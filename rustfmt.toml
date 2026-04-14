@@ -1,0 +1,28 @@
+# robinhood-rs formatting.
+#
+# The stable-rustfmt subset of rust-terrasync's rustfmt.toml. Terrasync's file sets
+# several nightly-only options that stable rustfmt warns about on every invocation
+# and then silently ignores. We keep only what stable accepts so `cargo fmt --check`
+# runs cleanly under our `channel = "stable"` pin in rust-toolchain.toml.
+#
+# If the project ever switches to nightly, uncomment the block below to match
+# terrasync verbatim.
+
+edition = "2024"
+max_width = 120
+use_small_heuristics = "Default"
+fn_params_layout = "Compressed"
+
+# ---- Nightly-only options (terrasync-compatible; re-enable under nightly rustfmt) ----
+#
+# normalize_comments = true
+# wrap_comments = false
+# comment_width = 100
+# overflow_delimited_expr = true
+# where_single_line = true
+# inline_attribute_width = 80
+# blank_lines_upper_bound = 2
+# reorder_impl_items = true
+# ignore = []
+# group_imports = "StdExternalCrate"
+# imports_granularity = "Module"

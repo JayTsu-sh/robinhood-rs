@@ -1,0 +1,26 @@
+[package]
+name = "rbh-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "robinhood-rs daemon — boots observability, DB, fs-scan, scheduler-rs, and axum HTTP server."
+
+[dependencies]
+rbh-api = { path = "../rbh-api" }
+rbh-entry-store = { path = "../rbh-entry-store" }
+rbh-fs-scan = { path = "../rbh-fs-scan" }
+rbh-observability = { path = "../rbh-observability" }
+rbh-policy = { path = "../rbh-policy" }
+lustre-api = { path = "../lustre-api" }
+lustre-changelog = { path = "../lustre-changelog" }
+scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", features = ["sqlx-mysql"] }
+
+anyhow = { workspace = true }
+axum = { version = "0.8" }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

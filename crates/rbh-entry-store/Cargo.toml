@@ -1,0 +1,23 @@
+[package]
+name = "rbh-entry-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MariaDB-backed entry catalog for robinhood-rs — schema, CRUD, batch upsert, CursorStore impl."
+
+[dependencies]
+lustre-api = { path = "../lustre-api" }
+lustre-changelog = { path = "../lustre-changelog" }
+
+async-trait = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }

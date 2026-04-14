@@ -1,0 +1,18 @@
+[package]
+name = "rbh-predicate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Serde-serializable predicate tree for robinhood-rs policies — SQL translator and in-memory evaluator."
+
+[dependencies]
+rbh-entry-store = { path = "../rbh-entry-store" }
+lustre-api = { path = "../lustre-api" }
+
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

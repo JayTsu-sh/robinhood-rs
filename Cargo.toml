@@ -1,0 +1,86 @@
+#
+# robinhood-rs — workspace + root binary shim.
+#
+# The root is a hybrid workspace+package:
+#   * [workspace] declares the 11 member crates under `crates/`.
+#   * [package] declares a tiny root binary named `robinhood` whose `src/main.rs`
+#     dispatches to `rbh_daemon::run()`. `cargo run` at the workspace root
+#     launches the daemon.
+#
+# Member crates inherit version/edition/license/authors from [workspace.package].
+# Shared dependency versions are pinned once in [workspace.dependencies].
+#
+
+[workspace]
+members = [
+    "crates/lustre-api",
+    "crates/lustre-changelog",
+    "crates/rbh-observability",
+    "crates/rbh-entry-store",
+    "crates/rbh-predicate",
+    "crates/rbh-fs-scan",
+    "crates/rbh-policy",
+    "crates/rbh-actions",
+    "crates/rbh-api",
+    "crates/rbh-daemon",
+    "crates/rbh-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["jay.xu <jay.xu@lenovonetapp.com>"]
+
+[workspace.dependencies]
+# Errors.
+anyhow = "1"
+thiserror = "2"
+
+# Async runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+
+# Serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Observability — library crates depend on `tracing` only; binaries compose subscribers
+# via the `rbh-observability` crate. See memory/observability_design.md.
+tracing = "0.1"
+
+# FFI / byte manipulation (Phase 1a additions).
+libc = "0.2"
+bitflags = { version = "2", features = ["serde"] }
+bytes = "1"
+
+# Async domain layer (Phase 1b additions).
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+
+# Database (Phase 2 additions).
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono", "json", "macros", "migrate"] }
+
+#
+# Root package: thin binary shim over rbh-daemon.
+#
+[package]
+name = "robinhood-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Robinhood Policy Engine — Rust rewrite with REST-driven policies."
+
+[[bin]]
+name = "robinhood"
+path = "src/main.rs"
+
+[dependencies]
+rbh-daemon = { path = "crates/rbh-daemon" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

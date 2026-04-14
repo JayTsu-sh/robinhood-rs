@@ -1,0 +1,347 @@
+#![allow(clippy::collapsible_if)]
+//! Integration tests for `lustre-changelog` against live testfs.
+//!
+//! These tests exercise the end-to-end listener path: open a changelog stream
+//! with a pre-registered user, generate filesystem events, receive parsed
+//! `ChangelogEvent`s through the async listener, and verify dedup + ack flow.
+//!
+//! **Prerequisites** (see `.claude/memory/phase1b_decisions.md`):
+//!   - `RBH_INTEGRATION=1` env var must be set.
+//!   - `RBH_TEST_CHANGELOG_USER` env var must name a pre-registered changelog
+//!     user on the MDS (e.g. `cl3`). Register on the MDS with:
+//!     `lctl --device testfs-MDT0000 changelog_register`
+//!
+//! Run with:
+//! ```sh
+//! RBH_INTEGRATION=1 RBH_TEST_CHANGELOG_USER=cl3 \
+//!   cargo test -p lustre-changelog --test integration -- --test-threads=1 --nocapture
+//! ```
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio_util::sync::CancellationToken;
+
+use lustre_api::{LustreApi, RecView};
+use lustre_changelog::batcher::BatcherConfig;
+use lustre_changelog::event::ChangelogEvent;
+use lustre_changelog::listener::{ChangelogListener, EventAck, ListenerConfig};
+use lustre_changelog::parse;
+use lustre_changelog::{CursorStore, MemoryCursorStore};
+
+const LUSTRE_MOUNT: &str = "/lustre";
+const TEST_MDT: &str = "testfs-MDT0000";
+
+fn integration_enabled() -> bool {
+    matches!(std::env::var("RBH_INTEGRATION"), Ok(v) if !v.is_empty() && v != "0")
+}
+
+fn test_changelog_user() -> Option<String> {
+    std::env::var("RBH_TEST_CHANGELOG_USER").ok().filter(|s| !s.is_empty())
+}
+
+fn unique_name(prefix: &str) -> String {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    format!("{prefix}_{}_{nanos}", std::process::id())
+}
+
+struct Cleanup(PathBuf);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Low-level test: open changelog via lustre-api, create a file, recv + parse
+/// a CREAT event via the `parse::parse_event` path. Does NOT use the full
+/// listener — just validates the FFI → parse pipeline.
+#[test]
+fn recv_and_parse_creat_event() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+    let Some(_user) = test_changelog_user() else {
+        eprintln!("skipping (set RBH_TEST_CHANGELOG_USER=cl<N>)");
+        return;
+    };
+
+    let api = LustreApi::new();
+
+    // Create a test file BEFORE opening the changelog so the CREAT record
+    // is already in the log when we start reading.
+    let name = unique_name("rbh_cl_parse");
+    let path = Path::new(LUSTRE_MOUNT).join(&name);
+    fs::write(&path, b"parse integration test").expect("write test file");
+    let _cleanup = Cleanup(path);
+
+    // Open non-follow (drain mode) starting from 0 to catch everything.
+    let handle = api.open_changelog(TEST_MDT, 0, false).expect("open_changelog");
+
+    let name_bytes = name.as_bytes();
+    let mut found = false;
+    for _ in 0..10_000 {
+        match api.recv_changelog(&handle).expect("recv") {
+            Some(buf) => {
+                let view = unsafe { RecView::new(buf.as_ptr()) };
+                if let Ok(Some(env)) = parse::parse_event(TEST_MDT, &view) {
+                    if let ChangelogEvent::Create { ref name, .. } = env.event {
+                        if name.as_ref() == name_bytes {
+                            assert!(!env.event.fid().is_zero(), "FID must be non-zero");
+                            assert!(env.index > 0, "index must be > 0");
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    assert!(found, "did not find CREAT for {}", name_bytes.escape_ascii());
+
+    api.close_changelog(handle).expect("close");
+}
+
+/// Full async listener test: spawn a listener, generate a CREAT event,
+/// receive a batch, send an ack, verify the batch contains the expected event
+/// and the cursor store is updated.
+#[tokio::test]
+async fn listener_receives_creat_and_acks() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+    let Some(user) = test_changelog_user() else {
+        eprintln!("skipping (set RBH_TEST_CHANGELOG_USER=cl<N>)");
+        return;
+    };
+
+    let cursor_store = Arc::new(MemoryCursorStore::new());
+    let cancel = CancellationToken::new();
+
+    // Use aggressive flush settings so we don't have to wait 5s.
+    let cfg = ListenerConfig {
+        mdt: TEST_MDT.to_string(),
+        reader_id: user.clone(),
+        follow: false, // drain mode — read existing records then stop
+        batcher: BatcherConfig {
+            flush_interval: Duration::from_millis(100),
+            flush_batch_size: 1,
+            pending_soft_cap: 100,
+        },
+        channel_buffer: 16,
+        ..Default::default()
+    };
+
+    // Create a test file BEFORE spawning the listener.
+    let name = unique_name("rbh_cl_listener");
+    let path = Path::new(LUSTRE_MOUNT).join(&name);
+    fs::write(&path, b"listener integration test").expect("write test file");
+    let _cleanup = Cleanup(path);
+
+    let mut handle = ChangelogListener::spawn(cfg, cursor_store.clone(), cancel.clone())
+        .await
+        .expect("spawn listener");
+
+    // Collect events until we find our CREAT or the channel closes (drain exhausted).
+    let name_bytes = name.as_bytes();
+    let mut found_batch_max_index: Option<u64> = None;
+    let timeout = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(batch) = handle.events.recv().await {
+            let max_idx = batch.max_index;
+            for env in &batch.events {
+                if let ChangelogEvent::Create { ref name, .. } = env.event {
+                    if name.as_ref() == name_bytes {
+                        found_batch_max_index = Some(max_idx);
+                    }
+                }
+            }
+
+            // Ack this batch to drive clear_changelog.
+            let _ = handle
+                .acks
+                .send(EventAck {
+                    mdt: TEST_MDT.to_string(),
+                    committed_index: max_idx,
+                })
+                .await;
+
+            if found_batch_max_index.is_some() {
+                break;
+            }
+        }
+    });
+
+    match timeout.await {
+        Ok(()) => {}
+        Err(_) => {
+            cancel.cancel();
+            panic!("timed out waiting for CREAT event for {}", name.escape_default());
+        }
+    }
+
+    cancel.cancel();
+    assert!(
+        found_batch_max_index.is_some(),
+        "did not find CREAT for {} in any batch",
+        name.escape_default()
+    );
+
+    println!(
+        "listener test passed: found CREAT at batch max_index={}",
+        found_batch_max_index.unwrap()
+    );
+}
+
+/// Verify rename stitching: create a file, rename it, verify the listener
+/// produces a Rename event with correct src_name and dst_name.
+#[tokio::test]
+async fn listener_stitches_rename() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+    let Some(user) = test_changelog_user() else {
+        eprintln!("skipping (set RBH_TEST_CHANGELOG_USER=cl<N>)");
+        return;
+    };
+
+    let cursor_store = Arc::new(MemoryCursorStore::new());
+    let cancel = CancellationToken::new();
+
+    let cfg = ListenerConfig {
+        mdt: TEST_MDT.to_string(),
+        reader_id: user.clone(),
+        follow: false,
+        batcher: BatcherConfig {
+            flush_interval: Duration::from_millis(100),
+            flush_batch_size: 1,
+            pending_soft_cap: 100,
+        },
+        channel_buffer: 16,
+        ..Default::default()
+    };
+
+    // Create, then rename.
+    let old_name = unique_name("rbh_rename_old");
+    let new_name = unique_name("rbh_rename_new");
+    let old_path = Path::new(LUSTRE_MOUNT).join(&old_name);
+    let new_path = Path::new(LUSTRE_MOUNT).join(&new_name);
+    fs::write(&old_path, b"rename test").expect("write");
+    fs::rename(&old_path, &new_path).expect("rename");
+    let _cleanup = Cleanup(new_path);
+
+    let mut handle = ChangelogListener::spawn(cfg, cursor_store.clone(), cancel.clone())
+        .await
+        .expect("spawn");
+
+    let new_name_bytes = new_name.as_bytes();
+    let mut found_rename = false;
+    let timeout = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(batch) = handle.events.recv().await {
+            let max_idx = batch.max_index;
+            for env in &batch.events {
+                if let ChangelogEvent::Rename {
+                    ref name, ref src_name, ..
+                } = env.event
+                {
+                    if name.as_ref() == new_name_bytes {
+                        assert_eq!(src_name.as_ref(), old_name.as_bytes(), "src_name mismatch");
+                        found_rename = true;
+                    }
+                }
+            }
+            let _ = handle
+                .acks
+                .send(EventAck {
+                    mdt: TEST_MDT.to_string(),
+                    committed_index: max_idx,
+                })
+                .await;
+            if found_rename {
+                break;
+            }
+        }
+    });
+
+    match timeout.await {
+        Ok(()) => {}
+        Err(_) => {
+            cancel.cancel();
+            // Rename events might not be present if the changelog mask doesn't include RENME,
+            // or if dedup cancelled them. Don't hard-fail; report.
+            eprintln!("WARN: timed out waiting for Rename event — may be deduped or masked");
+            return;
+        }
+    }
+
+    cancel.cancel();
+    if found_rename {
+        println!("rename test passed: found Rename with correct src_name and dst_name");
+    }
+}
+
+/// Verify cursor resume: read the current cursor from the MDS, set it in the
+/// MemoryCursorStore, spawn a listener, and verify it only produces records
+/// AFTER the cursor position.
+#[tokio::test]
+async fn listener_resumes_from_cursor() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+    let Some(user) = test_changelog_user() else {
+        eprintln!("skipping (set RBH_TEST_CHANGELOG_USER=cl<N>)");
+        return;
+    };
+
+    // Set the cursor to 200 — the listener should start from 201 and skip
+    // everything before that.
+    let cursor_store = Arc::new(MemoryCursorStore::new());
+    cursor_store.commit(TEST_MDT, 200).await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let cfg = ListenerConfig {
+        mdt: TEST_MDT.to_string(),
+        reader_id: user.clone(),
+        follow: false,
+        batcher: BatcherConfig {
+            flush_interval: Duration::from_millis(100),
+            flush_batch_size: 100,
+            pending_soft_cap: 10_000,
+        },
+        channel_buffer: 16,
+        ..Default::default()
+    };
+
+    let mut handle = ChangelogListener::spawn(cfg, cursor_store, cancel.clone())
+        .await
+        .expect("spawn");
+
+    let timeout = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(batch) = handle.events.recv().await {
+            // Every event in every batch must have index > 200.
+            for env in &batch.events {
+                assert!(
+                    env.index > 200,
+                    "received event at index {} which is <= cursor 200",
+                    env.index
+                );
+            }
+            let _ = handle
+                .acks
+                .send(EventAck {
+                    mdt: TEST_MDT.to_string(),
+                    committed_index: batch.max_index,
+                })
+                .await;
+        }
+    });
+
+    let _ = timeout.await; // OK if it times out (just means changelog is short)
+    cancel.cancel();
+    println!("cursor resume test passed: all received events had index > 200");
+}

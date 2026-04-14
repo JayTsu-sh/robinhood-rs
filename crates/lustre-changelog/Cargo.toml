@@ -1,0 +1,23 @@
+[package]
+name = "lustre-changelog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Async Lustre changelog listener — ChangelogEvent domain enum, per-FID dedup, batcher, cursor persistence trait."
+
+[dependencies]
+lustre-api = { path = "../lustre-api" }
+
+async-trait = { workspace = true }
+libc = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "sync", "time"] }

@@ -1,0 +1,21 @@
+[package]
+name = "rbh-fs-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Async Lustre filesystem walker — populates rbh-entry-store catalog from live FS."
+
+[dependencies]
+lustre-api = { path = "../lustre-api" }
+rbh-entry-store = { path = "../rbh-entry-store" }
+
+async-channel = "2"
+bytes = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

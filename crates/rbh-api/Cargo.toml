@@ -1,0 +1,27 @@
+[package]
+name = "rbh-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "axum Router — REST endpoints for policies, entries, and scans."
+
+[dependencies]
+rbh-entry-store = { path = "../rbh-entry-store" }
+rbh-policy = { path = "../rbh-policy" }
+rbh-fs-scan = { path = "../rbh-fs-scan" }
+scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", features = ["sqlx-mysql"] }
+
+axum = { version = "0.8", features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower-http = { version = "0.6", features = ["trace", "request-id", "util"] }
+tracing = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+axum-test = "17"
+tokio = { workspace = true, features = ["macros", "rt"] }

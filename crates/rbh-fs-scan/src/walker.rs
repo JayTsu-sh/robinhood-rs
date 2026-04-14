@@ -1,0 +1,318 @@
+//! Async filesystem walker using `async_channel` + `AtomicUsize` pending counter.
+//!
+//! Spawns N worker tasks that pull directory paths from a shared MPMC queue,
+//! read each directory, stat children, build [`EntryRow`]s, and emit
+//! [`ScanEvent`]s through a bounded channel. Termination is correct by
+//! construction: when `pending` hits zero, the work channel is closed.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use lustre_api::LustreApi;
+use lustre_api::fid::LuFid;
+use rbh_entry_store::model::EntryRow;
+use tokio::sync::mpsc;
+
+use crate::ScanError;
+use crate::entry::build_entry;
+
+/// Events emitted during a scan.
+#[derive(Debug)]
+pub enum ScanEvent {
+    /// A successfully scanned entry.
+    Entry(Box<EntryRow>),
+    /// A non-fatal error for a single path.
+    Error { path: String, error: String },
+}
+
+/// Scan configuration.
+#[derive(Debug, Clone)]
+pub struct ScanConfig {
+    /// Root directory to scan (Lustre mount point).
+    pub root: PathBuf,
+    /// Number of concurrent worker tasks.
+    pub concurrency: usize,
+    /// Maximum directory depth (0 = root only, None = unlimited).
+    pub max_depth: Option<usize>,
+    /// Channel buffer size for scan events.
+    pub channel_size: usize,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("/lustre"),
+            concurrency: num_workers(),
+            max_depth: None,
+            channel_size: 4096,
+        }
+    }
+}
+
+fn num_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(16))
+        .unwrap_or(4)
+}
+
+/// Scan progress counters (shared across workers).
+#[derive(Debug)]
+pub struct ScanProgress {
+    pub entries_scanned: AtomicU64,
+    pub errors: AtomicU64,
+    pub dirs_walked: AtomicU64,
+}
+
+impl ScanProgress {
+    fn new() -> Self {
+        Self {
+            entries_scanned: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            dirs_walked: AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.entries_scanned.load(Ordering::Relaxed),
+            self.errors.load(Ordering::Relaxed),
+            self.dirs_walked.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Async filesystem scanner.
+pub struct FsScanner;
+
+impl FsScanner {
+    /// Start a scan and return a receiver of [`ScanEvent`]s plus shared progress.
+    ///
+    /// Spawns `config.concurrency` worker tasks that walk the filesystem.
+    /// The returned `mpsc::Receiver` yields events until the scan completes.
+    #[tracing::instrument(skip_all, fields(root = %config.root.display(), concurrency = config.concurrency))]
+    pub fn run(config: ScanConfig) -> (mpsc::Receiver<ScanEvent>, Arc<ScanProgress>) {
+        let (event_tx, event_rx) = mpsc::channel(config.channel_size);
+        let progress = Arc::new(ScanProgress::new());
+
+        // Work queue: directories to process, with their depth and parent FID.
+        let (work_tx, work_rx) = async_channel::unbounded::<(PathBuf, usize, Option<LuFid>)>();
+
+        // Pending counter: tracks how many directories are queued or being processed.
+        let pending = Arc::new(AtomicUsize::new(1)); // 1 for the root
+
+        // Seed the root directory.
+        let _ = work_tx.try_send((config.root.clone(), 0, None));
+
+        let state = Arc::new(WalkState {
+            lustre: LustreApi,
+            max_depth: config.max_depth,
+            work_tx: work_tx.clone(),
+            event_tx: event_tx.clone(),
+            pending: pending.clone(),
+            progress: progress.clone(),
+        });
+
+        for worker_id in 0..config.concurrency {
+            let work_rx = work_rx.clone();
+            let state = state.clone();
+
+            tokio::task::spawn(async move {
+                tracing::debug!(worker_id, "scan worker started");
+
+                while let Ok((dir_path, depth, parent_fid)) = work_rx.recv().await {
+                    process_directory(&state, &dir_path, depth, parent_fid).await;
+
+                    if state.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        state.work_tx.close();
+                    }
+                }
+
+                tracing::debug!(worker_id, "scan worker finished");
+            });
+        }
+
+        drop(work_tx);
+        drop(event_tx);
+
+        (event_rx, progress)
+    }
+}
+
+/// Shared state passed to `process_directory` to avoid too many arguments.
+struct WalkState {
+    lustre: LustreApi,
+    max_depth: Option<usize>,
+    work_tx: async_channel::Sender<(PathBuf, usize, Option<LuFid>)>,
+    event_tx: mpsc::Sender<ScanEvent>,
+    pending: Arc<AtomicUsize>,
+    progress: Arc<ScanProgress>,
+}
+
+async fn process_directory(state: &WalkState, dir_path: &Path, depth: usize, parent_fid: Option<LuFid>) {
+    state.progress.dirs_walked.fetch_add(1, Ordering::Relaxed);
+
+    // First, build an entry for the directory itself.
+    let dir_fid = match build_entry_blocking(&state.lustre, dir_path, parent_fid).await {
+        Ok(entry) => {
+            let fid = entry.fid;
+            state.progress.entries_scanned.fetch_add(1, Ordering::Relaxed);
+            let _ = state.event_tx.send(ScanEvent::Entry(Box::new(entry))).await;
+            Some(fid)
+        }
+        Err(e) => {
+            state.progress.errors.fetch_add(1, Ordering::Relaxed);
+            let _ = state
+                .event_tx
+                .send(ScanEvent::Error {
+                    path: dir_path.display().to_string(),
+                    error: e.to_string(),
+                })
+                .await;
+            None
+        }
+    };
+
+    // Read directory entries.
+    let mut read_dir = match tokio::fs::read_dir(dir_path).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            state.progress.errors.fetch_add(1, Ordering::Relaxed);
+            let _ = state
+                .event_tx
+                .send(ScanEvent::Error {
+                    path: dir_path.display().to_string(),
+                    error: format!("readdir failed: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
+
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
+        let child_path = entry.path();
+
+        // Stat child to determine type.
+        let file_type = match entry.file_type().await {
+            Ok(ft) => ft,
+            Err(e) => {
+                state.progress.errors.fetch_add(1, Ordering::Relaxed);
+                let _ = state
+                    .event_tx
+                    .send(ScanEvent::Error {
+                        path: child_path.display().to_string(),
+                        error: format!("file_type failed: {e}"),
+                    })
+                    .await;
+                continue;
+            }
+        };
+
+        if file_type.is_dir() {
+            // Enqueue subdirectory if within depth limit.
+            if state.max_depth.is_none_or(|max| depth < max) {
+                state.pending.fetch_add(1, Ordering::AcqRel);
+                if state.work_tx.send((child_path, depth + 1, dir_fid)).await.is_err() {
+                    state.pending.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        } else {
+            // Non-directory: stat, resolve FID, emit entry.
+            match build_entry_blocking(&state.lustre, &child_path, dir_fid).await {
+                Ok(row) => {
+                    state.progress.entries_scanned.fetch_add(1, Ordering::Relaxed);
+                    let _ = state.event_tx.send(ScanEvent::Entry(Box::new(row))).await;
+                }
+                Err(e) => {
+                    state.progress.errors.fetch_add(1, Ordering::Relaxed);
+                    let _ = state
+                        .event_tx
+                        .send(ScanEvent::Error {
+                            path: child_path.display().to_string(),
+                            error: e.to_string(),
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+}
+
+/// Run `build_entry` on a blocking thread (stat + FFI are sync).
+async fn build_entry_blocking(
+    lustre: &LustreApi, path: &Path, parent_fid: Option<LuFid>,
+) -> Result<EntryRow, ScanError> {
+    let lustre = *lustre; // Copy (LustreApi is Copy)
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || build_entry(&lustre, &path, parent_fid))
+        .await
+        .map_err(|e| ScanError::Io {
+            path: String::new(),
+            source: std::io::Error::other(e.to_string()),
+        })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn scan_config_defaults() {
+        let cfg = ScanConfig::default();
+        assert_eq!(cfg.root, Path::new("/lustre"));
+        assert!(cfg.concurrency >= 1 && cfg.concurrency <= 16);
+        assert!(cfg.max_depth.is_none());
+        assert_eq!(cfg.channel_size, 4096);
+    }
+
+    #[test]
+    fn progress_snapshot_starts_zero() {
+        let p = ScanProgress::new();
+        let (scanned, errors, dirs) = p.snapshot();
+        assert_eq!(scanned, 0);
+        assert_eq!(errors, 0);
+        assert_eq!(dirs, 0);
+    }
+
+    #[tokio::test]
+    async fn scan_nonexistent_root_emits_error() {
+        let config = ScanConfig {
+            root: PathBuf::from("/nonexistent_fs_scan_test_root"),
+            concurrency: 1,
+            max_depth: Some(0),
+            channel_size: 16,
+        };
+        let (mut rx, progress) = FsScanner::run(config);
+
+        let mut got_error = false;
+        while let Some(event) = rx.recv().await {
+            if let ScanEvent::Error { .. } = event {
+                got_error = true;
+            }
+        }
+        assert!(got_error);
+        let (_, errors, _) = progress.snapshot();
+        assert!(errors > 0);
+    }
+
+    #[tokio::test]
+    async fn scan_tmp_finds_entries() {
+        // Scan /tmp with depth 0 — should find /tmp itself.
+        let config = ScanConfig {
+            root: PathBuf::from("/tmp"),
+            concurrency: 1,
+            max_depth: Some(0),
+            channel_size: 64,
+        };
+        let (mut rx, progress) = FsScanner::run(config);
+
+        while let Some(_event) = rx.recv().await {
+            // On non-Lustre systems, path_to_fid will fail → errors
+            // That's expected; we're testing the walker mechanics
+        }
+        // Either we got entries (Lustre) or errors (non-Lustre), but something happened
+        let (scanned, errors, _) = progress.snapshot();
+        assert!(scanned > 0 || errors > 0);
+    }
+}

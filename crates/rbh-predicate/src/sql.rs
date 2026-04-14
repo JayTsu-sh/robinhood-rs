@@ -1,0 +1,224 @@
+//! `Predicate::to_sql` — generate a parameterized SQL WHERE fragment.
+//!
+//! Parameters are collected as [`SqlParam`] values and appended to a `Vec`;
+//! the caller binds them positionally via sqlx `query.bind(...)`.
+
+use crate::{Predicate, Value};
+
+/// A parameter value to bind in the generated SQL.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlParam {
+    Num(i64),
+    Str(String),
+}
+
+/// Generate a parameterized WHERE clause fragment from a predicate.
+///
+/// Returns `(sql_fragment, params)` where `sql_fragment` contains `?`
+/// placeholders and `params` contains the values to bind in order.
+///
+/// # Examples
+///
+/// ```
+/// use rbh_predicate::*;
+/// let pred = Predicate::Cmp { field: Field::Size, cmp: CmpOp::Gt, value: Value::Num(1000) };
+/// let (sql, params) = to_sql(&pred);
+/// assert_eq!(sql, "size > ?");
+/// assert_eq!(params, vec![SqlParam::Num(1000)]);
+/// ```
+pub fn to_sql(pred: &Predicate) -> (String, Vec<SqlParam>) {
+    let mut params = Vec::new();
+    let sql = build(pred, &mut params);
+    (sql, params)
+}
+
+fn build(pred: &Predicate, params: &mut Vec<SqlParam>) -> String {
+    match pred {
+        Predicate::True => "1=1".to_string(),
+        Predicate::False => "1=0".to_string(),
+
+        Predicate::Cmp { field, cmp, value } => {
+            params.push(value_to_param(value));
+            format!("{} {} ?", field.column_name(), cmp.sql())
+        }
+
+        Predicate::NameLike { pattern } => {
+            params.push(SqlParam::Str(pattern.clone()));
+            "name LIKE ?".to_string()
+        }
+
+        Predicate::InPool { pool } => {
+            params.push(SqlParam::Str(pool.clone()));
+            "pool_name = ?".to_string()
+        }
+
+        Predicate::And { children } => {
+            if children.is_empty() {
+                return "1=1".to_string(); // empty AND = true
+            }
+            let parts: Vec<String> = children.iter().map(|c| build(c, params)).collect();
+            format!("({})", parts.join(" AND "))
+        }
+
+        Predicate::Or { children } => {
+            if children.is_empty() {
+                return "1=0".to_string(); // empty OR = false
+            }
+            let parts: Vec<String> = children.iter().map(|c| build(c, params)).collect();
+            format!("({})", parts.join(" OR "))
+        }
+
+        Predicate::Not { inner } => {
+            let inner_sql = build(inner, params);
+            format!("NOT ({})", inner_sql)
+        }
+    }
+}
+
+fn value_to_param(v: &Value) -> SqlParam {
+    match v {
+        Value::Num(n) => SqlParam::Num(*n),
+        Value::Str(s) => SqlParam::Str(s.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::*;
+
+    #[test]
+    fn simple_cmp() {
+        let pred = Predicate::Cmp {
+            field: Field::Size,
+            cmp: CmpOp::Gt,
+            value: Value::Num(1_000_000),
+        };
+        let (sql, params) = to_sql(&pred);
+        assert_eq!(sql, "size > ?");
+        assert_eq!(params, vec![SqlParam::Num(1_000_000)]);
+    }
+
+    #[test]
+    fn and_two_conditions() {
+        let pred = Predicate::And {
+            children: vec![
+                Predicate::Cmp {
+                    field: Field::Uid,
+                    cmp: CmpOp::Eq,
+                    value: Value::Num(1000),
+                },
+                Predicate::Cmp {
+                    field: Field::Mtime,
+                    cmp: CmpOp::Lt,
+                    value: Value::Num(1_775_955_820),
+                },
+            ],
+        };
+        let (sql, params) = to_sql(&pred);
+        assert_eq!(sql, "(uid = ? AND mtime < ?)");
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn or_with_name_like() {
+        let pred = Predicate::Or {
+            children: vec![
+                Predicate::NameLike {
+                    pattern: "%.tmp".to_string(),
+                },
+                Predicate::NameLike {
+                    pattern: "%.log".to_string(),
+                },
+            ],
+        };
+        let (sql, params) = to_sql(&pred);
+        assert_eq!(sql, "(name LIKE ? OR name LIKE ?)");
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn not_wraps_inner() {
+        let pred = Predicate::Not {
+            inner: Box::new(Predicate::InPool {
+                pool: "flash".to_string(),
+            }),
+        };
+        let (sql, params) = to_sql(&pred);
+        assert_eq!(sql, "NOT (pool_name = ?)");
+        assert_eq!(params, vec![SqlParam::Str("flash".to_string())]);
+    }
+
+    #[test]
+    fn true_false() {
+        assert_eq!(to_sql(&Predicate::True).0, "1=1");
+        assert_eq!(to_sql(&Predicate::False).0, "1=0");
+    }
+
+    #[test]
+    fn empty_and_is_true() {
+        let (sql, _) = to_sql(&Predicate::And { children: vec![] });
+        assert_eq!(sql, "1=1");
+    }
+
+    #[test]
+    fn empty_or_is_false() {
+        let (sql, _) = to_sql(&Predicate::Or { children: vec![] });
+        assert_eq!(sql, "1=0");
+    }
+
+    #[test]
+    fn nested_and_or() {
+        let pred = Predicate::And {
+            children: vec![
+                Predicate::Cmp {
+                    field: Field::Kind,
+                    cmp: CmpOp::Eq,
+                    value: Value::Num(0), // file
+                },
+                Predicate::Or {
+                    children: vec![
+                        Predicate::Cmp {
+                            field: Field::Size,
+                            cmp: CmpOp::Gt,
+                            value: Value::Num(1_000_000_000),
+                        },
+                        Predicate::Cmp {
+                            field: Field::Mtime,
+                            cmp: CmpOp::Lt,
+                            value: Value::Num(1_700_000_000),
+                        },
+                    ],
+                },
+            ],
+        };
+        let (sql, params) = to_sql(&pred);
+        assert_eq!(sql, "(kind = ? AND (size > ? OR mtime < ?))");
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn param_ordering_matches_placeholders() {
+        let pred = Predicate::And {
+            children: vec![
+                Predicate::Cmp {
+                    field: Field::Uid,
+                    cmp: CmpOp::Eq,
+                    value: Value::Num(1000),
+                },
+                Predicate::Cmp {
+                    field: Field::Gid,
+                    cmp: CmpOp::Eq,
+                    value: Value::Num(100),
+                },
+                Predicate::Cmp {
+                    field: Field::Size,
+                    cmp: CmpOp::Ge,
+                    value: Value::Num(0),
+                },
+            ],
+        };
+        let (_, params) = to_sql(&pred);
+        assert_eq!(params, vec![SqlParam::Num(1000), SqlParam::Num(100), SqlParam::Num(0)]);
+    }
+}

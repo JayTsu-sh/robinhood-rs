@@ -1,0 +1,25 @@
+[package]
+name = "lustre-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Safe wrapper around liblustreapi — changelog, FID operations, stripe info, and HSM."
+
+# Tell cargo about the native library dependency so two crates in the workspace
+# can't both try to own the linker directive.
+links = "lustreapi"
+
+[dependencies]
+bitflags  = { workspace = true }
+bytes     = { workspace = true }
+libc      = { workspace = true }
+serde     = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+[build-dependencies]
+bindgen = "0.70"
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,28 @@
+[package]
+name = "rbh-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Policy definitions (Purge/Migration/HsmArchive/HsmRelease/Alert) as scheduler-rs Tasks."
+
+[dependencies]
+lustre-api = { path = "../lustre-api" }
+rbh-actions = { path = "../rbh-actions" }
+rbh-entry-store = { path = "../rbh-entry-store" }
+rbh-predicate = { path = "../rbh-predicate" }
+scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", features = ["sqlx-mysql"] }
+
+async-trait = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+lustre-api = { path = "../lustre-api" }
+tokio = { workspace = true, features = ["macros", "rt"] }
