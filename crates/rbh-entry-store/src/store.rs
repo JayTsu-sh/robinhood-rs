@@ -385,6 +385,105 @@ impl EntryStore {
             .collect()
     }
 
+    /// Size-histogram: bucket entries by log2-ish size ranges
+    /// (`0`, `1-1K`, `1K-1M`, `1M-100M`, `100M-1G`, `>=1G`).
+    /// Returns `(label, count, total_size)` tuples, bucket order preserved.
+    pub async fn size_profile(&self) -> Result<Vec<(String, u64, u64)>> {
+        let sql = "
+            SELECT
+              CASE
+                WHEN size = 0                              THEN '0'
+                WHEN size < 1024                           THEN '<1K'
+                WHEN size < 1024*1024                      THEN '1K-1M'
+                WHEN size < 100 * 1024 * 1024              THEN '1M-100M'
+                WHEN size < 1024 * 1024 * 1024             THEN '100M-1G'
+                ELSE                                            '>=1G'
+              END AS bucket,
+              COUNT(*)                                          AS cnt,
+              CAST(COALESCE(SUM(size), 0) AS UNSIGNED)          AS total_size,
+              -- sort key to preserve bucket order in the output
+              CASE
+                WHEN size = 0                              THEN 0
+                WHEN size < 1024                           THEN 1
+                WHEN size < 1024*1024                      THEN 2
+                WHEN size < 100 * 1024 * 1024              THEN 3
+                WHEN size < 1024 * 1024 * 1024             THEN 4
+                ELSE                                            5
+              END AS ord
+            FROM entries
+            WHERE kind = 0
+            GROUP BY bucket, ord
+            ORDER BY ord
+        ";
+        let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|r| {
+                let bucket: String = r.try_get("bucket")?;
+                let cnt: i64 = r.try_get("cnt")?;
+                let total: u64 = r.try_get::<u64, _>("total_size").unwrap_or(0);
+                Ok((bucket, cnt as u64, total))
+            })
+            .collect()
+    }
+
+    /// Page the `removed_entries` table ordered by `rm_time` DESC
+    /// (newest first). Optional `since` filters rm_time >= since.
+    pub async fn list_removed(
+        &self,
+        since: Option<i64>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<crate::model::RemovedEntry>> {
+        let (sql, use_since) = match since {
+            Some(_) => (
+                "SELECT fid, parent_fid, name, kind, size, uid, gid, sm_status, rm_time \
+                 FROM removed_entries WHERE rm_time >= ? \
+                 ORDER BY rm_time DESC LIMIT ? OFFSET ?",
+                true,
+            ),
+            None => (
+                "SELECT fid, parent_fid, name, kind, size, uid, gid, sm_status, rm_time \
+                 FROM removed_entries \
+                 ORDER BY rm_time DESC LIMIT ? OFFSET ?",
+                false,
+            ),
+        };
+        let mut q = sqlx::query(sql);
+        if use_since {
+            q = q.bind(since.unwrap());
+        }
+        q = q.bind(limit as i64).bind(offset as i64);
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.iter().map(row_to_removed).collect()
+    }
+
+    /// Purge a removed-entry row (after operator confirmation or
+    /// `rbh undelete` success). Returns whether a row was deleted.
+    pub async fn forget_removed(&self, fid: &LuFid) -> Result<bool> {
+        let bytes = fid_codec::encode(fid);
+        let res = sqlx::query("DELETE FROM removed_entries WHERE fid = ?")
+            .bind(&bytes[..])
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Look up one removed entry by FID.
+    pub async fn get_removed(
+        &self,
+        fid: &LuFid,
+    ) -> Result<Option<crate::model::RemovedEntry>> {
+        let bytes = fid_codec::encode(fid);
+        let row = sqlx::query(
+            "SELECT fid, parent_fid, name, kind, size, uid, gid, sm_status, rm_time \
+             FROM removed_entries WHERE fid = ?",
+        )
+        .bind(&bytes[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_removed).transpose()
+    }
+
     /// Count matching rows (no limit/offset). Used for paginated responses
     /// that want a total count.
     pub async fn count_where(
@@ -510,5 +609,43 @@ fn row_to_entry(row: &sqlx::mysql::MySqlRow) -> Result<EntryRow> {
         pool_name: row.try_get("pool_name")?,
         sm_status,
         last_seen: row.try_get("last_seen")?,
+    })
+}
+
+fn row_to_removed(row: &sqlx::mysql::MySqlRow) -> Result<crate::model::RemovedEntry> {
+    let fid_bytes: Vec<u8> = row.try_get("fid")?;
+    let fid = fid_codec::decode(&fid_bytes)
+        .ok_or(StoreError::FidCodec("invalid fid in removed_entries table"))?;
+
+    let parent_bytes: Option<Vec<u8>> = row.try_get("parent_fid")?;
+    let parent_fid = match parent_bytes {
+        Some(b) if !b.is_empty() => Some(
+            fid_codec::decode(&b)
+                .ok_or(StoreError::FidCodec("corrupted parent_fid in removed_entries"))?,
+        ),
+        _ => None,
+    };
+
+    let name_bytes: Vec<u8> = row.try_get("name")?;
+    let kind_u8: u8 = row.try_get("kind")?;
+    let kind = EntryKind::from_u8(kind_u8)
+        .ok_or(StoreError::FidCodec("invalid entry kind in removed_entries"))?;
+
+    let sm_bytes: Option<Vec<u8>> = row.try_get("sm_status")?;
+    let sm_status: serde_json::Value = match sm_bytes {
+        Some(b) if !b.is_empty() => serde_json::from_slice(&b)?,
+        _ => serde_json::Value::Null,
+    };
+
+    Ok(crate::model::RemovedEntry {
+        fid,
+        parent_fid,
+        name: bytes::Bytes::from(name_bytes),
+        kind,
+        size: row.try_get::<u64, _>("size")?,
+        uid: row.try_get::<u32, _>("uid")?,
+        gid: row.try_get::<u32, _>("gid")?,
+        sm_status,
+        rm_time: row.try_get("rm_time")?,
     })
 }

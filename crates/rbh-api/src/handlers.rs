@@ -26,7 +26,10 @@ pub fn api_routes() -> Router<AppState> {
         .route("/reports/aggregate", post(report_aggregate))
         .route("/reports/top-size", get(top_size))
         .route("/reports/oldest", get(oldest_entries))
+        .route("/reports/size-profile", get(size_profile))
         .route("/metrics", get(metrics_endpoint))
+        .route("/removed", get(list_removed))
+        .route("/removed/{fid}", axum::routing::delete(forget_removed))
         .route("/health", get(health))
 }
 
@@ -307,6 +310,86 @@ async fn query_entries(
     }))
 }
 
+// ---- /api/removed ----
+
+#[derive(Debug, Deserialize)]
+pub struct RemovedQuery {
+    #[serde(default = "default_removed_limit")]
+    pub limit: u64,
+    #[serde(default)]
+    pub offset: u64,
+    /// Optional unix-epoch lower bound on rm_time.
+    #[serde(default)]
+    pub since: Option<i64>,
+}
+
+fn default_removed_limit() -> u64 {
+    500
+}
+
+#[derive(Debug, Serialize)]
+pub struct RemovedDto {
+    pub fid: lustre_api::LuFid,
+    pub parent_fid: Option<lustre_api::LuFid>,
+    pub name: String,
+    pub kind: &'static str,
+    pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub sm_status: serde_json::Value,
+    pub rm_time: i64,
+}
+
+impl From<rbh_entry_store::model::RemovedEntry> for RemovedDto {
+    fn from(r: rbh_entry_store::model::RemovedEntry) -> Self {
+        Self {
+            fid: r.fid,
+            parent_fid: r.parent_fid,
+            name: String::from_utf8_lossy(&r.name).into_owned(),
+            kind: entry_kind_str(r.kind),
+            size: r.size,
+            uid: r.uid,
+            gid: r.gid,
+            sm_status: r.sm_status,
+            rm_time: r.rm_time,
+        }
+    }
+}
+
+#[tracing::instrument(skip(state))]
+async fn list_removed(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<RemovedQuery>,
+) -> Result<Json<Vec<RemovedDto>>, ApiError> {
+    let limit = q.limit.min(10_000).max(1);
+    let rows = state
+        .entry_store
+        .list_removed(q.since, limit, q.offset)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(rows.into_iter().map(RemovedDto::from).collect()))
+}
+
+#[tracing::instrument(skip(state))]
+async fn forget_removed(
+    State(state): State<AppState>,
+    Path(fid_str): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    use std::str::FromStr;
+    let fid = lustre_api::LuFid::from_str(&fid_str)
+        .map_err(|e| ApiError::Internal(format!("invalid fid: {e}")))?;
+    let removed = state
+        .entry_store
+        .forget_removed(&fid)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(if removed {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
 // ---- /api/reports/* ----
 
 #[derive(Debug, Deserialize)]
@@ -382,6 +465,33 @@ async fn top_size(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(rows.into_iter().map(EntryDto::from).collect()))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SizeBucket {
+    pub bucket: String,
+    pub count: u64,
+    pub total_size: u64,
+}
+
+#[tracing::instrument(skip(state))]
+async fn size_profile(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SizeBucket>>, ApiError> {
+    let rows = state
+        .entry_store
+        .size_profile()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(bucket, count, total_size)| SizeBucket {
+                bucket,
+                count,
+                total_size,
+            })
+            .collect(),
+    ))
 }
 
 #[tracing::instrument(skip(state))]
