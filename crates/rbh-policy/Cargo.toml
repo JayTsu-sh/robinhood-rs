@@ -25,4 +25,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 bytes = { workspace = true }
 lustre-api = { path = "../lustre-api" }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

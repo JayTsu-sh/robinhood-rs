@@ -10,13 +10,14 @@
 //! dispatches matched entries to action executors (stubbed until `rbh-actions`).
 
 pub mod model;
+pub mod ratelimit;
 pub mod reconcile;
 pub mod store;
 pub mod task;
 
 pub use model::{
-    ActionParams, FileClassDef, LruSortAttr, PolicyDef, PolicyKind, PolicyRow, Rule,
-    TriggerSpec, WindowModeSpec, compose_scope_with_ignores,
+    ActionParams, FileClassDef, LruSortAttr, PolicyDef, PolicyKind, PolicyRow, RateLimit,
+    Rule, TriggerSpec, WindowModeSpec, compose_scope_with_ignores,
 };
 pub use task::TargetFilter;
 pub use reconcile::reconcile_triggers;

@@ -135,6 +135,20 @@ pub struct ActionParams {
     /// LRU sort attribute — when set, candidates are ordered oldest-first.
     #[serde(default)]
     pub lru_sort: Option<LruSortAttr>,
+    /// Rate limit applied to dispatched actions. See [`RateLimit`].
+    #[serde(default)]
+    pub rate_limit: Option<RateLimit>,
+}
+
+/// Action rate limit. Both fields are optional; `None` means unlimited.
+///
+/// * `max_per_sec` — hard ceiling on actions dispatched per second.
+/// * `max_bytes_per_sec` — approximate ceiling on bytes processed per
+///   second (summed from `EntryRow::size`; does not reflect real I/O).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct RateLimit {
+    pub max_per_sec: Option<u32>,
+    pub max_bytes_per_sec: Option<u64>,
 }
 
 impl ActionParams {
@@ -146,6 +160,14 @@ impl ActionParams {
             timeout_secs: self.timeout_secs.or(base.timeout_secs),
             nb_threads: self.nb_threads.or(base.nb_threads),
             lru_sort: self.lru_sort.or(base.lru_sort),
+            rate_limit: match (self.rate_limit, base.rate_limit) {
+                (Some(a), Some(b)) => Some(RateLimit {
+                    max_per_sec: a.max_per_sec.or(b.max_per_sec),
+                    max_bytes_per_sec: a.max_bytes_per_sec.or(b.max_bytes_per_sec),
+                }),
+                (Some(a), None) => Some(a),
+                (None, b) => b,
+            },
         }
     }
 }
@@ -264,6 +286,10 @@ mod tests {
             timeout_secs: Some(60),
             nb_threads: Some(4),
             lru_sort: Some(LruSortAttr::Atime),
+            rate_limit: Some(RateLimit {
+                max_per_sec: Some(100),
+                max_bytes_per_sec: Some(10_000_000),
+            }),
         };
         let over = ActionParams {
             max_count: Some(50),
@@ -271,6 +297,10 @@ mod tests {
             timeout_secs: None,
             nb_threads: Some(8),
             lru_sort: None,
+            rate_limit: Some(RateLimit {
+                max_per_sec: Some(30),
+                max_bytes_per_sec: None,
+            }),
         };
         let merged = over.merge_over(&base);
         assert_eq!(merged.max_count, Some(50));
@@ -278,6 +308,10 @@ mod tests {
         assert_eq!(merged.timeout_secs, Some(60));
         assert_eq!(merged.nb_threads, Some(8));
         assert_eq!(merged.lru_sort, Some(LruSortAttr::Atime));
+        // rate_limit: over.max_per_sec wins, max_bytes_per_sec falls back to base.
+        let rl = merged.rate_limit.unwrap();
+        assert_eq!(rl.max_per_sec, Some(30));
+        assert_eq!(rl.max_bytes_per_sec, Some(10_000_000));
     }
 
     #[test]

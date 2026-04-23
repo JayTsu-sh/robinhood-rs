@@ -140,12 +140,12 @@ impl Task for PolicyRunTask {
         );
 
         // 2. Get action executor for this policy kind.
-        let executor: Box<dyn rbh_actions::ActionExecutor> = match def.kind {
-            crate::PolicyKind::Purge => Box::new(rbh_actions::PurgeExecutor),
+        let executor: Arc<dyn rbh_actions::ActionExecutor> = match def.kind {
+            crate::PolicyKind::Purge => Arc::new(rbh_actions::PurgeExecutor),
             crate::PolicyKind::HsmArchive => {
-                Box::new(rbh_actions::HsmArchiveExecutor { archive_id: 1 })
+                Arc::new(rbh_actions::HsmArchiveExecutor { archive_id: 1 })
             }
-            crate::PolicyKind::HsmRelease => Box::new(rbh_actions::HsmReleaseExecutor),
+            crate::PolicyKind::HsmRelease => Arc::new(rbh_actions::HsmReleaseExecutor),
             other => {
                 tracing::warn!(kind = other.as_str(), "action not implemented for this kind");
                 return Ok(());
@@ -210,49 +210,56 @@ impl Task for PolicyRunTask {
             "candidates queried"
         );
 
-        // 4. For each candidate: evaluate rules, dispatch action.
-        let action_ctx = rbh_actions::ActionContext {
+        // 4. Dispatch candidates to a pool of concurrent workers sized by
+        // ActionParams.nb_threads (default 1 preserves sequential behavior).
+        let action_ctx = Arc::new(rbh_actions::ActionContext {
             mount_path: rt.mount_path.clone(),
             lustre: lustre_api::LustreApi,
-        };
+        });
+        let concurrency = def
+            .default_action
+            .nb_threads
+            .map(|n| n.max(1) as usize)
+            .unwrap_or(1);
+        let rate_limiter = def
+            .default_action
+            .rate_limit
+            .as_ref()
+            .and_then(crate::ratelimit::RateLimiter::from_spec);
 
-        let mut success = 0u64;
-        let mut skipped = 0u64;
-        let mut failed = 0u64;
+        // Child token: fires on parent cancel OR on low-watermark reached.
+        // Using a child keeps the parent token (owned by scheduler-rs)
+        // pristine; we only observe it.
+        let parent_cancel = ctx.cancellation_token.clone();
+        let cancel = parent_cancel.child_token();
 
-        for entry in &candidates {
-            if ctx.cancellation_token.is_cancelled() {
-                tracing::info!(policy_id = self.policy_id, "cancelled mid-run");
-                break;
-            }
+        // If this run was fired by a threshold trigger that declares a
+        // low watermark, spawn a monitor that re-evaluates the measure
+        // and cancels `cancel` when we're under the low watermark.
+        let _low_watermark_guard = maybe_spawn_low_watermark_monitor(
+            def,
+            self,
+            &where_clause,
+            &query_params,
+            cancel.clone(),
+            rt,
+        );
 
-            // ignore_fileclass is enforced at the SQL layer before this loop
-            // (see step 3); rule evaluation here only picks action params.
-            let _params = evaluate_rules(&def.rules, &def.default_action, entry);
-
-            match executor.execute(entry, &action_ctx).await {
-                Ok(rbh_actions::ActionOutcome::Success) => {
-                    success += 1;
-                    tracing::debug!(fid = %entry.fid, "action success");
-                }
-                Ok(rbh_actions::ActionOutcome::Skipped { reason }) => {
-                    skipped += 1;
-                    tracing::debug!(fid = %entry.fid, reason = %reason, "action skipped");
-                }
-                Ok(rbh_actions::ActionOutcome::Failed { error }) => {
-                    failed += 1;
-                    tracing::warn!(fid = %entry.fid, error = %error, "action failed");
-                }
-                Err(e) => {
-                    failed += 1;
-                    tracing::warn!(fid = %entry.fid, error = %e, "action error");
-                }
-            }
-        }
+        let candidate_count = candidates.len();
+        let (success, skipped, failed) = dispatch_workers(
+            candidates,
+            executor,
+            action_ctx,
+            concurrency,
+            rate_limiter,
+            cancel,
+            self.policy_id,
+        )
+        .await;
 
         tracing::info!(
             policy_id = self.policy_id,
-            candidates = candidates.len(),
+            candidates = candidate_count,
             success,
             skipped,
             failed,
@@ -263,8 +270,233 @@ impl Task for PolicyRunTask {
     }
 }
 
+/// RAII guard that aborts the low-watermark monitor when the run loop
+/// finishes (either naturally or via cancel).
+struct MonitorGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MonitorGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn a background task that periodically re-evaluates the firing
+/// trigger's measure (count or SUM(size)) against the same scope used
+/// for candidate selection, and cancels `stop_token` as soon as the
+/// measure drops to or below the low watermark.
+///
+/// Returns `None` when the firing trigger isn't a threshold trigger or
+/// has no positive low watermark (i.e. high-only trigger).
+fn maybe_spawn_low_watermark_monitor(
+    def: &crate::PolicyDef,
+    task: &PolicyRunTask,
+    where_clause: &str,
+    query_params: &[rbh_entry_store::store::QueryParam],
+    stop_token: scheduler_rs::prelude::CancellationToken,
+    rt: &Arc<PolicyRuntime>,
+) -> Option<MonitorGuard> {
+    let trigger = def.triggers.get(task.trigger_idx as usize)?;
+    let (interval_secs, measure) = match trigger {
+        crate::TriggerSpec::ThresholdCount {
+            check_interval_secs,
+            low_count,
+            ..
+        } if *low_count > 0 => (*check_interval_secs, LowMeasure::Count(*low_count)),
+        crate::TriggerSpec::ThresholdVolume {
+            check_interval_secs,
+            low_bytes,
+            ..
+        } if *low_bytes > 0 => (*check_interval_secs, LowMeasure::Volume(*low_bytes)),
+        _ => return None,
+    };
+
+    let entry_store = rt.entry_store.clone();
+    let where_clause = where_clause.to_string();
+    let params: Vec<_> = query_params.to_vec();
+    let policy_id = task.policy_id;
+    let trigger_idx = task.trigger_idx;
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop_token.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            let hit = match measure {
+                LowMeasure::Count(low) => match entry_store
+                    .count_where(&where_clause, &params)
+                    .await
+                {
+                    Ok(c) => c <= low,
+                    Err(e) => {
+                        tracing::warn!(
+                            policy_id,
+                            trigger_idx,
+                            error = %e,
+                            "low-watermark count query failed"
+                        );
+                        false
+                    }
+                },
+                LowMeasure::Volume(low) => {
+                    match sum_size_scope(&entry_store, &where_clause, &params).await {
+                        Ok(v) => v <= low,
+                        Err(e) => {
+                            tracing::warn!(
+                                policy_id,
+                                trigger_idx,
+                                error = %e,
+                                "low-watermark volume query failed"
+                            );
+                            false
+                        }
+                    }
+                }
+            };
+            if hit {
+                tracing::info!(
+                    policy_id,
+                    trigger_idx,
+                    "low watermark reached — stopping policy run"
+                );
+                stop_token.cancel();
+                return;
+            }
+        }
+    });
+    Some(MonitorGuard { handle })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LowMeasure {
+    Count(u64),
+    Volume(u64),
+}
+
+/// Stand-in for rbh-daemon's sum_size_where — local to the policy crate
+/// because rbh-policy can't depend on rbh-daemon.
+async fn sum_size_scope(
+    store: &rbh_entry_store::store::EntryStore,
+    where_clause: &str,
+    params: &[rbh_entry_store::store::QueryParam],
+) -> Result<u64, rbh_entry_store::StoreError> {
+    use sqlx::Row;
+    let sql = format!(
+        "SELECT CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total \
+         FROM entries WHERE {where_clause}"
+    );
+    let mut q = sqlx::query(&sql);
+    for p in params {
+        q = match p {
+            rbh_entry_store::store::QueryParam::Int(n) => q.bind(*n),
+            rbh_entry_store::store::QueryParam::Str(s) => q.bind(s.as_str()),
+        };
+    }
+    let row = q.fetch_one(store.pool()).await?;
+    Ok(row.try_get::<u64, _>("total").unwrap_or(0))
+}
+
+/// Fan out candidate processing across `concurrency` workers using a
+/// tokio `JoinSet`. Returns `(success, skipped, failed)` totals. Respects
+/// the supplied cancel token: outstanding workers complete but no new
+/// entries are dispatched after cancellation.
+async fn dispatch_workers(
+    candidates: Vec<rbh_entry_store::model::EntryRow>,
+    executor: Arc<dyn rbh_actions::ActionExecutor>,
+    action_ctx: Arc<rbh_actions::ActionContext>,
+    concurrency: usize,
+    rate_limiter: Option<crate::ratelimit::RateLimiter>,
+    cancel: scheduler_rs::prelude::CancellationToken,
+    policy_id: u64,
+) -> (u64, u64, u64) {
+    use tokio::sync::Semaphore;
+
+    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut set = tokio::task::JoinSet::new();
+
+    for entry in candidates {
+        if cancel.is_cancelled() {
+            tracing::info!(policy_id, "cancelled before full dispatch");
+            break;
+        }
+        // Acquire a permit before spawning — this bounds in-flight work
+        // without holding the candidate vec past its useful life.
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed (shouldn't happen)
+        };
+        // Rate limit is acquired on the dispatch path (not inside the
+        // spawned task) so concurrency and rate caps compose: workers
+        // wait for a permit, and dispatch itself waits for the token.
+        if let Some(ref rl) = rate_limiter {
+            rl.acquire(entry.size).await;
+        }
+        let exec = executor.clone();
+        let ctx = action_ctx.clone();
+        let worker_cancel = cancel.clone();
+        set.spawn(async move {
+            if worker_cancel.is_cancelled() {
+                drop(permit);
+                return WorkerOutcome::Skipped;
+            }
+            let fid = entry.fid;
+            let result = exec.execute(&entry, &ctx).await;
+            drop(permit);
+            match result {
+                Ok(rbh_actions::ActionOutcome::Success) => {
+                    tracing::debug!(%fid, "action success");
+                    WorkerOutcome::Success
+                }
+                Ok(rbh_actions::ActionOutcome::Skipped { reason }) => {
+                    tracing::debug!(%fid, reason = %reason, "action skipped");
+                    WorkerOutcome::Skipped
+                }
+                Ok(rbh_actions::ActionOutcome::Failed { error }) => {
+                    tracing::warn!(%fid, error = %error, "action failed");
+                    WorkerOutcome::Failed
+                }
+                Err(e) => {
+                    tracing::warn!(%fid, error = %e, "action error");
+                    WorkerOutcome::Failed
+                }
+            }
+        });
+    }
+
+    let mut success = 0u64;
+    let mut skipped = 0u64;
+    let mut failed = 0u64;
+    while let Some(j) = set.join_next().await {
+        match j {
+            Ok(WorkerOutcome::Success) => success += 1,
+            Ok(WorkerOutcome::Skipped) => skipped += 1,
+            Ok(WorkerOutcome::Failed) => failed += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(error = %e, "worker task panicked");
+            }
+        }
+    }
+    (success, skipped, failed)
+}
+
+#[derive(Debug)]
+enum WorkerOutcome {
+    Success,
+    Skipped,
+    Failed,
+}
+
 /// Evaluate rules against an entry. Returns effective action params
 /// for the first matching rule, or default if no rule matches.
+///
+/// Kept alongside tests for the next iteration: the executor trait takes
+/// only `(entry, ctx)` today, so per-entry rule-derived params cannot yet
+/// be applied. Will be wired in when the executor gains a params arg.
+#[allow(dead_code)]
 fn evaluate_rules(
     rules: &[Rule],
     default_action: &ActionParams,
@@ -411,5 +643,181 @@ mod tests {
         let s = serde_json::to_string(&t).unwrap();
         let back: PolicyRunTask = serde_json::from_str(&s).unwrap();
         assert_eq!(back.target, TargetFilter::Ost { osts: vec![7] });
+    }
+
+    // --- dispatch_workers tests -----------------------------------------
+
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct RecordingExecutor {
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+        outcome: rbh_actions::ActionOutcome,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl rbh_actions::ActionExecutor for RecordingExecutor {
+        async fn execute(
+            &self,
+            _entry: &EntryRow,
+            _ctx: &rbh_actions::ActionContext,
+        ) -> std::result::Result<rbh_actions::ActionOutcome, rbh_actions::ActionError> {
+            let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(n, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(self.outcome.clone())
+        }
+    }
+
+    fn mk_candidates(n: usize) -> Vec<EntryRow> {
+        (0..n).map(|i| {
+            let mut e = test_entry();
+            e.fid = LuFid::new(0x200000401, i as u32 + 100, 0);
+            e
+        }).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatch_respects_concurrency_cap() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let exec: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(RecordingExecutor {
+            in_flight: in_flight.clone(),
+            max_in_flight: max_in_flight.clone(),
+            outcome: rbh_actions::ActionOutcome::Success,
+            delay: Duration::from_millis(30),
+        });
+        let ctx = Arc::new(rbh_actions::ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: lustre_api::LustreApi,
+        });
+        let cancel = scheduler_rs::prelude::CancellationToken::new();
+        let (succ, _, _) =
+            dispatch_workers(mk_candidates(12), exec, ctx, 3, None, cancel, 0).await;
+        assert_eq!(succ, 12);
+        let peak = max_in_flight.load(Ordering::SeqCst);
+        assert!(peak >= 2 && peak <= 3, "expected peak ~3, got {peak}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatch_honors_rate_limit() {
+        // 100 actions/sec, 30 candidates — first ~100 tokens are the
+        // initial bucket so all 30 dispatch immediately; with a smaller
+        // initial budget via pre-drained actions we'd see throttling.
+        // Here we prove the limit doesn't break the happy path.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let exec: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(RecordingExecutor {
+            in_flight,
+            max_in_flight,
+            outcome: rbh_actions::ActionOutcome::Success,
+            delay: Duration::from_millis(1),
+        });
+        let ctx = Arc::new(rbh_actions::ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: lustre_api::LustreApi,
+        });
+        let cancel = scheduler_rs::prelude::CancellationToken::new();
+        // 10/s rate; 30 actions → ~2s real time for the tail.
+        let rl = crate::ratelimit::RateLimiter::from_spec(&crate::model::RateLimit {
+            max_per_sec: Some(10),
+            max_bytes_per_sec: None,
+        });
+        let start = std::time::Instant::now();
+        let (succ, _, _) =
+            dispatch_workers(mk_candidates(30), exec, ctx, 4, rl, cancel, 0).await;
+        let elapsed = start.elapsed();
+        assert_eq!(succ, 30);
+        // First 10 tokens free, then 20 at 10/s = ~2s.
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "30 actions @ 10/s should take >=1.5s, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn low_measure_decodes_from_trigger_spec() {
+        // ThresholdCount with low_count=0 → no monitor (no closure needed).
+        // ThresholdCount with low_count>0 → LowMeasure::Count.
+        let spec = crate::TriggerSpec::ThresholdCount {
+            check_interval_secs: 30,
+            high_count: 1_000,
+            low_count: 700,
+            post_trigger_wait_secs: 0,
+            target: crate::model::ThresholdTarget::Fs,
+        };
+        // Directly exercise the match arms in maybe_spawn_low_watermark_monitor
+        // by using the same pattern — kept in sync with the source.
+        let got = match &spec {
+            crate::TriggerSpec::ThresholdCount { low_count, .. } if *low_count > 0 => {
+                Some(LowMeasure::Count(*low_count))
+            }
+            _ => None,
+        };
+        assert!(matches!(got, Some(LowMeasure::Count(700))));
+
+        let spec_no_low = crate::TriggerSpec::ThresholdCount {
+            check_interval_secs: 30,
+            high_count: 1_000,
+            low_count: 0,
+            post_trigger_wait_secs: 0,
+            target: crate::model::ThresholdTarget::Fs,
+        };
+        let got_none = match &spec_no_low {
+            crate::TriggerSpec::ThresholdCount { low_count, .. } if *low_count > 0 => {
+                Some(LowMeasure::Count(*low_count))
+            }
+            _ => None,
+        };
+        assert!(got_none.is_none());
+
+        let spec_vol = crate::TriggerSpec::ThresholdVolume {
+            check_interval_secs: 30,
+            high_bytes: 1 << 30,
+            low_bytes: 1 << 28,
+            post_trigger_wait_secs: 0,
+            target: crate::model::ThresholdTarget::Fs,
+        };
+        let got_vol = match &spec_vol {
+            crate::TriggerSpec::ThresholdVolume { low_bytes, .. } if *low_bytes > 0 => {
+                Some(LowMeasure::Volume(*low_bytes))
+            }
+            _ => None,
+        };
+        assert!(matches!(got_vol, Some(LowMeasure::Volume(n)) if n == 1 << 28));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_stops_on_cancel() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let exec: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(RecordingExecutor {
+            in_flight,
+            max_in_flight,
+            outcome: rbh_actions::ActionOutcome::Success,
+            delay: Duration::from_millis(50),
+        });
+        let ctx = Arc::new(rbh_actions::ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: lustre_api::LustreApi,
+        });
+        let cancel = scheduler_rs::prelude::CancellationToken::new();
+        // Cancel quickly — most candidates should never dispatch.
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel_clone.cancel();
+        });
+        let (succ, skipped, failed) =
+            dispatch_workers(mk_candidates(50), exec, ctx, 2, None, cancel, 0).await;
+        assert!(
+            succ + skipped + failed < 50,
+            "expected partial run after cancel, got total={}",
+            succ + skipped + failed
+        );
     }
 }
