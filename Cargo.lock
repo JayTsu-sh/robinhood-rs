@@ -1736,6 +1736,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rbh-config-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rbh-policy",
+ "rbh-predicate",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rbh-daemon"
 version = "0.1.0"
 dependencies = [

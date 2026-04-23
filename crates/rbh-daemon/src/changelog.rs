@@ -66,6 +66,22 @@ pub async fn ingest_loop(
         let mut skipped = 0u64;
         let mut errors = 0u64;
 
+        // Count events into the per-MDT, per-type metric before any
+        // apply work so even skipped / errored events show up on the
+        // Grafana panel.
+        {
+            use std::collections::HashMap;
+            let mut by_type: HashMap<&'static str, u64> = HashMap::new();
+            for envelope in &batch.events {
+                *by_type.entry(envelope.event.kind_name()).or_insert(0) += 1;
+            }
+            for (ty, n) in by_type {
+                rbh_observability::metrics::CHANGELOG_EVENTS
+                    .with_label_values(&[mdt.as_str(), ty])
+                    .inc_by(n);
+            }
+        }
+
         for envelope in &batch.events {
             match apply_event(&entry_store, &mount_path, &envelope.event, envelope.time).await {
                 Ok(true) => applied += 1,

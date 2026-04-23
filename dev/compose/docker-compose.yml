@@ -1,0 +1,78 @@
+# Local dev stack for robinhood-rs.
+#
+# Does NOT include Lustre — developers run the daemon with the catalog
+# stored in MariaDB but no changelog listener (RBH_CHANGELOG_USER unset).
+# Useful for exercising the REST API, rbh-cli, and the Grafana dashboard
+# without MDS/OSS hardware.
+#
+#   cd dev/compose && docker compose up -d
+#   curl http://localhost:8080/api/health
+#   open http://localhost:3000     (grafana admin/admin)
+#
+# To seed data, run the daemon against a live mount from the host, or
+# insert rows into the `entries` table manually — the /api endpoints
+# and Grafana dashboard react to what's in the DB.
+
+services:
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: rbhdev
+      MARIADB_DATABASE: rbh_entries
+    ports:
+      - "3306:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-prbhdev"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  rbh-daemon:
+    # Image is built from the repo root — see Dockerfile in this dir.
+    build:
+      context: ../..
+      dockerfile: dev/compose/Dockerfile
+    environment:
+      RBH_DATABASE_URL: "mysql://root:rbhdev@mariadb:3306/rbh_entries"
+      RBH_LUSTRE_MOUNT: "/tmp/fake-mount"
+      RBH_LISTEN_ADDR: "0.0.0.0:8080"
+      RBH_LOG: "info"
+      RBH_THRESHOLD_TICK_SECS: "15"
+      # Intentionally no RBH_MDTS / RBH_CHANGELOG_USER — Lustre is absent.
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    # The daemon tries to stat RBH_LUSTRE_MOUNT on boot; point it at a
+    # scratch dir inside the container so startup doesn't fail.
+    command: ["sh", "-c", "mkdir -p /tmp/fake-mount && exec /usr/sbin/robinhood"]
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - rbh-daemon
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  mariadb-data:
+  grafana-data:
