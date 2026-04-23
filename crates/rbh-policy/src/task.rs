@@ -148,7 +148,18 @@ impl Task for PolicyRunTask {
         let executor: Arc<dyn rbh_actions::ActionExecutor> = match def.kind {
             crate::PolicyKind::Purge => Arc::new(rbh_actions::PurgeExecutor),
             crate::PolicyKind::HsmArchive => {
-                Arc::new(rbh_actions::HsmArchiveExecutor { archive_id: 1 })
+                let (archive_id, hints) = def
+                    .default_action
+                    .hsm
+                    .as_ref()
+                    .map(|h| {
+                        (
+                            h.archive_id.unwrap_or(1),
+                            h.hints.as_ref().map(|s| s.as_bytes().to_vec()),
+                        )
+                    })
+                    .unwrap_or((1, None));
+                Arc::new(rbh_actions::HsmArchiveExecutor { archive_id, hints })
             }
             crate::PolicyKind::HsmRelease => Arc::new(rbh_actions::HsmReleaseExecutor),
             other => {
@@ -481,6 +492,7 @@ async fn dispatch_workers(
         // First-match rule eval picks the effective per-entry params.
         let params = evaluate_rules(&rules, &default_action, &entry);
         let timeout = params.timeout_secs.filter(|&s| s > 0);
+        let retry = params.retry;
 
         let permit = match sem.clone().acquire_owned().await {
             Ok(p) => p,
@@ -498,10 +510,21 @@ async fn dispatch_workers(
                 return WorkerOutcome::Skipped;
             }
             let fid = entry.fid;
-            let fut = exec.execute(&entry, &ctx);
-            let result = match timeout {
-                Some(secs) => {
-                    match tokio::time::timeout(
+            let max_attempts = retry.map(|r| r.max_attempts.max(1)).unwrap_or(1);
+            let backoff = retry
+                .map(|r| std::time::Duration::from_secs(r.backoff_secs))
+                .unwrap_or_default();
+            let mut last_result: Result<rbh_actions::ActionOutcome, rbh_actions::ActionError> =
+                Ok(rbh_actions::ActionOutcome::Failed {
+                    error: "no attempts".into(),
+                });
+            for attempt in 1..=max_attempts {
+                if worker_cancel.is_cancelled() {
+                    break;
+                }
+                let fut = exec.execute(&entry, &ctx);
+                let result = match timeout {
+                    Some(secs) => match tokio::time::timeout(
                         std::time::Duration::from_secs(secs),
                         fut,
                     )
@@ -511,12 +534,26 @@ async fn dispatch_workers(
                         Err(_) => Ok(rbh_actions::ActionOutcome::Failed {
                             error: format!("timeout after {secs}s"),
                         }),
-                    }
+                    },
+                    None => fut.await,
+                };
+                let is_terminal = matches!(
+                    &result,
+                    Ok(rbh_actions::ActionOutcome::Success)
+                        | Ok(rbh_actions::ActionOutcome::Skipped { .. })
+                );
+                last_result = result;
+                if is_terminal || attempt == max_attempts {
+                    break;
                 }
-                None => fut.await,
-            };
+                tracing::debug!(
+                    %fid, attempt, max_attempts, backoff_secs = backoff.as_secs(),
+                    "action attempt failed, backing off before retry"
+                );
+                tokio::time::sleep(backoff).await;
+            }
             drop(permit);
-            match result {
+            match last_result {
                 Ok(rbh_actions::ActionOutcome::Success) => {
                     tracing::debug!(%fid, "action success");
                     WorkerOutcome::Success
@@ -951,6 +988,97 @@ mod tests {
         .await;
         assert_eq!(succ2, 0);
         assert_eq!(failed2, 2, "both should timeout");
+    }
+
+    struct FailThenSucceedExecutor {
+        calls: Arc<AtomicUsize>,
+        fail_first_n: usize,
+    }
+
+    #[async_trait]
+    impl rbh_actions::ActionExecutor for FailThenSucceedExecutor {
+        async fn execute(
+            &self,
+            _entry: &EntryRow,
+            _ctx: &rbh_actions::ActionContext,
+        ) -> std::result::Result<rbh_actions::ActionOutcome, rbh_actions::ActionError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_first_n {
+                Ok(rbh_actions::ActionOutcome::Failed {
+                    error: format!("intentional #{n}"),
+                })
+            } else {
+                Ok(rbh_actions::ActionOutcome::Success)
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_retries_until_success() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let exec: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(FailThenSucceedExecutor {
+            calls: calls.clone(),
+            fail_first_n: 2, // fail twice, succeed on 3rd attempt
+        });
+        let ctx = Arc::new(rbh_actions::ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: lustre_api::LustreApi,
+        });
+        let cancel = scheduler_rs::prelude::CancellationToken::new();
+        let rules = Arc::new(Vec::new());
+        let params = Arc::new(ActionParams {
+            retry: Some(crate::RetryParams { max_attempts: 3, backoff_secs: 0 }),
+            ..Default::default()
+        });
+        let (succ, _, failed) = dispatch_workers(
+            mk_candidates(1),
+            exec,
+            ctx,
+            1,
+            None,
+            cancel,
+            0,
+            rules,
+            params,
+        )
+        .await;
+        assert_eq!(succ, 1);
+        assert_eq!(failed, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "expected 3 attempts");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_retry_exhausts_then_fails() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let exec: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(FailThenSucceedExecutor {
+            calls: calls.clone(),
+            fail_first_n: 999, // always fail
+        });
+        let ctx = Arc::new(rbh_actions::ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: lustre_api::LustreApi,
+        });
+        let cancel = scheduler_rs::prelude::CancellationToken::new();
+        let rules = Arc::new(Vec::new());
+        let params = Arc::new(ActionParams {
+            retry: Some(crate::RetryParams { max_attempts: 2, backoff_secs: 0 }),
+            ..Default::default()
+        });
+        let (succ, _, failed) = dispatch_workers(
+            mk_candidates(1),
+            exec,
+            ctx,
+            1,
+            None,
+            cancel,
+            0,
+            rules,
+            params,
+        )
+        .await;
+        assert_eq!(succ, 0);
+        assert_eq!(failed, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

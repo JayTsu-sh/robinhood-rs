@@ -138,6 +138,41 @@ pub struct ActionParams {
     /// Rate limit applied to dispatched actions. See [`RateLimit`].
     #[serde(default)]
     pub rate_limit: Option<RateLimit>,
+    /// Retry policy applied per action failure.
+    #[serde(default)]
+    pub retry: Option<RetryParams>,
+    /// HSM-specific parameters (archive_id, hints). Only consumed by
+    /// HSM action executors; ignored by other kinds.
+    #[serde(default)]
+    pub hsm: Option<HsmParams>,
+}
+
+/// Retry policy for a single entry. On `Failed`/error outcomes the
+/// dispatcher sleeps `backoff_secs` and calls the executor again, up
+/// to `max_attempts` total attempts (so `max_attempts=3` = 1 initial +
+/// 2 retries).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RetryParams {
+    pub max_attempts: u32,
+    #[serde(default = "default_backoff")]
+    pub backoff_secs: u64,
+}
+
+fn default_backoff() -> u64 {
+    1
+}
+
+/// HSM-specific per-policy knobs. `archive_id` routes the request to a
+/// specific HSM backend; `hints` is opaque payload passed to the HSM
+/// agent (documented per-agent; commonly a tier name for multi-tier).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct HsmParams {
+    /// HSM archive backend id. When `None`, defaults to 1.
+    pub archive_id: Option<u32>,
+    /// Agent-specific hints (e.g. tier selector). Base64 when round-
+    /// tripping through JSON if the payload isn't UTF-8.
+    #[serde(default)]
+    pub hints: Option<String>,
 }
 
 /// Action rate limit. Both fields are optional; `None` means unlimited.
@@ -164,6 +199,15 @@ impl ActionParams {
                 (Some(a), Some(b)) => Some(RateLimit {
                     max_per_sec: a.max_per_sec.or(b.max_per_sec),
                     max_bytes_per_sec: a.max_bytes_per_sec.or(b.max_bytes_per_sec),
+                }),
+                (Some(a), None) => Some(a),
+                (None, b) => b,
+            },
+            retry: self.retry.or(base.retry),
+            hsm: match (self.hsm.clone(), base.hsm.clone()) {
+                (Some(a), Some(b)) => Some(HsmParams {
+                    archive_id: a.archive_id.or(b.archive_id),
+                    hints: a.hints.or(b.hints),
                 }),
                 (Some(a), None) => Some(a),
                 (None, b) => b,
@@ -290,6 +334,11 @@ mod tests {
                 max_per_sec: Some(100),
                 max_bytes_per_sec: Some(10_000_000),
             }),
+            retry: Some(RetryParams { max_attempts: 3, backoff_secs: 2 }),
+            hsm: Some(HsmParams {
+                archive_id: Some(1),
+                hints: Some("tier=cold".into()),
+            }),
         };
         let over = ActionParams {
             max_count: Some(50),
@@ -301,6 +350,8 @@ mod tests {
                 max_per_sec: Some(30),
                 max_bytes_per_sec: None,
             }),
+            retry: None,
+            hsm: Some(HsmParams { archive_id: Some(2), hints: None }),
         };
         let merged = over.merge_over(&base);
         assert_eq!(merged.max_count, Some(50));
@@ -312,6 +363,14 @@ mod tests {
         let rl = merged.rate_limit.unwrap();
         assert_eq!(rl.max_per_sec, Some(30));
         assert_eq!(rl.max_bytes_per_sec, Some(10_000_000));
+        // retry: over.retry=None, base.retry=Some → base wins.
+        let r = merged.retry.unwrap();
+        assert_eq!(r.max_attempts, 3);
+        assert_eq!(r.backoff_secs, 2);
+        // hsm: archive_id=over; hints=base (over's hints=None).
+        let h = merged.hsm.unwrap();
+        assert_eq!(h.archive_id, Some(2));
+        assert_eq!(h.hints.as_deref(), Some("tier=cold"));
     }
 
     #[test]

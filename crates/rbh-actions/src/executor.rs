@@ -129,6 +129,10 @@ impl ActionExecutor for PurgeExecutor {
 pub struct HsmArchiveExecutor {
     /// HSM archive backend id (typically 1).
     pub archive_id: u32,
+    /// Agent-specific hints passed as the HSM request payload. `None`
+    /// sends an empty data block; the Lustre HSM coordinator ignores
+    /// it but agents (copytool, lhsmtool_cmd) may interpret it.
+    pub hints: Option<Vec<u8>>,
 }
 
 #[async_trait]
@@ -166,18 +170,22 @@ impl ActionExecutor for HsmArchiveExecutor {
         // Submit archive request via spawn_blocking (FFI is sync).
         let fid = entry.fid;
         let archive_id = self.archive_id;
+        let hints = self.hints.clone();
         let mount = ctx.mount_path.clone();
         let lustre = ctx.lustre;
         tokio::task::spawn_blocking(move || {
-            HsmRequestBuilder::new(HsmAction::Archive)
+            let mut builder = HsmRequestBuilder::new(HsmAction::Archive)
                 .archive_id(archive_id)
-                .add_fid(fid)
-                .submit(&lustre, &mount)
+                .add_fid(fid);
+            if let Some(h) = hints {
+                builder = builder.data(h);
+            }
+            builder.submit(&lustre, &mount)
         })
         .await
         .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
 
-        tracing::info!("HSM archive request submitted");
+        tracing::info!(archive_id, "HSM archive request submitted");
         Ok(ActionOutcome::Success)
     }
 }
