@@ -360,8 +360,16 @@ impl EntryStore {
             AggregateSort::Count => "cnt DESC",
             AggregateSort::Size => "total_size DESC",
         };
+        // parent_fid is BINARY(16); all other whitelisted keys are
+        // integer or VARCHAR. HEX() renders the FID bytes as a printable
+        // string so the JSON payload stays readable.
+        let grp_expr = if group_col == "parent_fid" {
+            format!("HEX({group_col})")
+        } else {
+            format!("CAST({group_col} AS CHAR)")
+        };
         let sql = format!(
-            "SELECT CAST({group_col} AS CHAR) AS grp, COUNT(*) AS cnt, \
+            "SELECT {grp_expr} AS grp, COUNT(*) AS cnt, \
              CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total_size \
              FROM entries GROUP BY {group_col} \
              ORDER BY {order} LIMIT ?"

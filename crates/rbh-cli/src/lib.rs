@@ -208,10 +208,28 @@ fn print_aggregate_table(v: &serde_json::Value, key_label: &str) {
     let arr = v.as_array().cloned().unwrap_or_default();
     println!("{:<16}  {:>10}  {:>18}", key_label, "count", "total_size");
     for row in arr {
-        let k = row.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+        let raw = row.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+        let k = if key_label == "kind" {
+            kind_code_to_label(raw)
+        } else {
+            raw.to_string()
+        };
         let c = row.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
         let s = row.get("total_size").and_then(|v| v.as_u64()).unwrap_or(0);
         println!("{k:<16}  {c:>10}  {s:>18}");
+    }
+}
+
+fn kind_code_to_label(code: &str) -> String {
+    match code {
+        "0" => "file".into(),
+        "1" => "dir".into(),
+        "2" => "symlink".into(),
+        "3" => "chardev".into(),
+        "4" => "blockdev".into(),
+        "5" => "fifo".into(),
+        "6" => "socket".into(),
+        other => other.to_string(),
     }
 }
 

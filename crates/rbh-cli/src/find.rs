@@ -53,9 +53,9 @@ pub struct FindArgs {
     /// Sort key: one of size, mtime, atime, ctime, uid, gid.
     #[arg(long)]
     pub sort: Option<String>,
-    /// Sort ascending when true (default), descending when false.
-    #[arg(long, default_value = "true")]
-    pub asc: bool,
+    /// Sort descending instead of the default ascending.
+    #[arg(long)]
+    pub desc: bool,
 
     /// Print as JSON instead of one-line summary.
     #[arg(long)]
@@ -112,10 +112,10 @@ pub fn build_query(args: &FindArgs, now: i64) -> Result<(Predicate, Vec<SortKey>
         let field = parse_sort_field(name)?;
         vec![SortKey {
             field,
-            dir: if args.asc {
-                rbh_predicate::OrderDir::Asc
-            } else {
+            dir: if args.desc {
                 rbh_predicate::OrderDir::Desc
+            } else {
+                rbh_predicate::OrderDir::Asc
             },
         }]
     } else {
@@ -372,15 +372,25 @@ mod tests {
     }
 
     #[test]
-    fn sort_flag_produces_single_key() {
+    fn sort_flag_defaults_ascending() {
         let args = FindArgs {
             sort: Some("size".into()),
-            asc: false,
             ..Default::default()
         };
         let (_, keys) = build_query(&args, 0).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].field, Field::Size);
+        assert_eq!(keys[0].dir, rbh_predicate::OrderDir::Asc);
+    }
+
+    #[test]
+    fn desc_flag_flips_direction() {
+        let args = FindArgs {
+            sort: Some("mtime".into()),
+            desc: true,
+            ..Default::default()
+        };
+        let (_, keys) = build_query(&args, 0).unwrap();
         assert_eq!(keys[0].dir, rbh_predicate::OrderDir::Desc);
     }
 }
