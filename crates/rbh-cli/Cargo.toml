@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 rbh-observability = { path = "../rbh-observability" }
+rbh-predicate = { path = "../rbh-predicate" }
 
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
