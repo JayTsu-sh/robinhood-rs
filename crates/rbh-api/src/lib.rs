@@ -13,7 +13,7 @@
 //! per-request spans with method/path/status/latency.
 
 mod handlers;
-mod state;
+pub mod state;
 
 pub use state::AppState;
 

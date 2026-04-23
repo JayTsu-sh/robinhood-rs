@@ -164,6 +164,12 @@ impl Task for PolicyRunTask {
             crate::PolicyKind::HsmRelease => Arc::new(rbh_actions::HsmReleaseExecutor),
             other => {
                 tracing::warn!(kind = other.as_str(), "action not implemented for this kind");
+                rbh_observability::metrics::POLICY_RUNS
+                    .with_label_values(&[policy_id_lbl.as_str(), "unimplemented"])
+                    .inc();
+                rbh_observability::metrics::POLICY_RUN_DURATION
+                    .with_label_values(&[policy_id_lbl.as_str()])
+                    .observe(run_started.elapsed().as_secs_f64());
                 return Ok(());
             }
         };

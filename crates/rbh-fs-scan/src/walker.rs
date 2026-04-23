@@ -37,6 +37,17 @@ pub struct ScanConfig {
     pub max_depth: Option<usize>,
     /// Channel buffer size for scan events.
     pub channel_size: usize,
+    /// Incremental scan: when set, entries whose `mtime < since_mtime`
+    /// are skipped. Directories are still descended (their contents
+    /// may be newer), but individual files below the threshold are not
+    /// emitted. Unit is unix seconds.
+    pub since_mtime: Option<i64>,
+    /// Pattern list matched against the entry *name* (not full path).
+    /// Shell globs — `*`, `?`, `[abc]`. Matches cause the entry to be
+    /// skipped entirely (directories skipped with this also pruned
+    /// from descent). Loaded from `.rbh_ignore` by default when the
+    /// walker discovers one at the scan root.
+    pub ignore_globs: Vec<String>,
 }
 
 impl Default for ScanConfig {
@@ -46,6 +57,8 @@ impl Default for ScanConfig {
             concurrency: num_workers(),
             max_depth: None,
             channel_size: 4096,
+            since_mtime: None,
+            ignore_globs: Vec::new(),
         }
     }
 }
@@ -104,6 +117,13 @@ impl FsScanner {
         // Seed the root directory.
         let _ = work_tx.try_send((config.root.clone(), 0, None));
 
+        // Merge ignore globs from .rbh_ignore at the scan root (if any)
+        // with globs supplied via config. The file format mirrors
+        // .gitignore: one glob per line, `#` lines and blanks are
+        // ignored.
+        let mut ignore = config.ignore_globs.clone();
+        ignore.extend(load_rbh_ignore_file(&config.root));
+
         let state = Arc::new(WalkState {
             lustre: LustreApi,
             max_depth: config.max_depth,
@@ -111,6 +131,8 @@ impl FsScanner {
             event_tx: event_tx.clone(),
             pending: pending.clone(),
             progress: progress.clone(),
+            since_mtime: config.since_mtime,
+            ignore_globs: Arc::new(ignore),
         });
 
         for worker_id in 0..config.concurrency {
@@ -147,6 +169,72 @@ struct WalkState {
     event_tx: mpsc::Sender<ScanEvent>,
     pending: Arc<AtomicUsize>,
     progress: Arc<ScanProgress>,
+    /// Skip entries whose mtime is older than this (unix seconds).
+    since_mtime: Option<i64>,
+    /// Glob patterns matched against the entry name (not full path).
+    ignore_globs: Arc<Vec<String>>,
+}
+
+/// Parse `.rbh_ignore` at the scan root. Returns empty on IO error —
+/// missing file is a common case, don't propagate.
+fn load_rbh_ignore_file(root: &Path) -> Vec<String> {
+    let path = root.join(".rbh_ignore");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Shell-glob match: `*` matches zero-or-more, `?` exactly one, `[abc]`
+/// a character class. Anchored at both ends (i.e. the whole name must
+/// match the pattern).
+pub(crate) fn glob_matches(pat: &str, s: &str) -> bool {
+    // Recursive walk; patterns are short so this is fine.
+    fn m(p: &[u8], t: &[u8]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        match p[0] {
+            b'*' => {
+                // Try consuming zero or more of t.
+                for i in 0..=t.len() {
+                    if m(&p[1..], &t[i..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            b'?' => !t.is_empty() && m(&p[1..], &t[1..]),
+            b'[' => {
+                // Find closing ].
+                let mut end = 1;
+                while end < p.len() && p[end] != b']' {
+                    end += 1;
+                }
+                if end == p.len() || t.is_empty() {
+                    return false;
+                }
+                let class = &p[1..end];
+                if class.contains(&t[0]) {
+                    m(&p[end + 1..], &t[1..])
+                } else {
+                    false
+                }
+            }
+            c => !t.is_empty() && t[0] == c && m(&p[1..], &t[1..]),
+        }
+    }
+    m(pat.as_bytes(), s.as_bytes())
+}
+
+fn is_ignored(globs: &[String], name: &str) -> bool {
+    globs.iter().any(|g| glob_matches(g, name))
 }
 
 async fn process_directory(state: &WalkState, dir_path: &Path, depth: usize, parent_fid: Option<LuFid>) {
@@ -192,6 +280,13 @@ async fn process_directory(state: &WalkState, dir_path: &Path, depth: usize, par
     while let Ok(Some(entry)) = read_dir.next_entry().await {
         let child_path = entry.path();
 
+        // .rbh_ignore + inline globs: match on file name.
+        let child_name_os = entry.file_name();
+        let child_name = child_name_os.to_string_lossy();
+        if is_ignored(&state.ignore_globs, &child_name) {
+            continue;
+        }
+
         // Stat child to determine type.
         let file_type = match entry.file_type().await {
             Ok(ft) => ft,
@@ -220,6 +315,14 @@ async fn process_directory(state: &WalkState, dir_path: &Path, depth: usize, par
             // Non-directory: stat, resolve FID, emit entry.
             match build_entry_blocking(&state.lustre, &child_path, dir_fid).await {
                 Ok(row) => {
+                    // Incremental scan: drop entries older than the cutoff.
+                    // Directories are kept (their children may be newer);
+                    // this filter applies only to files / symlinks / etc.
+                    if let Some(cut) = state.since_mtime {
+                        if row.mtime < cut {
+                            continue;
+                        }
+                    }
                     state.progress.entries_scanned.fetch_add(1, Ordering::Relaxed);
                     let _ = state.event_tx.send(ScanEvent::Entry(Box::new(row))).await;
                 }
@@ -282,6 +385,8 @@ mod tests {
             concurrency: 1,
             max_depth: Some(0),
             channel_size: 16,
+            since_mtime: None,
+            ignore_globs: Vec::new(),
         };
         let (mut rx, progress) = FsScanner::run(config);
 
@@ -304,6 +409,8 @@ mod tests {
             concurrency: 1,
             max_depth: Some(0),
             channel_size: 64,
+            since_mtime: None,
+            ignore_globs: Vec::new(),
         };
         let (mut rx, progress) = FsScanner::run(config);
 
@@ -314,5 +421,44 @@ mod tests {
         // Either we got entries (Lustre) or errors (non-Lustre), but something happened
         let (scanned, errors, _) = progress.snapshot();
         assert!(scanned > 0 || errors > 0);
+    }
+
+    #[test]
+    fn glob_literal_and_star() {
+        assert!(glob_matches("foo.txt", "foo.txt"));
+        assert!(!glob_matches("foo.txt", "bar.txt"));
+        assert!(glob_matches("*.tmp", "scratch.tmp"));
+        assert!(glob_matches("*.tmp", ".tmp"));
+        assert!(!glob_matches("*.tmp", "scratch.log"));
+        assert!(glob_matches("core.*", "core.1234"));
+    }
+
+    #[test]
+    fn glob_question_and_class() {
+        assert!(glob_matches("f?le", "file"));
+        assert!(glob_matches("f?le", "fale"));
+        assert!(!glob_matches("f?le", "fle"));
+        assert!(glob_matches("[abc].tmp", "a.tmp"));
+        assert!(!glob_matches("[abc].tmp", "d.tmp"));
+    }
+
+    #[test]
+    fn load_rbh_ignore_reads_and_strips() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = std::fs::File::create(dir.path().join(".rbh_ignore")).unwrap();
+        writeln!(f, "# comment").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "*.tmp").unwrap();
+        writeln!(f, "   core.*   ").unwrap();
+        drop(f);
+        let globs = load_rbh_ignore_file(dir.path());
+        assert_eq!(globs, vec!["*.tmp".to_string(), "core.*".to_string()]);
+    }
+
+    #[test]
+    fn load_rbh_ignore_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_rbh_ignore_file(dir.path()).is_empty());
     }
 }

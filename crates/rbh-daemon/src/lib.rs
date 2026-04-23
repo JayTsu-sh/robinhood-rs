@@ -151,9 +151,32 @@ pub async fn run() -> anyhow::Result<()> {
     // Reconcile existing policies → scheduler schedules.
     reconcile_all_policies(&scheduler, &policy_store).await;
 
+    // Prune threshold-fire schedules left behind by previous runs. Their
+    // names follow `rbh.policy.<id>.threshold.<idx>.<unix>` and the
+    // scheduler marks them Completed but never removes them — this
+    // keeps the schedules table from growing unbounded.
+    prune_threshold_schedules(&scheduler).await;
+
     // Start the scheduler loop.
     let _scheduler_handle = scheduler.spawn();
     tracing::info!("scheduler started");
+
+    // Periodic pruner (every 10 minutes) for long-lived daemons that
+    // fire thousands of threshold events.
+    {
+        let scheduler_for_prune = scheduler.clone();
+        let cancel_for_prune = daemon_cancel.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(600);
+            loop {
+                tokio::select! {
+                    _ = cancel_for_prune.cancelled() => return,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                prune_threshold_schedules(&scheduler_for_prune).await;
+            }
+        });
+    }
 
     // Threshold checker — polls enabled policies for ThresholdCount /
     // ThresholdVolume triggers and fires immediate policy runs on hit.
@@ -177,6 +200,7 @@ pub async fn run() -> anyhow::Result<()> {
         policy_store,
         entry_store,
         scheduler: Some(scheduler.clone()),
+        scans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let app = rbh_api::router(state);
 
@@ -207,6 +231,47 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing::info!("robinhood-rs daemon stopped");
     Ok(())
+}
+
+/// Remove Completed one-shot policy schedules from the scheduler DB.
+///
+/// Both threshold fires and manual `POST /api/policies/:id/run` calls
+/// produce ImmediateTrigger schedules named `rbh.policy.<id>.threshold.*`
+/// or `rbh.policy.<id>.manual.*`. scheduler-rs marks them Completed
+/// after the one-shot runs but never removes them. This sweep drops
+/// Completed rows matching either prefix.
+async fn prune_threshold_schedules(scheduler: &Scheduler) {
+    let records = match scheduler
+        .list_schedules_by_name_prefix("rbh.policy.")
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "prune: list_schedules_by_name_prefix failed");
+            return;
+        }
+    };
+    let mut pruned = 0u64;
+    for rec in records {
+        let name = match &rec.name {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.contains(".threshold.") && !name.contains(".manual.") {
+            continue;
+        }
+        if !matches!(rec.state, scheduler_rs::prelude::ScheduleState::Completed) {
+            continue;
+        }
+        if let Err(e) = scheduler.remove(&rec.id).await {
+            tracing::warn!(name = %name, error = %e, "prune: remove failed");
+            continue;
+        }
+        pruned += 1;
+    }
+    if pruned > 0 {
+        tracing::info!(pruned, "pruned completed one-shot schedules");
+    }
 }
 
 /// Resolve the list of (MDT, changelog reader id) pairs from environment.
@@ -348,6 +413,8 @@ async fn run_initial_scan(
         concurrency: 4,
         max_depth: None,
         channel_size: 1024,
+        since_mtime: None,
+        ignore_globs: Vec::new(),
     };
     let (mut rx, progress) = rbh_fs_scan::FsScanner::run(config);
 

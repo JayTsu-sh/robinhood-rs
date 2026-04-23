@@ -35,6 +35,22 @@ pub enum Command {
         id: u64,
     },
 
+    /// Manually trigger a one-shot run of a policy, optionally narrowed.
+    #[command(name = "policy-run")]
+    PolicyRun {
+        /// Policy ID.
+        id: u64,
+        /// Restrict to files striped on OST N.
+        #[arg(long = "target-ost")]
+        target_ost: Option<u32>,
+        /// Restrict to files in Lustre pool NAME.
+        #[arg(long = "target-pool")]
+        target_pool: Option<String>,
+        /// Restrict to files owned by UID.
+        #[arg(long = "target-user")]
+        target_user: Option<u32>,
+    },
+
     /// Show entry catalog count.
     Status,
 
@@ -60,6 +76,28 @@ pub enum Command {
         /// Max entries to show per category.
         #[arg(long, default_value = "50")]
         limit: usize,
+    },
+
+    /// Start a filesystem scan on the daemon and poll for completion.
+    Scan {
+        /// Root directory to scan (defaults to daemon's configured mount).
+        #[arg(long)]
+        root: Option<String>,
+        /// Incremental scan: skip entries older than this unix timestamp.
+        #[arg(long)]
+        since_mtime: Option<i64>,
+        /// Glob to skip (repeatable). Merged with .rbh_ignore at root.
+        #[arg(long = "ignore", value_name = "GLOB")]
+        ignore: Vec<String>,
+        /// Worker count.
+        #[arg(long)]
+        concurrency: Option<usize>,
+        /// Max descent depth.
+        #[arg(long)]
+        max_depth: Option<usize>,
+        /// Don't poll — return the scan id immediately.
+        #[arg(long)]
+        detach: bool,
     },
 }
 
@@ -155,6 +193,33 @@ pub async fn run() -> Result<()> {
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
+        Command::PolicyRun { id, target_ost, target_pool, target_user } => {
+            // Build target JSON matching rbh_policy::TargetFilter enum.
+            let target = if let Some(o) = target_ost {
+                Some(serde_json::json!({"kind": "ost", "osts": [o]}))
+            } else if let Some(p) = target_pool {
+                Some(serde_json::json!({"kind": "pool", "name": p}))
+            } else if let Some(u) = target_user {
+                Some(serde_json::json!({"kind": "user", "uid": u}))
+            } else {
+                None
+            };
+            let body = match target {
+                Some(t) => serde_json::json!({ "target": t }),
+                None => serde_json::json!({}),
+            };
+            let resp = client
+                .post(format!("{}/api/policies/{}/run", cli.api_url, id))
+                .json(&body)
+                .send()
+                .await?;
+            let status = resp.status();
+            let out: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!("server {status}: {out}");
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
         Command::Status => {
             let resp = client.get(format!("{}/api/entries/count", cli.api_url)).send().await?;
             let body: serde_json::Value = resp.json().await?;
@@ -169,8 +234,81 @@ pub async fn run() -> Result<()> {
         Command::Report(cmd) => run_report(&client, &cli.api_url, cmd).await?,
         Command::Undelete(cmd) => run_undelete(&client, &cli.api_url, cmd).await?,
         Command::Diff { mount, limit } => run_diff(&client, &cli.api_url, &mount, limit).await?,
+        Command::Scan {
+            root,
+            since_mtime,
+            ignore,
+            concurrency,
+            max_depth,
+            detach,
+        } => {
+            run_scan(
+                &client,
+                &cli.api_url,
+                root,
+                since_mtime,
+                ignore,
+                concurrency,
+                max_depth,
+                detach,
+            )
+            .await?
+        }
     }
 
+    Ok(())
+}
+
+async fn run_scan(
+    client: &reqwest::Client,
+    api_url: &str,
+    root: Option<String>,
+    since_mtime: Option<i64>,
+    ignore: Vec<String>,
+    concurrency: Option<usize>,
+    max_depth: Option<usize>,
+    detach: bool,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "root": root,
+        "since_mtime": since_mtime,
+        "ignore_globs": ignore,
+        "concurrency": concurrency,
+        "max_depth": max_depth,
+    });
+    let resp = client
+        .post(format!("{api_url}/api/scans"))
+        .json(&body)
+        .send()
+        .await
+        .context("POST /api/scans")?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("server {status}: {v}");
+    }
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("no scan id in response"))?
+        .to_string();
+    println!("scan started: {id}");
+    if detach {
+        return Ok(());
+    }
+    // poll until Completed or Failed
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let rec = fetch_json(client, &format!("{api_url}/api/scans/{id}")).await?;
+        let state = rec.get("state").and_then(|s| s.as_str()).unwrap_or("running");
+        let scanned = rec.get("scanned").and_then(|s| s.as_u64()).unwrap_or(0);
+        let errors = rec.get("errors").and_then(|s| s.as_u64()).unwrap_or(0);
+        let dirs = rec.get("dirs").and_then(|s| s.as_u64()).unwrap_or(0);
+        println!("  [{state}] scanned={scanned} dirs={dirs} errors={errors}");
+        if state == "completed" || state == "failed" {
+            break;
+        }
+    }
     Ok(())
 }
 

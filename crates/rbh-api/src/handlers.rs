@@ -12,7 +12,7 @@ use rbh_entry_store::store::{AggregateKey, AggregateSort, QueryParam};
 use rbh_policy::{PolicyDef, PolicyError};
 use rbh_predicate::{Predicate, SortKey, SqlParam, to_sql};
 
-use crate::AppState;
+use crate::{AppState, state::{ScanRecord, ScanState}};
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
@@ -21,6 +21,7 @@ pub fn api_routes() -> Router<AppState> {
             "/policies/{id}",
             get(get_policy).put(update_policy).delete(delete_policy),
         )
+        .route("/policies/{id}/run", post(run_policy_now))
         .route("/entries/count", get(entry_count))
         .route("/entries/query", post(query_entries))
         .route("/reports/aggregate", post(report_aggregate))
@@ -30,6 +31,8 @@ pub fn api_routes() -> Router<AppState> {
         .route("/metrics", get(metrics_endpoint))
         .route("/removed", get(list_removed))
         .route("/removed/{fid}", axum::routing::delete(forget_removed))
+        .route("/scans", post(start_scan).get(list_scans))
+        .route("/scans/{id}", get(get_scan))
         .route("/health", get(health))
 }
 
@@ -133,6 +136,68 @@ async fn update_policy(
         }
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RunRequest {
+    /// Optional run narrowing. Identical JSON shape to
+    /// `rbh_policy::TargetFilter`. When absent, runs against the whole FS.
+    #[serde(default)]
+    pub target: Option<rbh_policy::TargetFilter>,
+}
+
+/// Fire a one-shot policy run via an `ImmediateTrigger` schedule. The
+/// response returns the generated schedule id so operators can cancel
+/// or observe it. Requires the scheduler to be present in `AppState`.
+#[tracing::instrument(skip(state, req))]
+async fn run_policy_now(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Json(req): Json<RunRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use scheduler_rs::prelude::{MisfirePolicy, ScheduleConfig, Task};
+    use scheduler_rs::trigger::ImmediateTrigger;
+
+    // Verify the policy exists first (returns 404 if not).
+    let _row = state.policy_store.get(id).await?;
+
+    let scheduler = state
+        .scheduler
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("scheduler not configured".into()))?;
+
+    let target = req.target.unwrap_or(rbh_policy::TargetFilter::Fs);
+    let task = rbh_policy::PolicyRunTask {
+        policy_id: id,
+        trigger_idx: u32::MAX, // sentinel: manual run, no trigger bound
+        target,
+    };
+    let task_data = serde_json::to_value(&task)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let config = ScheduleConfig {
+        misfire_policy: MisfirePolicy::Coalesce,
+        max_instances: 1,
+        ..Default::default()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = format!("rbh.policy.{id}.manual.{now}");
+    let schedule_id = scheduler
+        .add_raw(
+            rbh_policy::PolicyRunTask::TYPE_NAME.to_string(),
+            task_data,
+            Box::new(ImmediateTrigger::new()),
+            config,
+            Some(name.clone()),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("scheduler add_raw: {e}")))?;
+    Ok(Json(serde_json::json!({
+        "schedule_id": schedule_id.0.to_string(),
+        "name": name,
+    })))
 }
 
 #[tracing::instrument(skip(state))]
@@ -505,6 +570,136 @@ async fn oldest_entries(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(rows.into_iter().map(EntryDto::from).collect()))
+}
+
+// ---- /api/scans ----
+
+#[derive(Debug, Deserialize)]
+pub struct StartScanRequest {
+    /// Root directory to scan. Defaults to the daemon's configured mount.
+    pub root: Option<String>,
+    /// Incremental scan: only emit entries with mtime >= this unix time.
+    #[serde(default)]
+    pub since_mtime: Option<i64>,
+    /// Globs to skip (merged with .rbh_ignore at the root).
+    #[serde(default)]
+    pub ignore_globs: Vec<String>,
+    /// Worker count. Defaults to the crate default.
+    #[serde(default)]
+    pub concurrency: Option<usize>,
+    /// Max directory depth; None = unlimited.
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[tracing::instrument(skip(state, req))]
+async fn start_scan(
+    State(state): State<AppState>,
+    Json(req): Json<StartScanRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let root = req.root.unwrap_or_else(|| "/lustre".to_string());
+    let id = uuid::Uuid::new_v4().to_string();
+
+    let rec = ScanRecord {
+        id: id.clone(),
+        root: root.clone(),
+        since_mtime: req.since_mtime,
+        ignore_globs: req.ignore_globs.clone(),
+        state: ScanState::Running,
+        scanned: 0,
+        errors: 0,
+        dirs: 0,
+        started_at: now_epoch(),
+        finished_at: None,
+        error_message: None,
+    };
+    state.scans.lock().await.insert(id.clone(), rec);
+
+    // Detach a worker that drains the scan into the entry store.
+    let scans = state.scans.clone();
+    let entry_store = state.entry_store.clone();
+    let scan_id = id.clone();
+    tokio::spawn(async move {
+        let cfg = rbh_fs_scan::ScanConfig {
+            root: std::path::PathBuf::from(&root),
+            concurrency: req.concurrency.unwrap_or(4),
+            max_depth: req.max_depth,
+            channel_size: 4096,
+            since_mtime: req.since_mtime,
+            ignore_globs: req.ignore_globs,
+        };
+        let (mut rx, progress) = rbh_fs_scan::FsScanner::run(cfg);
+
+        let mut batch: Vec<rbh_entry_store::model::EntryRow> = Vec::with_capacity(100);
+        let mut errors = 0u64;
+        while let Some(event) = rx.recv().await {
+            match event {
+                rbh_fs_scan::ScanEvent::Entry(entry) => {
+                    batch.push(*entry);
+                    if batch.len() >= 100 {
+                        if let Err(e) = entry_store.upsert_batch(&batch).await {
+                            tracing::warn!(scan_id, error = %e, "batch upsert failed");
+                            errors += 1;
+                        }
+                        batch.clear();
+                    }
+                }
+                rbh_fs_scan::ScanEvent::Error { .. } => {
+                    errors += 1;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            if let Err(e) = entry_store.upsert_batch(&batch).await {
+                tracing::warn!(scan_id, error = %e, "final batch upsert failed");
+                errors += 1;
+            }
+        }
+
+        let (scanned, scan_errors, dirs) = progress.snapshot();
+        let total_errors = errors + scan_errors;
+        let mut map = scans.lock().await;
+        if let Some(rec) = map.get_mut(&scan_id) {
+            rec.state = if total_errors > 0 && scanned == 0 {
+                ScanState::Failed
+            } else {
+                ScanState::Completed
+            };
+            rec.scanned = scanned;
+            rec.errors = total_errors;
+            rec.dirs = dirs;
+            rec.finished_at = Some(now_epoch());
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"id": id}))))
+}
+
+#[tracing::instrument(skip(state))]
+async fn list_scans(State(state): State<AppState>) -> Json<Vec<ScanRecord>> {
+    let map = state.scans.lock().await;
+    let mut v: Vec<ScanRecord> = map.values().cloned().collect();
+    v.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    Json(v)
+}
+
+#[tracing::instrument(skip(state))]
+async fn get_scan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ScanRecord>, ApiError> {
+    let map = state.scans.lock().await;
+    map.get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| ApiError::Internal(format!("scan not found: {id}")))
 }
 
 // ---------------------------------------------------------------------------
