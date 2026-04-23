@@ -30,6 +30,12 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
         }
 
         Predicate::InPool { pool } => entry.pool_name.as_deref() == Some(pool.as_str()),
+
+        // OnOst is only meaningful with a DB-side JOIN against stripe_items.
+        // EntryRow does not carry the full OST list; treat as false in-memory
+        // so the evaluator stays conservative. Push down to SQL for accurate
+        // OST filtering.
+        Predicate::OnOst { .. } => false,
     }
 }
 

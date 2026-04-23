@@ -31,8 +31,9 @@ pub async fn reconcile_triggers(
     let mut built_triggers: Vec<(u32, Box<dyn scheduler_rs::trigger::Trigger>)> =
         Vec::with_capacity(def.triggers.len());
     for (idx, trigger_spec) in def.triggers.iter().enumerate() {
-        let trigger = build_trigger(trigger_spec)?;
-        built_triggers.push((idx as u32, trigger));
+        if let Some(trigger) = build_trigger(trigger_spec)? {
+            built_triggers.push((idx as u32, trigger));
+        }
     }
 
     // Step 2: remove old schedules (only after validation passes)
@@ -44,6 +45,7 @@ pub async fn reconcile_triggers(
         let task = PolicyRunTask {
             policy_id,
             trigger_idx: idx,
+            target: crate::TargetFilter::Fs,
         };
         let task_data = serde_json::to_value(&task).map_err(|e| PolicyError::Scheduler(e.to_string()))?;
         let schedule_name = format!("rbh.policy.{}.trigger.{}", policy_id, idx);
@@ -98,22 +100,32 @@ pub async fn remove_policy_schedules(scheduler: &Scheduler, policy_id: u64) -> R
 }
 
 /// Convert a `TriggerSpec` into a boxed scheduler-rs `Trigger`.
-fn build_trigger(spec: &TriggerSpec) -> Result<Box<dyn scheduler_rs::trigger::Trigger>, PolicyError> {
+///
+/// Returns `Ok(None)` for threshold variants — those are driven by the
+/// daemon-level threshold checker, not by scheduler-rs.
+fn build_trigger(
+    spec: &TriggerSpec,
+) -> Result<Option<Box<dyn scheduler_rs::trigger::Trigger>>, PolicyError> {
     use scheduler_rs::trigger::*;
 
     match spec {
         TriggerSpec::Interval { secs } => {
             if *secs == 0 {
-                return Err(PolicyError::InvalidTrigger("interval must be > 0 seconds".to_string()));
+                return Err(PolicyError::InvalidTrigger(
+                    "interval must be > 0 seconds".to_string(),
+                ));
             }
-            Ok(Box::new(IntervalTrigger::every(std::time::Duration::from_secs(*secs))))
+            Ok(Some(Box::new(IntervalTrigger::every(
+                std::time::Duration::from_secs(*secs),
+            ))))
         }
         TriggerSpec::Cron { expression } => {
-            let trigger = CronTrigger::new(expression).map_err(|e| PolicyError::InvalidTrigger(e.to_string()))?;
-            Ok(Box::new(trigger))
+            let trigger = CronTrigger::new(expression)
+                .map_err(|e| PolicyError::InvalidTrigger(e.to_string()))?;
+            Ok(Some(Box::new(trigger)))
         }
-        TriggerSpec::Once { at } => Ok(Box::new(OnceTrigger::at(*at))),
-        TriggerSpec::Immediate => Ok(Box::new(ImmediateTrigger::new())),
+        TriggerSpec::Once { at } => Ok(Some(Box::new(OnceTrigger::at(*at)))),
+        TriggerSpec::Immediate => Ok(Some(Box::new(ImmediateTrigger::new()))),
         TriggerSpec::Window { start, end, mode } => {
             let mut w = WindowTrigger::daily().start_at(*start).end_at(*end);
             if let WindowModeSpec::Repeat { interval_secs } = mode {
@@ -124,8 +136,11 @@ fn build_trigger(spec: &TriggerSpec) -> Result<Box<dyn scheduler_rs::trigger::Tr
                 }
                 w = w.repeat(std::time::Duration::from_secs(*interval_secs));
             }
-            Ok(Box::new(w))
+            Ok(Some(Box::new(w)))
         }
+        // Threshold triggers are driven by the daemon's threshold checker,
+        // not by scheduler-rs.
+        TriggerSpec::ThresholdCount { .. } | TriggerSpec::ThresholdVolume { .. } => Ok(None),
     }
 }
 
@@ -137,7 +152,7 @@ mod tests {
     #[test]
     fn build_interval_trigger() {
         let spec = TriggerSpec::Interval { secs: 300 };
-        let trigger = build_trigger(&spec).unwrap();
+        let trigger = build_trigger(&spec).unwrap().unwrap();
         assert!(trigger.description().contains("300"));
     }
 
@@ -146,14 +161,14 @@ mod tests {
         let spec = TriggerSpec::Cron {
             expression: "0 0 2 * * *".to_string(),
         };
-        let trigger = build_trigger(&spec).unwrap();
+        let trigger = build_trigger(&spec).unwrap().unwrap();
         assert!(!trigger.description().is_empty());
     }
 
     #[test]
     fn build_immediate_trigger() {
         let spec = TriggerSpec::Immediate;
-        let trigger = build_trigger(&spec).unwrap();
+        let trigger = build_trigger(&spec).unwrap().unwrap();
         // Immediate should fire once
         let next = trigger.next_fire_time(&Utc::now());
         assert!(next.is_some());
@@ -166,7 +181,7 @@ mod tests {
             end: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
             mode: WindowModeSpec::Once,
         };
-        let trigger = build_trigger(&spec).unwrap();
+        let trigger = build_trigger(&spec).unwrap().unwrap();
         assert!(!trigger.description().is_empty());
     }
 
@@ -177,7 +192,7 @@ mod tests {
             end: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
             mode: WindowModeSpec::Repeat { interval_secs: 600 },
         };
-        let trigger = build_trigger(&spec).unwrap();
+        let trigger = build_trigger(&spec).unwrap().unwrap();
         assert!(!trigger.description().is_empty());
     }
 
@@ -203,5 +218,20 @@ mod tests {
             mode: WindowModeSpec::Repeat { interval_secs: 0 },
         };
         assert!(build_trigger(&spec).is_err());
+    }
+
+    #[test]
+    fn threshold_count_is_skipped_for_scheduler() {
+        let spec = TriggerSpec::ThresholdCount {
+            check_interval_secs: 60,
+            high_count: 1_000,
+            low_count: 500,
+            post_trigger_wait_secs: 0,
+            target: crate::model::ThresholdTarget::Fs,
+        };
+        assert!(
+            matches!(build_trigger(&spec), Ok(None)),
+            "threshold triggers must not produce scheduler-rs triggers"
+        );
     }
 }

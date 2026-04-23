@@ -19,6 +19,39 @@ pub enum QueryParam {
     Str(String),
 }
 
+/// Sort ordering for [`EntryStore::aggregate_by`].
+#[derive(Debug, Clone, Copy)]
+pub enum AggregateSort {
+    Count,
+    Size,
+}
+
+/// Whitelisted column names available for [`EntryStore::aggregate_by`].
+/// Never lookup from raw user input — go through this enum.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateKey {
+    Uid,
+    Gid,
+    Projid,
+    Kind,
+    PoolName,
+    ParentFid,
+}
+
+impl AggregateKey {
+    pub fn as_column(self) -> &'static str {
+        match self {
+            Self::Uid => "uid",
+            Self::Gid => "gid",
+            Self::Projid => "projid",
+            Self::Kind => "kind",
+            Self::PoolName => "pool_name",
+            Self::ParentFid => "parent_fid",
+        }
+    }
+}
+
 /// Connection to the `rbh_entries` MariaDB database.
 #[derive(Clone)]
 pub struct EntryStore {
@@ -278,11 +311,29 @@ impl EntryStore {
         params: &[QueryParam],
         limit: u64,
     ) -> Result<Vec<EntryRow>> {
+        self.query_page(where_clause, params, None, limit, 0).await
+    }
+
+    /// Paginated query with optional ORDER BY. `order_by` must be a
+    /// pre-validated SQL fragment (column name + ASC/DESC). Callers build
+    /// it via [`SortKey::to_sql_fragment`] — never from raw user input.
+    pub async fn query_page(
+        &self,
+        where_clause: &str,
+        params: &[QueryParam],
+        order_by: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<EntryRow>> {
+        let order_clause = match order_by {
+            Some(o) if !o.is_empty() => format!(" ORDER BY {o}"),
+            _ => String::new(),
+        };
         let sql = format!(
             "SELECT fid, parent_fid, name, kind, size, blocks, uid, gid, projid, \
              mode, nlink, atime, mtime, ctime, stripe_count, stripe_size, \
              pool_name, sm_status, last_seen \
-             FROM entries WHERE {where_clause} LIMIT ?"
+             FROM entries WHERE {where_clause}{order_clause} LIMIT ? OFFSET ?"
         );
         let mut query = sqlx::query(&sql);
         for p in params {
@@ -291,9 +342,59 @@ impl EntryStore {
                 QueryParam::Str(s) => query.bind(s.as_str()),
             };
         }
-        query = query.bind(limit as i64);
+        query = query.bind(limit as i64).bind(offset as i64);
         let rows = query.fetch_all(&self.pool).await?;
         rows.iter().map(row_to_entry).collect()
+    }
+
+    /// Group entries by a column, returning `(key, count, total_size)`
+    /// tuples. `group_col` MUST be a validated column name (never raw user
+    /// input) — callers go through [`AggregateKey::as_column`].
+    pub async fn aggregate_by(
+        &self,
+        group_col: &str,
+        order_by: AggregateSort,
+        limit: u64,
+    ) -> Result<Vec<(String, u64, u64)>> {
+        let order = match order_by {
+            AggregateSort::Count => "cnt DESC",
+            AggregateSort::Size => "total_size DESC",
+        };
+        let sql = format!(
+            "SELECT CAST({group_col} AS CHAR) AS grp, COUNT(*) AS cnt, \
+             CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total_size \
+             FROM entries GROUP BY {group_col} \
+             ORDER BY {order} LIMIT ?"
+        );
+        let rows = sqlx::query(&sql).bind(limit as i64).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|r| {
+                let key: Option<String> = r.try_get("grp").ok();
+                let cnt: i64 = r.try_get("cnt")?;
+                let total: u64 = r.try_get::<u64, _>("total_size").unwrap_or(0);
+                Ok((key.unwrap_or_default(), cnt as u64, total))
+            })
+            .collect()
+    }
+
+    /// Count matching rows (no limit/offset). Used for paginated responses
+    /// that want a total count.
+    pub async fn count_where(
+        &self,
+        where_clause: &str,
+        params: &[QueryParam],
+    ) -> Result<u64> {
+        let sql = format!("SELECT COUNT(*) AS c FROM entries WHERE {where_clause}");
+        let mut query = sqlx::query(&sql);
+        for p in params {
+            query = match p {
+                QueryParam::Int(n) => query.bind(*n),
+                QueryParam::Str(s) => query.bind(s.as_str()),
+            };
+        }
+        let row = query.fetch_one(&self.pool).await?;
+        let c: i64 = row.try_get("c")?;
+        Ok(c as u64)
     }
 }
 

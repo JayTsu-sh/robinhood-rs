@@ -15,7 +15,7 @@ mod sql;
 use serde::{Deserialize, Serialize};
 
 pub use eval::matches;
-pub use sql::{SqlParam, to_sql};
+pub use sql::{OrderDir, SortKey, SqlParam, to_sql};
 
 /// A boolean predicate over entry attributes.
 ///
@@ -39,6 +39,10 @@ pub enum Predicate {
     NameLike { pattern: String },
     /// Match entries whose pool_name equals the given string.
     InPool { pool: String },
+    /// Match entries with a stripe on any of the given OST indices.
+    /// Generated SQL is `EXISTS (SELECT 1 FROM stripe_items s WHERE
+    /// s.fid = entries.fid AND s.ost_index IN (?, ?, …))`.
+    OnOst { osts: Vec<u32> },
     /// Always true — useful as default rule condition.
     True,
     /// Always false.

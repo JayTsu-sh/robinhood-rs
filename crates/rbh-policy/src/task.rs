@@ -35,11 +35,72 @@ fn runtime() -> &'static Arc<PolicyRuntime> {
     RUNTIME.get().expect("PolicyRuntime not initialized — call init_runtime() at startup")
 }
 
+/// Narrow a policy run to a specific subset of the filesystem. Injected by
+/// triggers (e.g. threshold triggers target a specific OST or pool). The
+/// filter is composed as an extra `AND` on top of the policy `scope`.
+///
+/// Serialized into the scheduler-rs task payload, so new variants must be
+/// backwards-compatible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TargetFilter {
+    /// Default — apply to the whole catalog.
+    Fs,
+    /// Match files striped on any of the listed OST indices.
+    Ost { osts: Vec<u32> },
+    /// Match files in the named OST pool.
+    Pool { name: String },
+    /// Match files owned by the given UID.
+    User { uid: u32 },
+    /// Match files in the given GID.
+    Group { gid: u32 },
+    /// Match files in the given project id.
+    Projid { projid: u32 },
+}
+
+impl TargetFilter {
+    /// Render as an in-memory `Predicate`. `Fs` => `True`.
+    pub fn to_predicate(&self) -> rbh_predicate::Predicate {
+        use rbh_predicate::{CmpOp, Field, Predicate, Value};
+        match self {
+            Self::Fs => Predicate::True,
+            Self::Ost { osts } => Predicate::OnOst { osts: osts.clone() },
+            Self::Pool { name } => Predicate::InPool { pool: name.clone() },
+            Self::User { uid } => Predicate::Cmp {
+                field: Field::Uid,
+                cmp: CmpOp::Eq,
+                value: Value::Num(*uid as i64),
+            },
+            Self::Group { gid } => Predicate::Cmp {
+                field: Field::Gid,
+                cmp: CmpOp::Eq,
+                value: Value::Num(*gid as i64),
+            },
+            Self::Projid { projid } => Predicate::Cmp {
+                field: Field::Projid,
+                cmp: CmpOp::Eq,
+                value: Value::Num(*projid as i64),
+            },
+        }
+    }
+}
+
+impl Default for TargetFilter {
+    fn default() -> Self {
+        Self::Fs
+    }
+}
+
 /// Task data serialized into scheduler-rs schedule rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRunTask {
     pub policy_id: u64,
     pub trigger_idx: u32,
+    /// Per-run narrowing injected by threshold triggers. Defaults to the
+    /// whole filesystem so existing scheduled runs keep working after an
+    /// upgrade.
+    #[serde(default)]
+    pub target: TargetFilter,
 }
 
 #[async_trait]
@@ -91,8 +152,27 @@ impl Task for PolicyRunTask {
             }
         };
 
-        // 3. Query candidates via predicate SQL pushdown.
-        let (where_clause, sql_params) = rbh_predicate::to_sql(&def.scope);
+        // 3. Query candidates via predicate SQL pushdown. Compose the scope
+        // with ignore_fileclass AND the per-run target filter:
+        //   WHERE scope AND <target> AND NOT (ignore1 OR ignore2 …).
+        let scope_with_ignore =
+            crate::model::compose_scope_with_ignores(&def.scope, &def.ignore_fileclass);
+        let target_pred = self.target.to_predicate();
+        let effective_scope = match &target_pred {
+            rbh_predicate::Predicate::True => scope_with_ignore,
+            _ => rbh_predicate::Predicate::And {
+                children: vec![scope_with_ignore, target_pred.clone()],
+            },
+        };
+        if !def.ignore_fileclass.is_empty() || !matches!(self.target, TargetFilter::Fs) {
+            tracing::debug!(
+                policy_id = self.policy_id,
+                ignore_count = def.ignore_fileclass.len(),
+                target = ?self.target,
+                "composed scope with ignore_fileclass and target"
+            );
+        }
+        let (where_clause, sql_params) = rbh_predicate::to_sql(&effective_scope);
         let query_params: Vec<rbh_entry_store::store::QueryParam> = sql_params
             .into_iter()
             .map(|p| match p {
@@ -101,7 +181,22 @@ impl Task for PolicyRunTask {
             })
             .collect();
         let max_count = def.default_action.max_count.unwrap_or(10_000);
-        let candidates = match rt.entry_store.query_where(&where_clause, &query_params, max_count).await {
+        let order_by = def
+            .default_action
+            .lru_sort
+            .and_then(|s| s.column())
+            .map(|col| format!("{col} ASC"));
+        let candidates = match rt
+            .entry_store
+            .query_page(
+                &where_clause,
+                &query_params,
+                order_by.as_deref(),
+                max_count,
+                0,
+            )
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "failed to query candidates");
@@ -131,8 +226,8 @@ impl Task for PolicyRunTask {
                 break;
             }
 
-            // TODO: Filter out entries matching ignore_fileclass
-            // Evaluate rules — first match wins
+            // ignore_fileclass is enforced at the SQL layer before this loop
+            // (see step 3); rule evaluation here only picks action params.
             let _params = evaluate_rules(&def.rules, &def.default_action, entry);
 
             match executor.execute(entry, &action_ctx).await {
@@ -266,5 +361,55 @@ mod tests {
         }];
         let result = evaluate_rules(&rules, &default, &test_entry());
         assert_eq!(result.max_count, Some(1000));
+    }
+
+    #[test]
+    fn target_filter_fs_is_true() {
+        assert_eq!(
+            TargetFilter::Fs.to_predicate(),
+            rbh_predicate::Predicate::True
+        );
+    }
+
+    #[test]
+    fn target_filter_ost_produces_on_ost() {
+        let p = TargetFilter::Ost { osts: vec![2, 5] }.to_predicate();
+        assert_eq!(
+            p,
+            rbh_predicate::Predicate::OnOst { osts: vec![2, 5] }
+        );
+    }
+
+    #[test]
+    fn target_filter_pool_produces_in_pool() {
+        let p = TargetFilter::Pool {
+            name: "flash".into(),
+        }
+        .to_predicate();
+        assert_eq!(
+            p,
+            rbh_predicate::Predicate::InPool {
+                pool: "flash".into()
+            }
+        );
+    }
+
+    #[test]
+    fn target_filter_serde_default_is_fs() {
+        let json = r#"{"policy_id":1,"trigger_idx":0}"#;
+        let t: PolicyRunTask = serde_json::from_str(json).unwrap();
+        assert_eq!(t.target, TargetFilter::Fs);
+    }
+
+    #[test]
+    fn target_filter_serde_ost_roundtrip() {
+        let t = PolicyRunTask {
+            policy_id: 1,
+            trigger_idx: 0,
+            target: TargetFilter::Ost { osts: vec![7] },
+        };
+        let s = serde_json::to_string(&t).unwrap();
+        let back: PolicyRunTask = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target, TargetFilter::Ost { osts: vec![7] });
     }
 }

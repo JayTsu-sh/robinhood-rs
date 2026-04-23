@@ -3,7 +3,49 @@
 //! Parameters are collected as [`SqlParam`] values and appended to a `Vec`;
 //! the caller binds them positionally via sqlx `query.bind(...)`.
 
-use crate::{Predicate, Value};
+use serde::{Deserialize, Serialize};
+
+use crate::{Field, Predicate, Value};
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderDir {
+    Asc,
+    Desc,
+}
+
+impl OrderDir {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+    }
+}
+
+/// A sort key — pair of validated field + direction. Never constructed from
+/// raw user-provided column names; all columns come through [`Field`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortKey {
+    pub field: Field,
+    pub dir: OrderDir,
+}
+
+impl SortKey {
+    /// Render a safe `"<col> ASC|DESC"` fragment for SQL composition.
+    pub fn to_sql_fragment(&self) -> String {
+        format!("{} {}", self.field.column_name(), self.dir.as_sql())
+    }
+
+    /// Join a slice of keys into a comma-separated fragment.
+    pub fn list_to_sql(keys: &[SortKey]) -> String {
+        keys.iter()
+            .map(SortKey::to_sql_fragment)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
 /// A parameter value to bind in the generated SQL.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +92,23 @@ fn build(pred: &Predicate, params: &mut Vec<SqlParam>) -> String {
         Predicate::InPool { pool } => {
             params.push(SqlParam::Str(pool.clone()));
             "pool_name = ?".to_string()
+        }
+
+        Predicate::OnOst { osts } => {
+            if osts.is_empty() {
+                return "1=0".to_string();
+            }
+            let placeholders = (0..osts.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            for idx in osts {
+                params.push(SqlParam::Num(*idx as i64));
+            }
+            format!(
+                "EXISTS (SELECT 1 FROM stripe_items s \
+                 WHERE s.fid = entries.fid AND s.ost_index IN ({placeholders}))"
+            )
         }
 
         Predicate::And { children } => {
@@ -220,5 +279,34 @@ mod tests {
         };
         let (_, params) = to_sql(&pred);
         assert_eq!(params, vec![SqlParam::Num(1000), SqlParam::Num(100), SqlParam::Num(0)]);
+    }
+
+    #[test]
+    fn on_ost_single_placeholder() {
+        let pred = Predicate::OnOst { osts: vec![3] };
+        let (sql, params) = to_sql(&pred);
+        assert!(
+            sql.contains("EXISTS (SELECT 1 FROM stripe_items s"),
+            "missing EXISTS: {sql}"
+        );
+        assert!(sql.contains("IN (?)"), "unexpected SQL: {sql}");
+        assert_eq!(params, vec![SqlParam::Num(3)]);
+    }
+
+    #[test]
+    fn on_ost_multi_placeholders() {
+        let pred = Predicate::OnOst { osts: vec![1, 4, 7] };
+        let (sql, params) = to_sql(&pred);
+        assert!(sql.contains("IN (?, ?, ?)"));
+        assert_eq!(
+            params,
+            vec![SqlParam::Num(1), SqlParam::Num(4), SqlParam::Num(7)]
+        );
+    }
+
+    #[test]
+    fn on_ost_empty_is_false() {
+        let pred = Predicate::OnOst { osts: vec![] };
+        assert_eq!(to_sql(&pred).0, "1=0");
     }
 }

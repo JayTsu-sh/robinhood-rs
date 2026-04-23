@@ -14,7 +14,11 @@ pub mod reconcile;
 pub mod store;
 pub mod task;
 
-pub use model::{ActionParams, PolicyDef, PolicyKind, PolicyRow, Rule, TriggerSpec, WindowModeSpec};
+pub use model::{
+    ActionParams, FileClassDef, LruSortAttr, PolicyDef, PolicyKind, PolicyRow, Rule,
+    TriggerSpec, WindowModeSpec, compose_scope_with_ignores,
+};
+pub use task::TargetFilter;
 pub use reconcile::reconcile_triggers;
 pub use store::PolicyStore;
 pub use task::{PolicyRunTask, PolicyRuntime, init_runtime};
