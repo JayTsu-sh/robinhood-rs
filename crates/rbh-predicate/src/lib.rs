@@ -43,6 +43,11 @@ pub enum Predicate {
     /// Generated SQL is `EXISTS (SELECT 1 FROM stripe_items s WHERE
     /// s.fid = entries.fid AND s.ost_index IN (?, ?, …))`.
     OnOst { osts: Vec<u32> },
+    /// Match entries whose `sm_status.hsm_state` JSON field equals the
+    /// given string (e.g. `"archived"`, `"released"`, `"none"`). Uses
+    /// MySQL's `JSON_UNQUOTE(JSON_EXTRACT(...))` so the comparison is
+    /// insensitive to JSON escape form.
+    HsmStateEq { state: String },
     /// Always true — useful as default rule condition.
     True,
     /// Always false.

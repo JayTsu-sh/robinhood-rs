@@ -272,12 +272,126 @@ async fn apply_event(
             restat_entry(store, mount, fid, None, Bytes::new()).await
         }
 
-        // ── Events we skip for now ──
-        ChangelogEvent::XAttr { .. }
-        | ChangelogEvent::Layout { .. }
-        | ChangelogEvent::Hsm { .. } => {
-            Ok(false)
+        ChangelogEvent::Hsm { fid, hsm_event, hsm_flags, hsm_error } => {
+            apply_hsm_event(store, fid, *hsm_event, *hsm_flags, *hsm_error).await
         }
+
+        // ── Events we skip for now ──
+        ChangelogEvent::XAttr { .. } | ChangelogEvent::Layout { .. } => Ok(false),
+    }
+}
+
+/// Translate a Lustre `hsm_event` + `hsm_flags` into a JSON patch and
+/// merge it into `entries.sm_status`. Returns `true` when a row was
+/// updated (i.e. the entry is already in the catalog).
+///
+/// The `hsm_event` mapping follows `enum hsm_event` in
+/// `<lustre/lustre_user.h>`:
+///   0 archive  1 restore  2 cancel  3 release  4 remove  5 state
+///
+/// `hsm_flags` carries the packed state bits from `cr_flags`; bit 0 is
+/// `CLF_HSM_DIRTY`. Non-zero `hsm_error` means the coordinator reported
+/// a failure — we record the code and the inferred operation but leave
+/// the previous state in place.
+/// Pure helper: translate Lustre HSM event fields into the sm_status
+/// JSON patch. Separated from `apply_hsm_event` so it can be unit-
+/// tested without a DB.
+fn build_hsm_patch(hsm_event: u8, hsm_flags: u8, hsm_error: u8, now: i64) -> serde_json::Value {
+    let op = match hsm_event {
+        0 => "archive",
+        1 => "restore",
+        2 => "cancel",
+        3 => "release",
+        4 => "remove",
+        5 => "state",
+        _ => "unknown",
+    };
+    let mut patch = serde_json::json!({
+        "hsm_last_op": op,
+        "hsm_last_event_ts": now,
+        "hsm_dirty": (hsm_flags & 0x01) != 0,
+    });
+    if hsm_error != 0 {
+        patch["hsm_last_error"] = serde_json::json!(hsm_error);
+    } else {
+        let state = match hsm_event {
+            0 => Some("archived"),
+            1 => Some("archived"), // restored = back to archived + present
+            3 => Some("released"),
+            4 => Some("none"),
+            _ => None,
+        };
+        if let Some(s) = state {
+            patch["hsm_state"] = serde_json::json!(s);
+        }
+    }
+    patch
+}
+
+async fn apply_hsm_event(
+    store: &EntryStore,
+    fid: &lustre_api::LuFid,
+    hsm_event: u8,
+    hsm_flags: u8,
+    hsm_error: u8,
+) -> anyhow::Result<bool> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let patch = build_hsm_patch(hsm_event, hsm_flags, hsm_error, now);
+    let touched = store.patch_sm_status(fid, &patch).await?;
+    if !touched {
+        tracing::debug!(%fid, event = hsm_event, "HSM event for entry not yet in catalog — skipped");
+    } else {
+        tracing::debug!(%fid, event = hsm_event, flags = hsm_flags, error = hsm_error, "HSM state patched");
+    }
+    Ok(touched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_event_sets_archived_state() {
+        let p = build_hsm_patch(0, 0, 0, 1700);
+        assert_eq!(p["hsm_state"], "archived");
+        assert_eq!(p["hsm_last_op"], "archive");
+        assert_eq!(p["hsm_dirty"], false);
+        assert_eq!(p["hsm_last_event_ts"], 1700);
+        assert!(p.get("hsm_last_error").is_none());
+    }
+
+    #[test]
+    fn release_event_sets_released_state() {
+        let p = build_hsm_patch(3, 0, 0, 0);
+        assert_eq!(p["hsm_state"], "released");
+        assert_eq!(p["hsm_last_op"], "release");
+    }
+
+    #[test]
+    fn remove_event_sets_none_state() {
+        let p = build_hsm_patch(4, 0, 0, 0);
+        assert_eq!(p["hsm_state"], "none");
+        assert_eq!(p["hsm_last_op"], "remove");
+    }
+
+    #[test]
+    fn error_records_code_without_state() {
+        let p = build_hsm_patch(0, 1, 22, 0);
+        assert_eq!(p["hsm_last_op"], "archive");
+        assert_eq!(p["hsm_last_error"], 22);
+        assert_eq!(p["hsm_dirty"], true);
+        assert!(p.get("hsm_state").is_none(), "error must not set state");
+    }
+
+    #[test]
+    fn state_event_records_op_but_no_state() {
+        // HE_STATE = 5 — can't infer state from the event alone.
+        let p = build_hsm_patch(5, 0, 0, 0);
+        assert_eq!(p["hsm_last_op"], "state");
+        assert!(p.get("hsm_state").is_none());
     }
 }
 

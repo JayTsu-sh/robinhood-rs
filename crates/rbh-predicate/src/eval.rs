@@ -31,6 +31,12 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
 
         Predicate::InPool { pool } => entry.pool_name.as_deref() == Some(pool.as_str()),
 
+        Predicate::HsmStateEq { state } => entry
+            .sm_status
+            .get("hsm_state")
+            .and_then(|v| v.as_str())
+            == Some(state.as_str()),
+
         // OnOst is only meaningful with a DB-side JOIN against stripe_items.
         // EntryRow does not carry the full OST list; treat as false in-memory
         // so the evaluator stays conservative. Push down to SQL for accurate
@@ -275,6 +281,27 @@ mod tests {
                 pool: "archive".to_string()
             },
             &test_entry()
+        ));
+    }
+
+    #[test]
+    fn matches_hsm_state() {
+        let mut entry = test_entry();
+        entry.sm_status = serde_json::json!({"hsm_state": "archived"});
+        assert!(matches(
+            &Predicate::HsmStateEq { state: "archived".into() },
+            &entry
+        ));
+        assert!(!matches(
+            &Predicate::HsmStateEq { state: "released".into() },
+            &entry
+        ));
+        // Missing key -> no match.
+        let mut blank = test_entry();
+        blank.sm_status = serde_json::json!({});
+        assert!(!matches(
+            &Predicate::HsmStateEq { state: "archived".into() },
+            &blank
         ));
     }
 

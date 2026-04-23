@@ -426,6 +426,54 @@ impl EntryStore {
             .collect()
     }
 
+    /// Merge a JSON patch into the `sm_status` of one entry. Creates
+    /// the column as `{}` first if it's NULL. Missing rows are a no-op
+    /// (HSM events can arrive before the initial scan); returns whether
+    /// a row was touched.
+    pub async fn patch_sm_status(
+        &self,
+        fid: &LuFid,
+        patch: &serde_json::Value,
+    ) -> Result<bool> {
+        let bytes = fid_codec::encode(fid);
+        // Pull, merge, write. Doing this in-app (not via MySQL
+        // JSON_MERGE_PATCH) keeps the logic portable and testable.
+        let row = sqlx::query("SELECT sm_status FROM entries WHERE fid = ?")
+            .bind(&bytes[..])
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let sm_bytes: Option<Vec<u8>> = row.try_get("sm_status")?;
+        let mut current: serde_json::Value = match sm_bytes {
+            Some(b) if !b.is_empty() => serde_json::from_slice(&b)?,
+            _ => serde_json::Value::Object(serde_json::Map::new()),
+        };
+        if let (Some(obj), Some(patch_obj)) =
+            (current.as_object_mut(), patch.as_object())
+        {
+            for (k, v) in patch_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        } else {
+            current = patch.clone();
+        }
+        let merged = serde_json::to_string(&current)?;
+        sqlx::query("UPDATE entries SET sm_status = ?, last_seen = ? WHERE fid = ?")
+            .bind(merged)
+            .bind(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            )
+            .bind(&bytes[..])
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+
     /// Page the `removed_entries` table ordered by `rm_time` DESC
     /// (newest first). Optional `since` filters rm_time >= since.
     pub async fn list_removed(

@@ -177,7 +177,7 @@ struct WalkState {
 
 /// Parse `.rbh_ignore` at the scan root. Returns empty on IO error —
 /// missing file is a common case, don't propagate.
-fn load_rbh_ignore_file(root: &Path) -> Vec<String> {
+pub fn load_rbh_ignore_file(root: &Path) -> Vec<String> {
     let path = root.join(".rbh_ignore");
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,

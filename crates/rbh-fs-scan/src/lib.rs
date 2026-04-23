@@ -12,7 +12,7 @@ mod entry;
 mod walker;
 
 pub use entry::build_entry;
-pub use walker::{FsScanner, ScanConfig, ScanEvent, ScanProgress};
+pub use walker::{FsScanner, ScanConfig, ScanEvent, ScanProgress, load_rbh_ignore_file};
 
 /// Errors produced by the filesystem scanner.
 #[derive(Debug, thiserror::Error)]

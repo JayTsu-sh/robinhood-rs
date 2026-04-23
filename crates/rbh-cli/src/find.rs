@@ -34,6 +34,9 @@ pub struct FindArgs {
     /// Size filter: `+10M`, `-1K`, `5G` (no prefix = exact).
     #[arg(long)]
     pub size: Option<String>,
+    /// HSM state filter: one of `archived`, `released`, `none`.
+    #[arg(long = "hsm-state")]
+    pub hsm_state: Option<String>,
     /// Modified-time filter: `+7d`, `-1h`, `10m`.
     #[arg(long)]
     pub mtime: Option<String>,
@@ -91,6 +94,11 @@ pub fn build_query(args: &FindArgs, now: i64) -> Result<(Predicate, Vec<SortKey>
     }
     if let Some(s) = &args.size {
         preds.push(parse_size_filter(s)?);
+    }
+    if let Some(state) = &args.hsm_state {
+        preds.push(Predicate::HsmStateEq {
+            state: state.clone(),
+        });
     }
     if let Some(t) = &args.mtime {
         preds.push(parse_time_filter(Field::Mtime, t, now)?);

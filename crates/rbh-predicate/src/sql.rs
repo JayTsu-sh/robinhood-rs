@@ -94,6 +94,11 @@ fn build(pred: &Predicate, params: &mut Vec<SqlParam>) -> String {
             "pool_name = ?".to_string()
         }
 
+        Predicate::HsmStateEq { state } => {
+            params.push(SqlParam::Str(state.clone()));
+            "JSON_UNQUOTE(JSON_EXTRACT(sm_status, '$.hsm_state')) = ?".to_string()
+        }
+
         Predicate::OnOst { osts } => {
             if osts.is_empty() {
                 return "1=0".to_string();
@@ -308,5 +313,14 @@ mod tests {
     fn on_ost_empty_is_false() {
         let pred = Predicate::OnOst { osts: vec![] };
         assert_eq!(to_sql(&pred).0, "1=0");
+    }
+
+    #[test]
+    fn hsm_state_generates_json_extract() {
+        let p = Predicate::HsmStateEq { state: "archived".into() };
+        let (sql, params) = to_sql(&p);
+        assert!(sql.contains("JSON_UNQUOTE"));
+        assert!(sql.contains("$.hsm_state"));
+        assert_eq!(params, vec![SqlParam::Str("archived".into())]);
     }
 }

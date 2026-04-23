@@ -179,11 +179,12 @@ async fn run_policy_now(
         max_instances: 1,
         ..Default::default()
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let name = format!("rbh.policy.{id}.manual.{now}");
+    // Use a UUID suffix so same-second manual runs don't collide on
+    // the unique-name constraint (scheduler-rs keys on the UUID id but
+    // the name is what shows up in logs and DB queries).
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let short = &suffix[..8];
+    let name = format!("rbh.policy.{id}.manual.{short}");
     let schedule_id = scheduler
         .add_raw(
             rbh_policy::PolicyRunTask::TYPE_NAME.to_string(),
@@ -607,11 +608,16 @@ async fn start_scan(
     let root = req.root.unwrap_or_else(|| "/lustre".to_string());
     let id = uuid::Uuid::new_v4().to_string();
 
+    // Record the full glob list visible to the walker so operators can
+    // see what `.rbh_ignore` actually contributed.
+    let mut merged_globs = req.ignore_globs.clone();
+    merged_globs.extend(rbh_fs_scan::load_rbh_ignore_file(std::path::Path::new(&root)));
+
     let rec = ScanRecord {
         id: id.clone(),
         root: root.clone(),
         since_mtime: req.since_mtime,
-        ignore_globs: req.ignore_globs.clone(),
+        ignore_globs: merged_globs,
         state: ScanState::Running,
         scanned: 0,
         errors: 0,
