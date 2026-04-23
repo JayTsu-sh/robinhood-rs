@@ -1,0 +1,33 @@
+# robinhood-rs daemon environment. Drop this file at /etc/sysconfig/rbh-daemon
+# (Red Hat / SUSE) or /etc/default/rbh-daemon (Debian / Ubuntu).
+
+# --- Database ---------------------------------------------------------------
+# MariaDB / MySQL connection URL. Required.
+RBH_DATABASE_URL=mysql://robinhood:CHANGEME@127.0.0.1/rbh_entries
+
+# --- Lustre -----------------------------------------------------------------
+# Mount point of the Lustre filesystem.
+RBH_LUSTRE_MOUNT=/lustre
+
+# Comma-separated MDT names for changelog consumption. Leave empty to disable
+# live changelog ingestion (catalog will only reflect the initial fs-scan).
+#   Example: RBH_MDTS=testfs-MDT0000,testfs-MDT0001
+RBH_MDTS=
+
+# Changelog user id(s). Either a single value (reused on every MDT) or a
+# comma-separated list that matches RBH_MDTS 1:1.
+#   Example: RBH_CHANGELOG_USER=cl3
+RBH_CHANGELOG_USER=
+
+# --- API server -------------------------------------------------------------
+RBH_LISTEN_ADDR=0.0.0.0:8080
+
+# --- Observability ----------------------------------------------------------
+# tracing-subscriber env-filter directive. Hot-reloadable via SIGHUP.
+RBH_LOG=info
+
+# --- OpenTelemetry (future) -------------------------------------------------
+# RBH_OTLP_ENDPOINT=http://127.0.0.1:4317
+
+# --- Rust runtime -----------------------------------------------------------
+# RUST_BACKTRACE=1

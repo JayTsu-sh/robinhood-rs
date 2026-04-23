@@ -1,0 +1,40 @@
+[Unit]
+Description=Robinhood-rs daemon instance %i
+Documentation=https://github.com/JayTsu-sh/robinhood-rs
+After=network-online.target remote-fs.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robinhood
+Group=robinhood
+
+# Per-instance config. Each instance reads its own env file, so operators can
+# run e.g. `systemctl start rbh-daemon@purge` and `rbh-daemon@hsm` with
+# different RBH_LUSTRE_MOUNT / RBH_LISTEN_ADDR / RBH_DATABASE_URL values.
+EnvironmentFile=-/etc/sysconfig/rbh-daemon
+EnvironmentFile=-/etc/sysconfig/rbh-daemon-%i
+EnvironmentFile=-/etc/default/rbh-daemon
+EnvironmentFile=-/etc/default/rbh-daemon-%i
+
+ExecStart=/usr/sbin/robinhood
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/robinhood /var/log/robinhood
+RuntimeDirectory=robinhood
+StateDirectory=robinhood/%i
+LogsDirectory=robinhood/%i
+
+LimitNOFILE=65536
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

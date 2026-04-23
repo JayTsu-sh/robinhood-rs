@@ -12,6 +12,7 @@ rbh-entry-store = { path = "../rbh-entry-store" }
 rbh-fs-scan = { path = "../rbh-fs-scan" }
 rbh-observability = { path = "../rbh-observability" }
 rbh-policy = { path = "../rbh-policy" }
+rbh-predicate = { path = "../rbh-predicate" }
 lustre-api = { path = "../lustre-api" }
 lustre-changelog = { path = "../lustre-changelog" }
 scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", features = ["sqlx-mysql"] }

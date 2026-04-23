@@ -4,6 +4,8 @@
 //! changelog listener, fs-scan, scheduler-rs, and the axum HTTP server.
 
 mod changelog;
+mod signals;
+mod thresholds;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 /// Run the robinhood-rs daemon.
 pub async fn run() -> anyhow::Result<()> {
     // 1. Observability — must be first.
-    let _guard = rbh_observability::init(rbh_observability::ObservabilityConfig {
+    let obs_guard = rbh_observability::init(rbh_observability::ObservabilityConfig {
         service_name: "rbh-daemon",
         ..Default::default()
     })
@@ -54,58 +56,71 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::info!(entries = count, "catalog already populated");
     }
 
-    // 5. Spawn changelog listener(s) for continuous catalog updates.
+    // 5. Spawn one changelog listener per configured MDT.
+    //
+    // Env:
+    //   RBH_MDTS             — comma-separated MDT names (e.g. "fs-MDT0000,fs-MDT0001")
+    //                          Falls back to RBH_MDT_NAME for backward compat.
+    //   RBH_CHANGELOG_USER   — either a single reader id reused on every MDT,
+    //                          or a comma-separated list matching RBH_MDTS 1:1.
     let daemon_cancel = CancellationToken::new();
-    let changelog_reader_id = std::env::var("RBH_CHANGELOG_USER")
-        .unwrap_or_else(|_| String::new());
+    let cursor_store = Arc::new(
+        rbh_entry_store::store::MariaDbCursorStore::new(pool.clone()),
+    );
 
-    if !changelog_reader_id.is_empty() {
-        let mdt_name = std::env::var("RBH_MDT_NAME")
-            .unwrap_or_else(|_| "testfs-MDT0000".to_string());
-
-        let cursor_store = Arc::new(
-            rbh_entry_store::store::MariaDbCursorStore::new(pool.clone()),
+    let mdt_specs = resolve_changelog_mdts();
+    if mdt_specs.is_empty() {
+        tracing::info!(
+            "RBH_MDTS / RBH_CHANGELOG_USER not set — changelog listener disabled"
         );
+    } else {
+        for (mdt_name, reader_id) in mdt_specs {
+            let listener_cfg = lustre_changelog::ListenerConfig {
+                mdt: mdt_name.clone(),
+                reader_id: reader_id.clone(),
+                follow: true,
+                channel_buffer: 32,
+                ..Default::default()
+            };
 
-        let listener_cfg = lustre_changelog::ListenerConfig {
-            mdt: mdt_name.clone(),
-            reader_id: changelog_reader_id.clone(),
-            follow: true,
-            channel_buffer: 32,
-            ..Default::default()
-        };
-
-        match lustre_changelog::ChangelogListener::spawn(
-            listener_cfg,
-            cursor_store,
-            daemon_cancel.clone(),
-        ).await {
-            Ok(handle) => {
-                tracing::info!(
-                    mdt = %mdt_name,
-                    reader_id = %changelog_reader_id,
-                    "changelog listener started"
-                );
-
-                // Spawn the ingest task that applies events to the entry store.
-                let ingest_store = entry_store.clone();
-                let ingest_mount = PathBuf::from(&mount_path);
-                let ingest_cancel = daemon_cancel.clone();
-                tokio::spawn(async move {
-                    changelog::ingest_loop(handle, ingest_store, ingest_mount, ingest_cancel).await;
-                });
-            }
-            Err(e) => {
-                tracing::error!(
-                    mdt = %mdt_name,
-                    reader_id = %changelog_reader_id,
-                    error = %e,
-                    "failed to start changelog listener — running without live updates"
-                );
+            match lustre_changelog::ChangelogListener::spawn(
+                listener_cfg,
+                cursor_store.clone(),
+                daemon_cancel.clone(),
+            )
+            .await
+            {
+                Ok(handle) => {
+                    tracing::info!(
+                        mdt = %mdt_name,
+                        reader_id = %reader_id,
+                        "changelog listener started"
+                    );
+                    let ingest_store = entry_store.clone();
+                    let ingest_mount = PathBuf::from(&mount_path);
+                    let ingest_cancel = daemon_cancel.clone();
+                    tokio::spawn(async move {
+                        changelog::ingest_loop(
+                            handle,
+                            ingest_store,
+                            ingest_mount,
+                            ingest_cancel,
+                        )
+                        .await;
+                    });
+                }
+                Err(e) => {
+                    // Isolate per-MDT failures — other MDTs keep running.
+                    tracing::error!(
+                        mdt = %mdt_name,
+                        reader_id = %reader_id,
+                        error = %e,
+                        "failed to start changelog listener for this MDT \
+                         — continuing without it"
+                    );
+                }
             }
         }
-    } else {
-        tracing::info!("RBH_CHANGELOG_USER not set — changelog listener disabled");
     }
 
     // 6. Set up scheduler-rs.
@@ -140,6 +155,23 @@ pub async fn run() -> anyhow::Result<()> {
     let _scheduler_handle = scheduler.spawn();
     tracing::info!("scheduler started");
 
+    // Threshold checker — polls enabled policies for ThresholdCount /
+    // ThresholdVolume triggers and fires immediate policy runs on hit.
+    let threshold_tick_secs = std::env::var("RBH_THRESHOLD_TICK_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(30);
+    let checker = thresholds::ThresholdChecker {
+        policy_store: policy_store.clone(),
+        entry_store: entry_store.clone(),
+        scheduler: scheduler.clone(),
+        tick: std::time::Duration::from_secs(threshold_tick_secs),
+        cancel: daemon_cancel.clone(),
+    };
+    tokio::spawn(checker.run());
+    tracing::info!(tick_secs = threshold_tick_secs, "threshold checker spawned");
+
     // 7. Build router with scheduler for trigger reconciliation.
     let state = rbh_api::AppState {
         policy_store,
@@ -148,7 +180,7 @@ pub async fn run() -> anyhow::Result<()> {
     };
     let app = rbh_api::router(state);
 
-    // 8. Start HTTP server.
+    // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
     let listen_addr =
         std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&listen_addr)
@@ -156,11 +188,154 @@ pub async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind {listen_addr}"))?;
     tracing::info!(addr = %listen_addr, "HTTP server listening");
 
-    axum::serve(listener, app)
-        .await
-        .context("HTTP server error")?;
+    let shutdown_cancel = daemon_cancel.clone();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { shutdown_cancel.cancelled().await })
+            .await
+    });
 
+    // 9. Signal supervisor. Blocks until SIGTERM/SIGINT, then flips cancel.
+    signals::supervise(obs_guard, daemon_cancel.clone(), None, None).await?;
+
+    // Await HTTP server drain.
+    match server_task.await {
+        Ok(Ok(())) => tracing::info!("HTTP server stopped cleanly"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "HTTP server error on shutdown"),
+        Err(e) => tracing::warn!(error = %e, "HTTP server task panicked"),
+    }
+
+    tracing::info!("robinhood-rs daemon stopped");
     Ok(())
+}
+
+/// Resolve the list of (MDT, changelog reader id) pairs from environment.
+fn resolve_changelog_mdts() -> Vec<(String, String)> {
+    let mdts_raw = std::env::var("RBH_MDTS").ok();
+    let legacy_mdt = std::env::var("RBH_MDT_NAME").ok();
+    let user_raw = std::env::var("RBH_CHANGELOG_USER").unwrap_or_default();
+    pair_mdts_with_users(mdts_raw.as_deref(), legacy_mdt.as_deref(), &user_raw)
+}
+
+/// Pure resolver used by [`resolve_changelog_mdts`]. Pulled out for testing.
+fn pair_mdts_with_users(
+    mdts_csv: Option<&str>,
+    legacy_mdt: Option<&str>,
+    user_csv: &str,
+) -> Vec<(String, String)> {
+    if user_csv.is_empty() {
+        return Vec::new();
+    }
+
+    let mdt_list: Vec<String> = match mdts_csv.filter(|s| !s.is_empty()) {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => legacy_mdt
+            .filter(|s| !s.is_empty())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+    };
+    if mdt_list.is_empty() {
+        return Vec::new();
+    }
+
+    let users: Vec<String> = user_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if users.is_empty() {
+        return Vec::new();
+    }
+
+    match users.len() {
+        1 => mdt_list.into_iter().map(|m| (m, users[0].clone())).collect(),
+        n if n == mdt_list.len() => mdt_list.into_iter().zip(users).collect(),
+        _ => {
+            tracing::warn!(
+                mdts = mdt_list.len(),
+                users = users.len(),
+                "RBH_CHANGELOG_USER count does not match RBH_MDTS (and is not 1); \
+                 reusing the first user id across all MDTs"
+            );
+            let first = users.into_iter().next().unwrap_or_default();
+            mdt_list.into_iter().map(|m| (m, first.clone())).collect()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pair_mdts_with_users;
+
+    #[test]
+    fn nothing_configured_is_empty() {
+        assert!(pair_mdts_with_users(None, None, "").is_empty());
+    }
+
+    #[test]
+    fn legacy_single_mdt() {
+        let v = pair_mdts_with_users(None, Some("fs-MDT0000"), "cl1");
+        assert_eq!(v, vec![("fs-MDT0000".into(), "cl1".into())]);
+    }
+
+    #[test]
+    fn shared_user_across_mdts() {
+        let v = pair_mdts_with_users(Some("a,b,c"), None, "cl9");
+        assert_eq!(
+            v,
+            vec![
+                ("a".into(), "cl9".into()),
+                ("b".into(), "cl9".into()),
+                ("c".into(), "cl9".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_user_per_mdt() {
+        let v = pair_mdts_with_users(Some("a,b"), None, "cl1,cl2");
+        assert_eq!(
+            v,
+            vec![("a".into(), "cl1".into()), ("b".into(), "cl2".into())]
+        );
+    }
+
+    #[test]
+    fn mismatch_falls_back_to_first_user() {
+        let v = pair_mdts_with_users(Some("a,b,c"), None, "cl1,cl2");
+        assert_eq!(
+            v,
+            vec![
+                ("a".into(), "cl1".into()),
+                ("b".into(), "cl1".into()),
+                ("c".into(), "cl1".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn mdts_takes_precedence_over_legacy() {
+        let v = pair_mdts_with_users(Some("a,b"), Some("legacy"), "cl1");
+        assert_eq!(
+            v,
+            vec![("a".into(), "cl1".into()), ("b".into(), "cl1".into())]
+        );
+    }
+
+    #[test]
+    fn empty_tokens_are_ignored() {
+        let v = pair_mdts_with_users(Some(" a , , b "), None, "cl1, ,cl2");
+        assert_eq!(
+            v,
+            vec![("a".into(), "cl1".into()), ("b".into(), "cl2".into())]
+        );
+    }
 }
 
 /// Drain an fs-scan into the entry store.

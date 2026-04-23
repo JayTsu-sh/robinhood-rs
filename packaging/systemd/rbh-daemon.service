@@ -1,0 +1,41 @@
+[Unit]
+Description=Robinhood-rs policy engine daemon
+Documentation=https://github.com/JayTsu-sh/robinhood-rs
+After=network-online.target remote-fs.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robinhood
+Group=robinhood
+
+# Operator config. All runtime parameters are environment variables.
+EnvironmentFile=-/etc/sysconfig/rbh-daemon
+EnvironmentFile=-/etc/default/rbh-daemon
+
+ExecStart=/usr/sbin/robinhood
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=5s
+
+# Filesystem / syscall hardening.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/robinhood /var/log/robinhood
+RuntimeDirectory=robinhood
+RuntimeDirectoryMode=0755
+StateDirectory=robinhood
+StateDirectoryMode=0750
+LogsDirectory=robinhood
+LogsDirectoryMode=0750
+
+# Lustre scans can hold a lot of file descriptors.
+LimitNOFILE=65536
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

@@ -1,15 +1,13 @@
 //! Shared observability bootstrap for robinhood-rs binaries.
 //!
-//! Call [`init`] as the very first line in `main()` to configure structured
-//! JSON logging to stdout with span context. The returned [`Guard`] flushes
-//! on drop.
-//!
-//! v1: JSON logs to stdout via `tracing-subscriber::fmt::json()`.
-//! v2: Optional OTLP export via `tracing-opentelemetry` (gated on `RBH_OTLP_ENDPOINT`).
+//! Call [`init`] as the very first line in `main()`. The returned [`Guard`]
+//! carries a reload handle so SIGHUP can change the log level at runtime
+//! without restarting the process.
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::reload;
 
 /// Configuration for the observability stack.
 pub struct ObservabilityConfig {
@@ -40,19 +38,28 @@ impl Default for ObservabilityConfig {
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
-    /// JSON objects, one per line — queryable with `jq`.
     Json,
-    /// Human-readable pretty output for development.
     Pretty,
 }
 
-/// Guard that flushes pending log/trace data on drop.
-/// Must be held alive for the lifetime of the program.
+/// Handle returned from [`init`]. Holding it keeps the subscriber alive and
+/// exposes runtime filter changes for SIGHUP reloads.
 pub struct Guard {
-    _private: (),
+    reload_handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
 }
 
-/// Errors from observability initialization.
+impl Guard {
+    /// Parse `directive` (e.g. `"info"`, `"rbh_policy=debug"`) and atomically
+    /// replace the active filter. Used by SIGHUP reload in the daemon.
+    pub fn reload_filter(&self, directive: &str) -> Result<(), ObsError> {
+        let new_filter = EnvFilter::try_new(directive)
+            .map_err(|e| ObsError::InvalidFilter(e.to_string()))?;
+        self.reload_handle
+            .reload(new_filter)
+            .map_err(|e| ObsError::SetGlobal(e.to_string()))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObsError {
     #[error("failed to set global subscriber: {0}")]
@@ -61,12 +68,11 @@ pub enum ObsError {
     InvalidFilter(String),
 }
 
-/// Initialize the global tracing subscriber.
-///
-/// Must be called exactly once, as the first line in `main()`.
-/// Returns a [`Guard`] that should be held until shutdown.
+/// Initialize the global tracing subscriber. Must be called exactly once.
 pub fn init(cfg: ObservabilityConfig) -> Result<Guard, ObsError> {
-    let filter = EnvFilter::try_new(&cfg.level).map_err(|e| ObsError::InvalidFilter(e.to_string()))?;
+    let filter = EnvFilter::try_new(&cfg.level)
+        .map_err(|e| ObsError::InvalidFilter(e.to_string()))?;
+    let (filter, reload_handle) = reload::Layer::new(filter);
 
     match cfg.format {
         LogFormat::Json => {
@@ -79,13 +85,15 @@ pub fn init(cfg: ObservabilityConfig) -> Result<Guard, ObsError> {
                     .with_thread_ids(false)
                     .with_thread_names(false),
             );
-            tracing::subscriber::set_global_default(subscriber).map_err(|e| ObsError::SetGlobal(e.to_string()))?;
+            tracing::subscriber::set_global_default(subscriber)
+                .map_err(|e| ObsError::SetGlobal(e.to_string()))?;
         }
         LogFormat::Pretty => {
             let subscriber = tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt::layer().pretty().with_writer(std::io::stderr));
-            tracing::subscriber::set_global_default(subscriber).map_err(|e| ObsError::SetGlobal(e.to_string()))?;
+            tracing::subscriber::set_global_default(subscriber)
+                .map_err(|e| ObsError::SetGlobal(e.to_string()))?;
         }
     }
 
@@ -103,7 +111,7 @@ pub fn init(cfg: ObservabilityConfig) -> Result<Guard, ObsError> {
         "observability initialized"
     );
 
-    Ok(Guard { _private: () })
+    Ok(Guard { reload_handle })
 }
 
 #[cfg(test)]
@@ -118,7 +126,13 @@ mod tests {
     }
 
     #[test]
-    fn log_format_variants() {
-        assert_ne!(LogFormat::Json, LogFormat::Pretty);
+    fn invalid_filter_rejected() {
+        let cfg = ObservabilityConfig {
+            level: "!!invalid!!".into(),
+            format: LogFormat::Pretty,
+            otlp_endpoint: None,
+            service_name: "test",
+        };
+        assert!(matches!(init(cfg), Err(ObsError::InvalidFilter(_))));
     }
 }
