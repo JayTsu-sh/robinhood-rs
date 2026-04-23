@@ -178,6 +178,10 @@ impl ThresholdChecker {
                         );
                     } else {
                         last_fired.lock().await.insert(key, now);
+                        let pid_str = policy.id.to_string();
+                        rbh_observability::metrics::THRESHOLD_FIRES
+                            .with_label_values(&[pid_str.as_str()])
+                            .inc();
                         tracing::info!(
                             policy_id = policy.id,
                             trigger_idx = idx,

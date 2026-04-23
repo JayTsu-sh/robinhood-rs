@@ -60,6 +60,9 @@ async-trait = "0.1"
 # Database (Phase 2 additions).
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono", "json", "macros", "migrate"] }
 
+# Metrics (P2).
+prometheus = { version = "0.14", default-features = false }
+
 #
 # Root package: thin binary shim over rbh-daemon.
 #

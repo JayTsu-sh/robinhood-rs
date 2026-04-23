@@ -4,6 +4,8 @@
 //! carries a reload handle so SIGHUP can change the log level at runtime
 //! without restarting the process.
 
+pub mod metrics;
+
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;

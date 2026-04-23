@@ -109,6 +109,8 @@ impl Task for PolicyRunTask {
 
     async fn run(&self, ctx: &TaskContext) -> TaskResult {
         let rt = runtime();
+        let run_started = std::time::Instant::now();
+        let policy_id_lbl = self.policy_id.to_string();
 
         tracing::info!(
             policy_id = self.policy_id,
@@ -119,6 +121,9 @@ impl Task for PolicyRunTask {
 
         if ctx.cancellation_token.is_cancelled() {
             tracing::info!(policy_id = self.policy_id, "cancelled before start");
+            rbh_observability::metrics::POLICY_RUNS
+                .with_label_values(&[policy_id_lbl.as_str(), "cancelled"])
+                .inc();
             return Ok(());
         }
 
@@ -246,6 +251,8 @@ impl Task for PolicyRunTask {
         );
 
         let candidate_count = candidates.len();
+        let rules = Arc::new(def.rules.clone());
+        let default_action = Arc::new(def.default_action.clone());
         let (success, skipped, failed) = dispatch_workers(
             candidates,
             executor,
@@ -254,6 +261,8 @@ impl Task for PolicyRunTask {
             rate_limiter,
             cancel,
             self.policy_id,
+            rules,
+            default_action,
         )
         .await;
 
@@ -265,6 +274,32 @@ impl Task for PolicyRunTask {
             failed,
             "policy run completed"
         );
+
+        // Metrics.
+        let outcome = if failed == 0 && candidate_count == 0 {
+            "empty"
+        } else if failed == 0 {
+            "success"
+        } else if success > 0 {
+            "partial"
+        } else {
+            "failed"
+        };
+        rbh_observability::metrics::POLICY_RUNS
+            .with_label_values(&[policy_id_lbl.as_str(), outcome])
+            .inc();
+        rbh_observability::metrics::ACTIONS
+            .with_label_values(&[policy_id_lbl.as_str(), "success"])
+            .inc_by(success);
+        rbh_observability::metrics::ACTIONS
+            .with_label_values(&[policy_id_lbl.as_str(), "skipped"])
+            .inc_by(skipped);
+        rbh_observability::metrics::ACTIONS
+            .with_label_values(&[policy_id_lbl.as_str(), "failed"])
+            .inc_by(failed);
+        rbh_observability::metrics::POLICY_RUN_DURATION
+            .with_label_values(&[policy_id_lbl.as_str()])
+            .observe(run_started.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -411,26 +446,46 @@ async fn dispatch_workers(
     rate_limiter: Option<crate::ratelimit::RateLimiter>,
     cancel: scheduler_rs::prelude::CancellationToken,
     policy_id: u64,
+    rules: Arc<Vec<Rule>>,
+    default_action: Arc<ActionParams>,
 ) -> (u64, u64, u64) {
     use tokio::sync::Semaphore;
 
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut set = tokio::task::JoinSet::new();
 
+    // Run-level budget: stop dispatching once cumulative bytes of
+    // processed entries cross `max_volume`. Size is billed at dispatch
+    // (not after completion) so concurrent workers don't race past.
+    let max_volume = default_action.max_volume;
+    let mut bytes_dispatched: u64 = 0;
+
     for entry in candidates {
         if cancel.is_cancelled() {
             tracing::info!(policy_id, "cancelled before full dispatch");
             break;
         }
-        // Acquire a permit before spawning — this bounds in-flight work
-        // without holding the candidate vec past its useful life.
+        if let Some(cap) = max_volume {
+            if bytes_dispatched.saturating_add(entry.size) > cap {
+                tracing::info!(
+                    policy_id,
+                    processed_bytes = bytes_dispatched,
+                    cap,
+                    "max_volume reached — stopping dispatch"
+                );
+                break;
+            }
+            bytes_dispatched = bytes_dispatched.saturating_add(entry.size);
+        }
+
+        // First-match rule eval picks the effective per-entry params.
+        let params = evaluate_rules(&rules, &default_action, &entry);
+        let timeout = params.timeout_secs.filter(|&s| s > 0);
+
         let permit = match sem.clone().acquire_owned().await {
             Ok(p) => p,
-            Err(_) => break, // semaphore closed (shouldn't happen)
+            Err(_) => break,
         };
-        // Rate limit is acquired on the dispatch path (not inside the
-        // spawned task) so concurrency and rate caps compose: workers
-        // wait for a permit, and dispatch itself waits for the token.
         if let Some(ref rl) = rate_limiter {
             rl.acquire(entry.size).await;
         }
@@ -443,7 +498,23 @@ async fn dispatch_workers(
                 return WorkerOutcome::Skipped;
             }
             let fid = entry.fid;
-            let result = exec.execute(&entry, &ctx).await;
+            let fut = exec.execute(&entry, &ctx);
+            let result = match timeout {
+                Some(secs) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(secs),
+                        fut,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Ok(rbh_actions::ActionOutcome::Failed {
+                            error: format!("timeout after {secs}s"),
+                        }),
+                    }
+                }
+                None => fut.await,
+            };
             drop(permit);
             match result {
                 Ok(rbh_actions::ActionOutcome::Success) => {
@@ -491,12 +562,10 @@ enum WorkerOutcome {
 }
 
 /// Evaluate rules against an entry. Returns effective action params
-/// for the first matching rule, or default if no rule matches.
-///
-/// Kept alongside tests for the next iteration: the executor trait takes
-/// only `(entry, ctx)` today, so per-entry rule-derived params cannot yet
-/// be applied. Will be wired in when the executor gains a params arg.
-#[allow(dead_code)]
+/// for the first matching rule, or default if no rule matches. The
+/// resulting ActionParams drives per-entry behavior: timeout_secs
+/// wraps the action call in a tokio::time::timeout; other fields stay
+/// run-level (enforced in dispatch_workers before the spawn).
 fn evaluate_rules(
     rules: &[Rule],
     default_action: &ActionParams,
@@ -696,8 +765,20 @@ mod tests {
             lustre: lustre_api::LustreApi,
         });
         let cancel = scheduler_rs::prelude::CancellationToken::new();
-        let (succ, _, _) =
-            dispatch_workers(mk_candidates(12), exec, ctx, 3, None, cancel, 0).await;
+        let rules = Arc::new(Vec::new());
+        let params = Arc::new(ActionParams::default());
+        let (succ, _, _) = dispatch_workers(
+            mk_candidates(12),
+            exec,
+            ctx,
+            3,
+            None,
+            cancel,
+            0,
+            rules,
+            params,
+        )
+        .await;
         assert_eq!(succ, 12);
         let peak = max_in_flight.load(Ordering::SeqCst);
         assert!(peak >= 2 && peak <= 3, "expected peak ~3, got {peak}");
@@ -728,8 +809,20 @@ mod tests {
             max_bytes_per_sec: None,
         });
         let start = std::time::Instant::now();
-        let (succ, _, _) =
-            dispatch_workers(mk_candidates(30), exec, ctx, 4, rl, cancel, 0).await;
+        let rules = Arc::new(Vec::new());
+        let params = Arc::new(ActionParams::default());
+        let (succ, _, _) = dispatch_workers(
+            mk_candidates(30),
+            exec,
+            ctx,
+            4,
+            rl,
+            cancel,
+            0,
+            rules,
+            params,
+        )
+        .await;
         let elapsed = start.elapsed();
         assert_eq!(succ, 30);
         // First 10 tokens free, then 20 at 10/s = ~2s.
@@ -792,6 +885,108 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_timeout_marks_failed() {
+        // Executor sleeps 500ms; rule says timeout_secs=1 default, but one
+        // rule matches uid=0 with timeout_secs=0 (=disabled) to prove
+        // evaluate_rules wins. We'll set default timeout_secs=1 which is
+        // >500ms → Success; then make default 0 and add a delay higher
+        // than the timeout to provoke Failed.
+        let exec: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(RecordingExecutor {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+            outcome: rbh_actions::ActionOutcome::Success,
+            delay: Duration::from_millis(300),
+        });
+        let ctx = Arc::new(rbh_actions::ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: lustre_api::LustreApi,
+        });
+        let cancel = scheduler_rs::prelude::CancellationToken::new();
+        let rules = Arc::new(Vec::new());
+        let params = Arc::new(ActionParams {
+            timeout_secs: Some(1), // executor takes 300ms — within budget
+            ..Default::default()
+        });
+        let (succ, _, failed) = dispatch_workers(
+            mk_candidates(3),
+            exec.clone(),
+            ctx.clone(),
+            1,
+            None,
+            cancel,
+            0,
+            rules,
+            params,
+        )
+        .await;
+        assert_eq!(succ, 3);
+        assert_eq!(failed, 0);
+
+        // Now force timeout: executor 500ms vs timeout_secs=0.001… use a
+        // fresh executor with longer delay; timeout_secs must be u64, so
+        // build a scenario where executor takes ≥1s and timeout is 1s.
+        let slow: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(RecordingExecutor {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+            outcome: rbh_actions::ActionOutcome::Success,
+            delay: Duration::from_millis(1500),
+        });
+        let cancel2 = scheduler_rs::prelude::CancellationToken::new();
+        let rules2 = Arc::new(Vec::new());
+        let params2 = Arc::new(ActionParams {
+            timeout_secs: Some(1),
+            ..Default::default()
+        });
+        let (succ2, _, failed2) = dispatch_workers(
+            mk_candidates(2),
+            slow,
+            ctx,
+            2,
+            None,
+            cancel2,
+            0,
+            rules2,
+            params2,
+        )
+        .await;
+        assert_eq!(succ2, 0);
+        assert_eq!(failed2, 2, "both should timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_respects_max_volume() {
+        // Each candidate is 1 byte (default test_entry size). With
+        // max_volume=5, only 5 entries should dispatch out of 10.
+        let exec: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(RecordingExecutor {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+            outcome: rbh_actions::ActionOutcome::Success,
+            delay: Duration::from_millis(1),
+        });
+        let ctx = Arc::new(rbh_actions::ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: lustre_api::LustreApi,
+        });
+        let cancel = scheduler_rs::prelude::CancellationToken::new();
+        // Shape candidates so each has size=2; with max_volume=7 → only
+        // 3 dispatch (6 bytes), the 4th (+2 → 8 > 7) is rejected.
+        let mut candidates = mk_candidates(10);
+        for e in candidates.iter_mut() {
+            e.size = 2;
+        }
+        let rules = Arc::new(Vec::new());
+        let params = Arc::new(ActionParams {
+            max_volume: Some(7),
+            ..Default::default()
+        });
+        let (succ, skipped, failed) = dispatch_workers(
+            candidates, exec, ctx, 1, None, cancel, 0, rules, params,
+        )
+        .await;
+        assert_eq!(succ + skipped + failed, 3, "expected only 3 dispatched");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dispatch_stops_on_cancel() {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_in_flight = Arc::new(AtomicUsize::new(0));
@@ -812,8 +1007,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             cancel_clone.cancel();
         });
-        let (succ, skipped, failed) =
-            dispatch_workers(mk_candidates(50), exec, ctx, 2, None, cancel, 0).await;
+        let rules = Arc::new(Vec::new());
+        let params = Arc::new(ActionParams::default());
+        let (succ, skipped, failed) = dispatch_workers(
+            mk_candidates(50),
+            exec,
+            ctx,
+            2,
+            None,
+            cancel,
+            0,
+            rules,
+            params,
+        )
+        .await;
         assert!(
             succ + skipped + failed < 50,
             "expected partial run after cancel, got total={}",

@@ -26,6 +26,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/reports/aggregate", post(report_aggregate))
         .route("/reports/top-size", get(top_size))
         .route("/reports/oldest", get(oldest_entries))
+        .route("/metrics", get(metrics_endpoint))
         .route("/health", get(health))
 }
 
@@ -35,6 +36,29 @@ pub fn api_routes() -> Router<AppState> {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+// ---- /api/metrics ----
+// Prometheus text exposition. Refreshes the catalog gauge on every
+// scrape — the entries count is the only point-in-time metric that's
+// not updated on a hot path.
+async fn metrics_endpoint(State(state): State<AppState>) -> axum::response::Response {
+    if let Ok(count) = state.entry_store.entry_count().await {
+        rbh_observability::metrics::CATALOG_ENTRIES.set(count as i64);
+    }
+    match rbh_observability::metrics::render() {
+        Ok(body) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+            body,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("metrics render error: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
