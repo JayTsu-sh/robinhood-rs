@@ -369,11 +369,16 @@ async fn run_diff(
     mount: &str,
     limit: usize,
 ) -> Result<()> {
-    // Page through the catalog to collect name -> fid (name-only match
-    // is coarse; full parent+name join would be accurate but this stays
-    // client-side for simplicity).
-    use std::collections::HashSet;
-    let mut in_catalog: HashSet<String> = HashSet::new();
+    // Match by `(name, size)` tuples. Precise diff by parent_fid would
+    // need an FS-side path_to_fid call per entry — that's an FFI a
+    // pure-HTTP CLI client shouldn't own. `(name, size)` catches the
+    // common drift patterns (new file, deleted file, truncated file,
+    // rewritten file same name) while keeping the walker a plain
+    // `walkdir`.
+    use std::collections::{HashMap, HashSet};
+
+    // --- catalog side: name + size → fid string for diagnostics ---
+    let mut catalog: HashMap<(String, u64), String> = HashMap::new();
     let mut offset: u64 = 0;
     let page_size: u64 = 5000;
     loop {
@@ -386,9 +391,10 @@ async fn run_diff(
         let entries = v.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default();
         let n = entries.len() as u64;
         for e in entries {
-            if let Some(n) = e.get("name").and_then(|x| x.as_str()) {
-                in_catalog.insert(n.to_string());
-            }
+            let name = e.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let size = e.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
+            let fid = e.get("fid").and_then(|x| x.as_str()).unwrap_or("?").to_string();
+            catalog.insert((name, size), fid);
         }
         offset += n;
         if n < page_size {
@@ -396,40 +402,48 @@ async fn run_diff(
         }
     }
 
-    // Walk FS (shallow — don't hammer Lustre; a real diff would reuse
-    // FsScanner async). Use blocking walkdir in a spawn_blocking.
+    // --- fs side: walk up to depth 5, stat each ---
     let mount_path = std::path::PathBuf::from(mount);
-    let walked: Vec<String> = tokio::task::spawn_blocking(move || {
-        let mut names = Vec::new();
+    let walked: Vec<(String, u64)> = tokio::task::spawn_blocking(move || {
+        let mut v = Vec::new();
         for entry in walkdir::WalkDir::new(&mount_path)
             .max_depth(5)
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            if let Some(n) = entry.file_name().to_str() {
-                names.push(n.to_string());
-            }
+            let name = match entry.file_name().to_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            v.push((name, size));
         }
-        names
+        v
     })
     .await
     .context("walker join error")?;
 
-    let fs_set: std::collections::HashSet<String> = walked.into_iter().collect();
-    let only_fs: Vec<_> = fs_set.difference(&in_catalog).take(limit).collect();
-    let only_db: Vec<_> = in_catalog.difference(&fs_set).take(limit).collect();
+    let fs_set: HashSet<(String, u64)> = walked.into_iter().collect();
+    let catalog_keys: HashSet<(String, u64)> = catalog.keys().cloned().collect();
+
+    let only_fs: Vec<_> = fs_set.difference(&catalog_keys).take(limit).collect();
+    let only_db: Vec<_> = catalog_keys.difference(&fs_set).take(limit).collect();
 
     println!("-- only on filesystem ({}): --", only_fs.len());
-    for n in &only_fs {
-        println!("  + {n}");
+    for (name, size) in &only_fs {
+        println!("  + {name}  ({size} B)");
     }
     println!("-- only in catalog ({}): --", only_db.len());
-    for n in &only_db {
-        println!("  - {n}");
+    for (name, size) in &only_db {
+        let fid = catalog
+            .get(&((*name).clone(), *size))
+            .cloned()
+            .unwrap_or_else(|| "?".into());
+        println!("  - {name}  ({size} B)  fid={fid}");
     }
     println!(
         "-- summary: catalog={}  fs(walked)={}  lonely_fs={}  lonely_db={} --",
-        in_catalog.len(),
+        catalog_keys.len(),
         fs_set.len(),
         only_fs.len(),
         only_db.len()
