@@ -39,6 +39,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/scans/{id}", get(get_scan))
         .route("/admin/dump", get(admin_dump))
         .route("/admin/restore", post(admin_restore))
+        .route("/admin/sweep-orphans", post(admin_sweep_orphans))
         .route("/health", get(health))
 }
 
@@ -825,6 +826,47 @@ async fn admin_restore(
         }
     }
     Ok(Json(RestoreSummary { restored, failed }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SweepOrphansQuery {
+    /// Entries whose `last_seen < before` are candidates. Caller usually
+    /// passes the Unix timestamp at which the most recent full scan
+    /// started.
+    before: i64,
+    /// Cap per call. Default 5_000 so a single request doesn't lock the
+    /// table for long.
+    #[serde(default = "default_sweep_limit")]
+    limit: u64,
+    /// When true, counts candidates without moving them.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn default_sweep_limit() -> u64 {
+    5_000
+}
+
+#[derive(Debug, Serialize)]
+struct SweepOrphansResponse {
+    swept: u64,
+    dry_run: bool,
+}
+
+/// Sweep stale entries into `removed_entries`. The caller typically runs
+/// a full `rbh scan` first, then calls this with `before = scan_started_at`.
+async fn admin_sweep_orphans(
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<SweepOrphansQuery>,
+) -> Result<Json<SweepOrphansResponse>, ApiError> {
+    let swept = state
+        .entry_store
+        .sweep_orphans(q.before, q.limit.clamp(1, 100_000), q.dry_run)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(SweepOrphansResponse {
+        swept,
+        dry_run: q.dry_run,
+    }))
 }
 
 // ---------------------------------------------------------------------------

@@ -123,6 +123,21 @@ pub enum AdminCmd {
         #[arg(long, default_value = "500")]
         batch: usize,
     },
+    /// Move entries with `last_seen < <before>` into `removed_entries`.
+    /// Typically run right after a full `rbh scan` completes, passing
+    /// the scan start time so anything the scan didn't touch is
+    /// presumed gone.
+    SweepOrphans {
+        /// Unix timestamp — entries older than this are candidates.
+        #[arg(long)]
+        before: i64,
+        /// Max rows to sweep per call (server clamps to 100_000).
+        #[arg(long, default_value = "5000")]
+        limit: u64,
+        /// Count candidates without moving them.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -286,6 +301,9 @@ pub async fn run() -> Result<()> {
         Command::Admin(cmd) => match cmd {
             AdminCmd::Dump { out } => run_admin_dump(&client, &cli.api_url, out).await?,
             AdminCmd::Restore { input, batch } => run_admin_restore(&client, &cli.api_url, input, batch).await?,
+            AdminCmd::SweepOrphans { before, limit, dry_run } => {
+                run_admin_sweep(&client, &cli.api_url, before, limit, dry_run).await?
+            }
         },
     }
 
@@ -341,6 +359,20 @@ async fn run_admin_restore(client: &reqwest::Client, api_url: &str, input: Optio
         .send()
         .await
         .context("POST /api/admin/restore")?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("server {status}: {v}");
+    }
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn run_admin_sweep(
+    client: &reqwest::Client, api_url: &str, before: i64, limit: u64, dry_run: bool,
+) -> Result<()> {
+    let url = format!("{api_url}/api/admin/sweep-orphans?before={before}&limit={limit}&dry_run={dry_run}");
+    let resp = client.post(url).send().await.context("POST /api/admin/sweep-orphans")?;
     let status = resp.status();
     let v: serde_json::Value = resp.json().await.unwrap_or_default();
     if !status.is_success() {

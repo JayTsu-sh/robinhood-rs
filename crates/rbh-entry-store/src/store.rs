@@ -546,6 +546,57 @@ impl EntryStore {
         Ok(row.try_get::<u64, _>("total").unwrap_or(0))
     }
 
+    /// Sweep entries whose `last_seen < before` into `removed_entries`.
+    ///
+    /// Covers the case where a file was deleted out-of-band while the
+    /// daemon was down and the changelog ring overflowed: a full scan
+    /// refreshes `last_seen` on everything currently on disk, so anything
+    /// still stale after the scan completed is presumed gone.
+    ///
+    /// Never sweeps directories (they're handled by the scanner
+    /// distinctly) and caps work at `limit` rows per call. Call
+    /// repeatedly until the returned count is zero.
+    ///
+    /// When `dry_run` is true, the scan counts candidates but performs
+    /// no deletes.
+    pub async fn sweep_orphans(&self, before: i64, limit: u64, dry_run: bool) -> Result<u64> {
+        // Candidate fids, ordered oldest-first so repeated calls make
+        // monotonic progress.
+        let sql = "SELECT fid FROM entries WHERE last_seen < ? AND kind != 1 \
+                   ORDER BY last_seen ASC LIMIT ?";
+        let fids: Vec<Vec<u8>> = sqlx::query_scalar(sql)
+            .bind(before)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        if fids.is_empty() {
+            return Ok(0);
+        }
+        if dry_run {
+            return Ok(fids.len() as u64);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut swept = 0u64;
+        for fid_bin in fids {
+            // Decode the blob back into a LuFid to reuse `remove_entry`'s
+            // transactional move. We could do this with a single bulk
+            // INSERT ... SELECT / DELETE pair, but per-row keeps the
+            // existing semantics (names-table cleanup included) without
+            // duplicating that SQL here.
+            if let Some(fid) = fid_codec::decode(&fid_bin) {
+                if let Err(e) = self.remove_entry(&fid, now).await {
+                    tracing::warn!(fid = %fid, error = %e, "sweep_orphans: remove_entry failed");
+                    continue;
+                }
+                swept += 1;
+            }
+        }
+        Ok(swept)
+    }
+
     /// Per-OST stripe distribution: for each OST index that appears in
     /// `stripe_items`, return `(ost_index, file_count, approx_bytes)`.
     ///
