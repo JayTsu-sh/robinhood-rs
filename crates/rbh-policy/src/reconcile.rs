@@ -46,6 +46,7 @@ pub async fn reconcile_triggers(
             policy_id,
             trigger_idx: idx,
             target: crate::TargetFilter::Fs,
+            dry_run: false,
         };
         let task_data = serde_json::to_value(&task).map_err(|e| PolicyError::Scheduler(e.to_string()))?;
         let schedule_name = format!("rbh.policy.{}.trigger.{}", policy_id, idx);

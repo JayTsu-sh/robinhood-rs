@@ -32,6 +32,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/reports/oldest", get(oldest_entries))
         .route("/reports/size-profile", get(size_profile))
         .route("/reports/stripe-distribution", get(stripe_distribution_report))
+        .route("/reports/du", get(du_report))
         .route("/metrics", get(metrics_endpoint))
         .route("/removed", get(list_removed))
         .route("/removed/{fid}", axum::routing::delete(forget_removed))
@@ -147,6 +148,10 @@ pub struct RunRequest {
     /// `rbh_policy::TargetFilter`. When absent, runs against the whole FS.
     #[serde(default)]
     pub target: Option<rbh_policy::TargetFilter>,
+    /// Skip executor; log what would happen. Useful for validating a
+    /// new policy before pulling the trigger.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Fire a one-shot policy run via an `ImmediateTrigger` schedule. The
@@ -172,6 +177,7 @@ async fn run_policy_now(
         policy_id: id,
         trigger_idx: u32::MAX, // sentinel: manual run, no trigger bound
         target,
+        dry_run: req.dry_run,
     };
     let task_data = serde_json::to_value(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
     let config = ScheduleConfig {
@@ -481,6 +487,30 @@ pub struct AggregateRow {
     pub key: String,
     pub count: u64,
     pub total_size: u64,
+    /// Friendly label derived from `key` when it's numeric:
+    /// `uid` → passwd `pw_name`, `gid` → group `gr_name`. Missing or
+    /// unresolved entries surface as `null` — callers should fall back
+    /// to `key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Resolve a uid / gid to its name via NSS. Returns `None` when the id
+/// isn't in passwd/group (or the lookup fails for any reason — we never
+/// want a bad name lookup to break a report).
+fn resolve_label(key: AggregateKey, numeric: &str) -> Option<String> {
+    let n: u32 = numeric.parse().ok()?;
+    match key {
+        AggregateKey::Uid => nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(n))
+            .ok()
+            .flatten()
+            .map(|u| u.name),
+        AggregateKey::Gid => nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(n))
+            .ok()
+            .flatten()
+            .map(|g| g.name),
+        _ => None,
+    }
 }
 
 #[tracing::instrument(skip(state, req))]
@@ -496,9 +526,18 @@ async fn report_aggregate(
         .aggregate_by(req.key.as_column(), sort, req.limit.clamp(1, 1_000))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let key_kind = req.key;
     Ok(Json(
         rows.into_iter()
-            .map(|(key, count, total_size)| AggregateRow { key, count, total_size })
+            .map(|(key, count, total_size)| {
+                let label = resolve_label(key_kind, &key);
+                AggregateRow {
+                    key,
+                    count,
+                    total_size,
+                    label,
+                }
+            })
             .collect(),
     ))
 }
@@ -548,6 +587,61 @@ async fn size_profile(State(state): State<AppState>) -> Result<Json<Vec<SizeBuck
             })
             .collect(),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DuQuery {
+    /// FID (literal, with or without surrounding brackets) to aggregate
+    /// under. Mutually exclusive with `path`.
+    #[serde(default)]
+    fid: Option<String>,
+    /// Absolute path (under the Lustre mount) resolved via
+    /// `llapi_path2fid` on the daemon. Mutually exclusive with `fid`.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DuResponse {
+    fid: String,
+    file_count: u64,
+    total_bytes: u64,
+}
+
+/// Recursive size aggregation under a FID subtree. Fast path: relies on
+/// the catalog's `parent_fid` edge and a MariaDB recursive CTE — no
+/// filesystem walk.
+#[tracing::instrument(skip(state))]
+async fn du_report(
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<DuQuery>,
+) -> Result<Json<DuResponse>, ApiError> {
+    let root = match (q.fid.as_deref(), q.path.as_deref()) {
+        (Some(f), None) => f
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<lustre_api::LuFid>()
+            .map_err(|e| ApiError::Internal(format!("bad fid: {e}")))?,
+        (None, Some(p)) => {
+            let lustre = lustre_api::LustreApi;
+            let path = std::path::PathBuf::from(p);
+            tokio::task::spawn_blocking(move || lustre.path_to_fid(&path))
+                .await
+                .map_err(|e| ApiError::Internal(format!("join: {e}")))?
+                .map_err(|e| ApiError::Internal(format!("path_to_fid: {e}")))?
+        }
+        _ => {
+            return Err(ApiError::Internal("exactly one of fid / path must be provided".into()));
+        }
+    };
+    let (file_count, total_bytes) = state
+        .entry_store
+        .subtree_totals(&root)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(DuResponse {
+        fid: root.to_string(),
+        file_count,
+        total_bytes,
+    }))
 }
 
 #[tracing::instrument(skip(state))]

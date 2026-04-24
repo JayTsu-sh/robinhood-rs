@@ -221,6 +221,7 @@ impl ThresholdChecker {
             policy_id: policy.id,
             trigger_idx,
             target: target.clone(),
+            dry_run: false,
         };
         let task_data = serde_json::to_value(&task)?;
         let config = ScheduleConfig {

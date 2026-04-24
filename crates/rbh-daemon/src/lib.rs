@@ -242,8 +242,20 @@ pub async fn run() -> anyhow::Result<()> {
             .await
     });
 
+    // sd_notify(READY=1) — no-op outside systemd, used by `Type=notify`
+    // units so the unit blocks in `activating` until the HTTP bind
+    // succeeds. `MAINPID=self` lets systemd follow restarts of the
+    // child (we don't fork, but documenting the behavior anyway).
+    if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        tracing::debug!(error = %e, "sd_notify READY failed (likely not under systemd)");
+    }
+
     // 9. Signal supervisor. Blocks until SIGTERM/SIGINT, then flips cancel.
     signals::supervise(obs_guard, daemon_cancel.clone(), None, None).await?;
+
+    // Tell systemd we're stopping so it can update unit state before
+    // the process exits and suppresses its own timeout warnings.
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
 
     // Await HTTP server drain.
     match server_task.await {

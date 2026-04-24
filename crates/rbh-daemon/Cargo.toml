@@ -20,6 +20,7 @@ scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", featur
 anyhow = { workspace = true }
 axum = { version = "0.8" }
 bytes = { workspace = true }
+sd-notify = "0.4"
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }

@@ -3,6 +3,8 @@
 //! Subcommands communicate with the `rbh-daemon` REST API via HTTP.
 //! No direct database access — all operations go through `/api/`.
 
+#![allow(clippy::items_after_test_module)]
+
 mod find;
 
 use anyhow::{Context, Result};
@@ -49,6 +51,9 @@ pub enum Command {
         /// Restrict to files owned by UID.
         #[arg(long = "target-user")]
         target_user: Option<u32>,
+        /// Evaluate rules and log candidates but skip the executor.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Show entry catalog count.
@@ -103,6 +108,17 @@ pub enum Command {
     /// Disaster-recovery — dump/restore the whole catalog as NDJSON.
     #[command(subcommand)]
     Admin(AdminCmd),
+
+    /// Recursive size aggregation over the catalog (Lustre-aware du).
+    ///
+    /// Pass either `--fid <FID>` or `--path <abs-path>` (the daemon
+    /// resolves path → FID via `llapi_path2fid`).
+    Du {
+        #[arg(long)]
+        fid: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -239,6 +255,7 @@ pub async fn run() -> Result<()> {
             target_ost,
             target_pool,
             target_user,
+            dry_run,
         } => {
             // Build target JSON matching rbh_policy::TargetFilter enum.
             let target = if let Some(o) = target_ost {
@@ -248,10 +265,14 @@ pub async fn run() -> Result<()> {
             } else {
                 target_user.map(|u| serde_json::json!({"kind": "user", "uid": u}))
             };
-            let body = match target {
-                Some(t) => serde_json::json!({ "target": t }),
-                None => serde_json::json!({}),
-            };
+            let mut body = serde_json::Map::new();
+            if let Some(t) = target {
+                body.insert("target".into(), t);
+            }
+            if dry_run {
+                body.insert("dry_run".into(), serde_json::json!(true));
+            }
+            let body = serde_json::Value::Object(body);
             let resp = client
                 .post(format!("{}/api/policies/{}/run", cli.api_url, id))
                 .json(&body)
@@ -305,6 +326,7 @@ pub async fn run() -> Result<()> {
                 run_admin_sweep(&client, &cli.api_url, before, limit, dry_run).await?
             }
         },
+        Command::Du { fid, path } => run_du(&client, &cli.api_url, fid, path).await?,
     }
 
     Ok(())
@@ -366,6 +388,52 @@ async fn run_admin_restore(client: &reqwest::Client, api_url: &str, input: Optio
     }
     println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
+}
+
+async fn run_du(client: &reqwest::Client, api_url: &str, fid: Option<String>, path: Option<String>) -> Result<()> {
+    let url = match (fid, path) {
+        (Some(f), None) => format!("{api_url}/api/reports/du?fid={}", urlencoding::encode(&f)),
+        (None, Some(p)) => format!("{api_url}/api/reports/du?path={}", urlencoding::encode(&p)),
+        _ => anyhow::bail!("exactly one of --fid or --path must be given"),
+    };
+    let v = fetch_json(client, &url).await?;
+    let root = v.get("fid").and_then(|v| v.as_str()).unwrap_or("?");
+    let count = v.get("file_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let bytes = v.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!("root:     {root}");
+    println!("entries:  {count}");
+    println!("bytes:    {bytes}");
+    println!("human:    {}", human_bytes(bytes));
+    Ok(())
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", n, UNITS[0])
+    } else {
+        format!("{v:.2} {}", UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_bytes_scales() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.00 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(human_bytes(3 * 1024_u64.pow(4)), "3.00 TiB");
+    }
 }
 
 async fn run_admin_sweep(
@@ -688,8 +756,13 @@ fn print_aggregate_table(v: &serde_json::Value, key_label: &str) {
     println!("{:<16}  {:>10}  {:>18}", key_label, "count", "total_size");
     for row in arr {
         let raw = row.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+        let label = row.get("label").and_then(|v| v.as_str());
         let k = if key_label == "kind" {
             kind_code_to_label(raw)
+        } else if let Some(name) = label {
+            // Server resolved the uid/gid for us via NSS — prefer the
+            // friendly name but fall back to numeric when absent.
+            format!("{name} ({raw})")
         } else {
             raw.to_string()
         };

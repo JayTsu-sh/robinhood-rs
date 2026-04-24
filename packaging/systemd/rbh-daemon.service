@@ -5,7 +5,11 @@ After=network-online.target remote-fs.target mariadb.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+# notify: systemd blocks in `activating` until the daemon calls
+# sd_notify(READY=1), which happens right after the HTTP listener
+# binds and scheduler/threshold checker/changelog listeners are up.
+Type=notify
+NotifyAccess=main
 User=robinhood
 Group=robinhood
 

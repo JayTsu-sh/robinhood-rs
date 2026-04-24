@@ -98,6 +98,11 @@ pub struct PolicyRunTask {
     /// upgrade.
     #[serde(default)]
     pub target: TargetFilter,
+    /// When true, the executor is skipped — candidates are still
+    /// queried and rule-evaluated so the run reports what *would*
+    /// happen, but no filesystem or HSM mutations take place.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[async_trait]
@@ -292,9 +297,17 @@ impl Task for PolicyRunTask {
         let candidate_count = candidates.len();
         let rules = Arc::new(def.rules.clone());
         let default_action = Arc::new(def.default_action.clone());
+        // Dry-run: wrap the real executor so it never calls the backend.
+        // Rule evaluation and per-entry logging still happen.
+        let effective_executor: Arc<dyn rbh_actions::ActionExecutor> = if self.dry_run {
+            tracing::info!(policy_id = self.policy_id, "dry_run: skipping action execution");
+            Arc::new(DryRunExecutor)
+        } else {
+            executor
+        };
         let (success, skipped, failed) = dispatch_workers(
             candidates,
-            executor,
+            effective_executor,
             action_ctx,
             concurrency,
             rate_limiter,
@@ -438,6 +451,28 @@ enum LowMeasure {
     Volume(u64),
 }
 
+/// Executor shim used by `PolicyRunTask` when `dry_run=true`. Records
+/// what *would* have happened (at `info` level) and always returns
+/// `Skipped { reason: "dry run" }` without mutating anything.
+struct DryRunExecutor;
+
+#[async_trait]
+impl rbh_actions::ActionExecutor for DryRunExecutor {
+    async fn execute(
+        &self, entry: &rbh_entry_store::model::EntryRow, _ctx: &rbh_actions::ActionContext,
+    ) -> Result<rbh_actions::ActionOutcome, rbh_actions::ActionError> {
+        tracing::info!(
+            fid = %entry.fid,
+            size = entry.size,
+            uid = entry.uid,
+            "dry_run: would act on entry"
+        );
+        Ok(rbh_actions::ActionOutcome::Skipped {
+            reason: "dry run".into(),
+        })
+    }
+}
+
 /// Fan out candidate processing across `concurrency` workers using a
 /// tokio `JoinSet`. Returns `(success, skipped, failed)` totals. Respects
 /// the supplied cancel token: outstanding workers complete but no new
@@ -458,12 +493,26 @@ async fn dispatch_workers(
     // processed entries cross `max_volume`. Size is billed at dispatch
     // (not after completion) so concurrent workers don't race past.
     let max_volume = default_action.max_volume;
+    let skip_hardlinked = default_action.skip_hardlinked;
     let mut bytes_dispatched: u64 = 0;
+    let mut hardlinked_skipped: u64 = 0;
 
     for entry in candidates {
         if cancel.is_cancelled() {
             tracing::info!(policy_id, "cancelled before full dispatch");
             break;
+        }
+        // Hardlink safety: skip entries whose FID has >1 link when
+        // skip_hardlinked is set. Prevents a policy targeting one
+        // path from implicitly acting on another link to the same FID.
+        if skip_hardlinked && entry.nlink > 1 {
+            hardlinked_skipped += 1;
+            tracing::debug!(
+                fid = %entry.fid,
+                nlink = entry.nlink,
+                "skip_hardlinked: entry has multiple links"
+            );
+            continue;
         }
         if let Some(cap) = max_volume {
             if bytes_dispatched.saturating_add(entry.size) > cap {
@@ -558,7 +607,7 @@ async fn dispatch_workers(
     }
 
     let mut success = 0u64;
-    let mut skipped = 0u64;
+    let mut skipped = hardlinked_skipped;
     let mut failed = 0u64;
     while let Some(j) = set.join_next().await {
         match j {
@@ -570,6 +619,13 @@ async fn dispatch_workers(
                 tracing::warn!(error = %e, "worker task panicked");
             }
         }
+    }
+    if hardlinked_skipped > 0 {
+        tracing::info!(
+            policy_id,
+            hardlinked_skipped,
+            "hardlink safety: skipped entries with nlink > 1"
+        );
     }
     (success, skipped, failed)
 }
@@ -712,6 +768,7 @@ mod tests {
             policy_id: 1,
             trigger_idx: 0,
             target: TargetFilter::Ost { osts: vec![7] },
+            dry_run: false,
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: PolicyRunTask = serde_json::from_str(&s).unwrap();
@@ -775,6 +832,35 @@ mod tests {
         assert_eq!(succ, 12);
         let peak = max_in_flight.load(Ordering::SeqCst);
         assert!((2..=3).contains(&peak), "expected peak ~3, got {peak}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatch_skips_hardlinked_when_opted_in() {
+        // 10 candidates: odd indices simulate hardlinked files (nlink=2).
+        let mut cands = mk_candidates(10);
+        for (i, e) in cands.iter_mut().enumerate() {
+            e.nlink = if i % 2 == 0 { 1 } else { 2 };
+        }
+        let exec: Arc<dyn rbh_actions::ActionExecutor> = Arc::new(RecordingExecutor {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+            outcome: rbh_actions::ActionOutcome::Success,
+            delay: Duration::from_millis(0),
+        });
+        let ctx = Arc::new(rbh_actions::ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: lustre_api::LustreApi,
+        });
+        let cancel = scheduler_rs::prelude::CancellationToken::new();
+        let rules = Arc::new(Vec::new());
+        let params = Arc::new(ActionParams {
+            skip_hardlinked: true,
+            ..ActionParams::default()
+        });
+        let (succ, skipped, _) = dispatch_workers(cands, exec, ctx, 2, None, cancel, 0, rules, params).await;
+        // 5 nlink=1 entries succeed, 5 nlink=2 entries are skipped pre-dispatch.
+        assert_eq!(succ, 5);
+        assert!(skipped >= 5, "expected >=5 hardlinked skips, got {skipped}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

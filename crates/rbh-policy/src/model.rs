@@ -156,6 +156,13 @@ pub struct ActionParams {
     /// Webhook / logging configuration for [`PolicyKind::Alert`].
     #[serde(default)]
     pub alert: Option<AlertParams>,
+    /// When true, entries with `nlink > 1` are skipped at dispatch
+    /// time. Mirrors robinhood-C's `check_hardlinks_before_rm` safety
+    /// check — prevents a policy that targets `path A` from
+    /// implicitly mutating the file visible at hardlinked `path B`.
+    /// Default: false (preserves original behavior).
+    #[serde(default)]
+    pub skip_hardlinked: bool,
 }
 
 /// Arbitrary-command action parameters. `command` is resolved on PATH;
@@ -255,6 +262,8 @@ impl ActionParams {
             backup: self.backup.clone().or_else(|| base.backup.clone()),
             cmd: self.cmd.clone().or_else(|| base.cmd.clone()),
             alert: self.alert.clone().or_else(|| base.alert.clone()),
+            // skip_hardlinked: "opted in by either side" — safety field.
+            skip_hardlinked: self.skip_hardlinked || base.skip_hardlinked,
         }
     }
 }
@@ -422,6 +431,7 @@ mod tests {
                 log: true,
                 message: Some("base".into()),
             }),
+            skip_hardlinked: true,
         };
         let over = ActionParams {
             max_count: Some(50),
@@ -441,6 +451,7 @@ mod tests {
             backup: None,
             cmd: None,
             alert: None,
+            skip_hardlinked: false,
         };
         let merged = over.merge_over(&base);
         assert_eq!(merged.max_count, Some(50));

@@ -597,6 +597,27 @@ impl EntryStore {
         Ok(swept)
     }
 
+    /// Totals (`file_count`, `total_bytes`) across the FID subtree
+    /// rooted at `root`. Implemented with a MariaDB recursive CTE on the
+    /// `parent_fid` edge. Includes the root itself in the totals when
+    /// it exists. Returns `(0, 0)` when the root is absent.
+    pub async fn subtree_totals(&self, root: &LuFid) -> Result<(u64, u64)> {
+        let root_bin = fid_codec::encode(root);
+        let sql = "WITH RECURSIVE descendants (fid) AS ( \
+                     SELECT fid FROM entries WHERE fid = ? \
+                     UNION ALL \
+                     SELECT e.fid FROM entries e \
+                     JOIN descendants d ON e.parent_fid = d.fid \
+                   ) \
+                   SELECT COUNT(*) AS n, \
+                          CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS bytes \
+                   FROM entries WHERE fid IN (SELECT fid FROM descendants)";
+        let row = sqlx::query(sql).bind(root_bin.as_slice()).fetch_one(&self.pool).await?;
+        let count = row.try_get::<i64, _>("n")? as u64;
+        let bytes = row.try_get::<u64, _>("bytes").unwrap_or(0);
+        Ok((count, bytes))
+    }
+
     /// Per-OST stripe distribution: for each OST index that appears in
     /// `stripe_items`, return `(ost_index, file_count, approx_bytes)`.
     ///
