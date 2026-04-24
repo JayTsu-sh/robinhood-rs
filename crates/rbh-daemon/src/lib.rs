@@ -6,6 +6,7 @@
 #![allow(clippy::items_after_test_module)]
 
 mod changelog;
+mod hsm_poller;
 mod signals;
 mod thresholds;
 
@@ -178,6 +179,43 @@ pub async fn run() -> anyhow::Result<()> {
     };
     tokio::spawn(checker.run());
     tracing::info!(tick_secs = threshold_tick_secs, "threshold checker spawned");
+
+    // Active HSM state poller. Walks the catalog in small batches,
+    // calls llapi_hsm_state_get, patches sm_status if the stored state
+    // diverged from MDS truth. Disabled when RBH_HSM_POLL_SECS=0.
+    let hsm_poll_secs = std::env::var("RBH_HSM_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    if hsm_poll_secs > 0 {
+        let hsm_batch = std::env::var("RBH_HSM_POLL_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(200);
+        let hsm_pause_ms = std::env::var("RBH_HSM_POLL_PAUSE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(500);
+        let poller = hsm_poller::HsmPoller {
+            entry_store: entry_store.clone(),
+            lustre: lustre_api::LustreApi,
+            mount_path: PathBuf::from(&mount_path),
+            tick: std::time::Duration::from_secs(hsm_poll_secs),
+            batch: hsm_batch,
+            pause_between_batches: std::time::Duration::from_millis(hsm_pause_ms),
+            cancel: daemon_cancel.clone(),
+        };
+        tokio::spawn(poller.run());
+        tracing::info!(
+            tick_secs = hsm_poll_secs,
+            batch = hsm_batch,
+            pause_ms = hsm_pause_ms,
+            "hsm poller spawned"
+        );
+    } else {
+        tracing::info!("hsm poller disabled (RBH_HSM_POLL_SECS=0)");
+    }
 
     // 7. Build router with scheduler for trigger reconciliation.
     let state = rbh_api::AppState {

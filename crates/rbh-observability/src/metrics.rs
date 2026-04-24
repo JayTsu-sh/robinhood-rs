@@ -66,6 +66,29 @@ pub static CHANGELOG_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+/// Entries scanned by the active-HSM-state poller.
+pub static HSM_POLL_SCANNED: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let c = prometheus::IntCounter::with_opts(Opts::new(
+        "rbh_hsm_poll_scanned_total",
+        "Entries inspected by the HSM state poller",
+    ))
+    .expect("metric registration");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+/// Entries whose catalog HSM state was patched to match the live MDS
+/// state during a poller cycle.
+pub static HSM_POLL_RECONCILED: Lazy<prometheus::IntCounter> = Lazy::new(|| {
+    let c = prometheus::IntCounter::with_opts(Opts::new(
+        "rbh_hsm_poll_reconciled_total",
+        "Entries whose HSM state was corrected by the poller",
+    ))
+    .expect("metric registration");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
 /// Individual action outcomes (dispatched under a policy run).
 pub static ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
