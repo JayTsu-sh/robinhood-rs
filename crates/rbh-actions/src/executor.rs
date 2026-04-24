@@ -355,6 +355,168 @@ impl ActionExecutor for BackupExecutor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cmd (arbitrary subprocess) — drives PolicyKind::Migration
+// ---------------------------------------------------------------------------
+
+/// Runs an operator-defined shell command, one invocation per entry.
+/// The arg template supports these placeholders (all optional):
+///
+///   `{fid}`  — literal FID, e.g. `[0x200000401:0x42:0x0]`
+///   `{path}` — `.lustre/fid/<FID>` virtual path
+///   `{size}`, `{uid}`, `{gid}`, `{mtime}`, `{ctime}`, `{atime}`
+///
+/// Matches robinhood-C's `common.cmd`/`cmd(...)` DSL. Non-zero exit
+/// codes are surfaced as [`ActionOutcome::Failed`]. STDERR (up to
+/// 4 KiB) is captured into the failure reason.
+pub struct CmdExecutor {
+    pub command: std::path::PathBuf,
+    pub args_template: Vec<String>,
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl CmdExecutor {
+    pub fn new(command: impl Into<std::path::PathBuf>, args: Vec<String>, timeout_secs: Option<u64>) -> Self {
+        Self {
+            command: command.into(),
+            args_template: args,
+            timeout: timeout_secs.map(std::time::Duration::from_secs),
+        }
+    }
+
+    fn render_args(&self, entry: &EntryRow, mount: &Path) -> Vec<String> {
+        let fid_str = entry.fid.to_string();
+        let stripped = fid_str.trim_start_matches('[').trim_end_matches(']');
+        let path = mount.join(".lustre").join("fid").join(stripped);
+        let path_s = path.to_string_lossy().into_owned();
+        self.args_template
+            .iter()
+            .map(|t| {
+                t.replace("{fid}", &fid_str)
+                    .replace("{path}", &path_s)
+                    .replace("{size}", &entry.size.to_string())
+                    .replace("{uid}", &entry.uid.to_string())
+                    .replace("{gid}", &entry.gid.to_string())
+                    .replace("{mtime}", &entry.mtime.to_string())
+                    .replace("{ctime}", &entry.ctime.to_string())
+                    .replace("{atime}", &entry.atime.to_string())
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl ActionExecutor for CmdExecutor {
+    #[tracing::instrument(name = "action.cmd", skip(self, ctx), fields(fid = %entry.fid))]
+    async fn execute(&self, entry: &EntryRow, ctx: &ActionContext) -> Result<ActionOutcome, ActionError> {
+        let args = self.render_args(entry, &ctx.mount_path);
+        let child_res = tokio::process::Command::new(&self.command)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn();
+        let child = match child_res {
+            Ok(c) => c,
+            Err(e) => return Err(ActionError::Io(e)),
+        };
+        let output = match self.timeout {
+            Some(t) => match tokio::time::timeout(t, child.wait_with_output()).await {
+                Ok(r) => r.map_err(ActionError::Io)?,
+                Err(_) => {
+                    return Ok(ActionOutcome::Failed {
+                        error: format!("timeout after {t:?}"),
+                    });
+                }
+            },
+            None => child.wait_with_output().await.map_err(ActionError::Io)?,
+        };
+        if output.status.success() {
+            Ok(ActionOutcome::Success)
+        } else {
+            let mut stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.len() > 4096 {
+                stderr.truncate(4096);
+            }
+            Ok(ActionOutcome::Failed {
+                error: format!("exit {:?}: {stderr}", output.status.code()),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alert — drives PolicyKind::Alert
+// ---------------------------------------------------------------------------
+
+/// Emits an alert per matched entry. If `webhook` is configured, POSTs
+/// a JSON payload with the entry's core metadata; if `log` is true,
+/// also emits a tracing::warn! record. Webhook failures are surfaced
+/// as `ActionOutcome::Failed` but do NOT propagate as errors — the
+/// policy run continues.
+pub struct AlertExecutor {
+    pub webhook: Option<String>,
+    pub log: bool,
+    pub message: Option<String>,
+    pub client: reqwest::Client,
+}
+
+impl AlertExecutor {
+    pub fn new(webhook: Option<String>, log: bool, message: Option<String>) -> Self {
+        Self {
+            webhook,
+            log,
+            message,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn payload(&self, entry: &EntryRow) -> serde_json::Value {
+        serde_json::json!({
+            "fid": entry.fid.to_string(),
+            "size": entry.size,
+            "uid": entry.uid,
+            "gid": entry.gid,
+            "mtime": entry.mtime,
+            "atime": entry.atime,
+            "message": self.message,
+        })
+    }
+}
+
+#[async_trait]
+impl ActionExecutor for AlertExecutor {
+    #[tracing::instrument(name = "action.alert", skip(self, _ctx), fields(fid = %entry.fid))]
+    async fn execute(&self, entry: &EntryRow, _ctx: &ActionContext) -> Result<ActionOutcome, ActionError> {
+        if self.log {
+            tracing::warn!(
+                fid = %entry.fid,
+                size = entry.size,
+                uid = entry.uid,
+                message = self.message.as_deref().unwrap_or(""),
+                "alert fired"
+            );
+        }
+        if let Some(url) = &self.webhook {
+            let payload = self.payload(entry);
+            match self.client.post(url).json(&payload).send().await {
+                Ok(r) if r.status().is_success() => Ok(ActionOutcome::Success),
+                Ok(r) => Ok(ActionOutcome::Failed {
+                    error: format!("webhook {}: HTTP {}", url, r.status()),
+                }),
+                Err(e) => Ok(ActionOutcome::Failed {
+                    error: format!("webhook {url}: {e}"),
+                }),
+            }
+        } else {
+            Ok(ActionOutcome::Success)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +586,93 @@ mod tests {
             Ok(ActionOutcome::Skipped { .. }) => {}
             other => panic!("expected Skipped for nonexistent path, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cmd_template_renders_all_placeholders() {
+        let entry = test_file_entry();
+        let exec = CmdExecutor::new(
+            "/bin/echo",
+            vec![
+                "{fid}".into(),
+                "{path}".into(),
+                "{size}".into(),
+                "{uid}".into(),
+                "{gid}".into(),
+                "{mtime}".into(),
+            ],
+            None,
+        );
+        let args = exec.render_args(&entry, Path::new("/lustre"));
+        assert!(args[0].starts_with("["), "fid literal: {}", args[0]);
+        assert!(args[1].contains("/lustre/.lustre/fid/"), "path: {}", args[1]);
+        assert_eq!(args[2], "1024");
+        assert_eq!(args[3], "1000");
+        assert_eq!(args[4], "100");
+        assert_eq!(args[5], entry.mtime.to_string());
+    }
+
+    #[tokio::test]
+    async fn cmd_success_returns_success() {
+        let entry = test_file_entry();
+        let ctx = ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: LustreApi,
+        };
+        let exec = CmdExecutor::new("/bin/true", vec![], None);
+        assert_eq!(exec.execute(&entry, &ctx).await.unwrap(), ActionOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn cmd_failure_returns_failed() {
+        let entry = test_file_entry();
+        let ctx = ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: LustreApi,
+        };
+        let exec = CmdExecutor::new("/bin/false", vec![], None);
+        let outcome = exec.execute(&entry, &ctx).await.unwrap();
+        assert!(matches!(outcome, ActionOutcome::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn cmd_timeout_returns_failed() {
+        let entry = test_file_entry();
+        let ctx = ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: LustreApi,
+        };
+        let exec = CmdExecutor::new("/bin/sleep", vec!["5".into()], Some(1));
+        // Use try_for_1s via timeout_secs=1; /bin/sleep 5 will time out.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), exec.execute(&entry, &ctx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, ActionOutcome::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn alert_log_only_succeeds() {
+        let entry = test_file_entry();
+        let ctx = ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: LustreApi,
+        };
+        let exec = AlertExecutor::new(None, true, Some("high mtime age".into()));
+        assert_eq!(exec.execute(&entry, &ctx).await.unwrap(), ActionOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn alert_webhook_unreachable_returns_failed() {
+        let entry = test_file_entry();
+        let ctx = ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: LustreApi,
+        };
+        // 127.0.0.1:1 should always refuse. The executor captures the
+        // connection error into Failed, not Err.
+        let exec = AlertExecutor::new(Some("http://127.0.0.1:1/".into()), false, None);
+        let outcome = exec.execute(&entry, &ctx).await.unwrap();
+        assert!(matches!(outcome, ActionOutcome::Failed { .. }), "got {outcome:?}");
     }
 }

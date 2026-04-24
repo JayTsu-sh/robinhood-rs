@@ -11,7 +11,8 @@
 mod executor;
 
 pub use executor::{
-    ActionContext, ActionExecutor, ActionOutcome, BackupExecutor, HsmArchiveExecutor, HsmReleaseExecutor, PurgeExecutor,
+    ActionContext, ActionExecutor, ActionOutcome, AlertExecutor, BackupExecutor, CmdExecutor, HsmArchiveExecutor,
+    HsmReleaseExecutor, PurgeExecutor,
 };
 
 /// Errors produced by action executors.

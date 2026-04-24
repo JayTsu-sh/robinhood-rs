@@ -1703,6 +1703,7 @@ dependencies = [
  "lustre-api",
  "rbh-backup",
  "rbh-entry-store",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

@@ -148,6 +148,43 @@ pub struct ActionParams {
     /// [`PolicyKind::Backup`] via rbh-backup's CommandBackupAdapter.
     #[serde(default)]
     pub backup: Option<rbh_backup::BackupCommandConfig>,
+    /// Arbitrary-command configuration consumed by
+    /// [`PolicyKind::Migration`]. Mirrors robinhood-C's `action = cmd(...)`
+    /// and `common_actions.c`.
+    #[serde(default)]
+    pub cmd: Option<CmdParams>,
+    /// Webhook / logging configuration for [`PolicyKind::Alert`].
+    #[serde(default)]
+    pub alert: Option<AlertParams>,
+}
+
+/// Arbitrary-command action parameters. `command` is resolved on PATH;
+/// each item in `args` is rendered with `{fid}`, `{path}`, `{size}`,
+/// `{uid}`, `{gid}`. `{path}` expands to the `.lustre/fid/<FID>` virtual
+/// path — use `{fid}` if the target tool prefers the literal FID.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CmdParams {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Per-invocation timeout in seconds (overrides action `timeout_secs`).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Alert sink configuration. Exactly one of `webhook` / `log_only`
+/// should be effective; when both are set, both fire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertParams {
+    /// POST the payload to this URL as JSON.
+    #[serde(default)]
+    pub webhook: Option<String>,
+    /// If true, emit a `tracing::warn!` record per matched entry.
+    #[serde(default = "default_true")]
+    pub log: bool,
+    /// Optional free-form message field included in the JSON payload.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Retry policy for a single entry. On `Failed`/error outcomes the
@@ -216,6 +253,8 @@ impl ActionParams {
                 (None, b) => b,
             },
             backup: self.backup.clone().or_else(|| base.backup.clone()),
+            cmd: self.cmd.clone().or_else(|| base.cmd.clone()),
+            alert: self.alert.clone().or_else(|| base.alert.clone()),
         }
     }
 }
@@ -352,6 +391,16 @@ mod tests {
                 timeout_secs: Some(600),
                 dest_template: None,
             }),
+            cmd: Some(CmdParams {
+                command: "/usr/bin/logger".into(),
+                args: vec!["base".into()],
+                timeout_secs: Some(5),
+            }),
+            alert: Some(AlertParams {
+                webhook: Some("http://alerts.invalid/hook".into()),
+                log: true,
+                message: Some("base".into()),
+            }),
         };
         let over = ActionParams {
             max_count: Some(50),
@@ -369,6 +418,8 @@ mod tests {
                 hints: None,
             }),
             backup: None,
+            cmd: None,
+            alert: None,
         };
         let merged = over.merge_over(&base);
         assert_eq!(merged.max_count, Some(50));
@@ -392,6 +443,12 @@ mod tests {
         let b = merged.backup.unwrap();
         assert_eq!(b.command, "/usr/local/bin/rbhext_tool");
         assert_eq!(b.timeout_secs, Some(600));
+        // cmd: over is None → base wins.
+        let c = merged.cmd.unwrap();
+        assert_eq!(c.command, "/usr/bin/logger");
+        // alert: over is None → base wins.
+        let a = merged.alert.unwrap();
+        assert_eq!(a.webhook.as_deref(), Some("http://alerts.invalid/hook"));
     }
 
     #[test]

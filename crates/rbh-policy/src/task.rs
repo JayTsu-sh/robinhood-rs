@@ -159,6 +159,30 @@ impl Task for PolicyRunTask {
                 Arc::new(rbh_actions::HsmArchiveExecutor { archive_id, hints })
             }
             crate::PolicyKind::HsmRelease => Arc::new(rbh_actions::HsmReleaseExecutor),
+            crate::PolicyKind::Migration => match def.default_action.cmd.as_ref() {
+                Some(c) => Arc::new(rbh_actions::CmdExecutor::new(
+                    &c.command,
+                    c.args.clone(),
+                    c.timeout_secs.or(def.default_action.timeout_secs),
+                )),
+                None => {
+                    tracing::warn!("migration policy has no cmd config — skipping run");
+                    rbh_observability::metrics::POLICY_RUNS
+                        .with_label_values(&[policy_id_lbl.as_str(), "misconfigured"])
+                        .inc();
+                    rbh_observability::metrics::POLICY_RUN_DURATION
+                        .with_label_values(&[policy_id_lbl.as_str()])
+                        .observe(run_started.elapsed().as_secs_f64());
+                    return Ok(());
+                }
+            },
+            crate::PolicyKind::Alert => {
+                let (webhook, log, message) = match def.default_action.alert.as_ref() {
+                    Some(a) => (a.webhook.clone(), a.log, a.message.clone()),
+                    None => (None, true, None),
+                };
+                Arc::new(rbh_actions::AlertExecutor::new(webhook, log, message))
+            }
             crate::PolicyKind::Backup => {
                 let cfg = match def.default_action.backup.as_ref() {
                     Some(c) => c,
@@ -186,16 +210,6 @@ impl Task for PolicyRunTask {
                     hints,
                     cfg.dest_template.clone(),
                 ))
-            }
-            other => {
-                tracing::warn!(kind = other.as_str(), "action not implemented for this kind");
-                rbh_observability::metrics::POLICY_RUNS
-                    .with_label_values(&[policy_id_lbl.as_str(), "unimplemented"])
-                    .inc();
-                rbh_observability::metrics::POLICY_RUN_DURATION
-                    .with_label_values(&[policy_id_lbl.as_str()])
-                    .observe(run_started.elapsed().as_secs_f64());
-                return Ok(());
             }
         };
 
