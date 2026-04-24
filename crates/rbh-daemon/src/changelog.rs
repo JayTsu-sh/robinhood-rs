@@ -188,6 +188,21 @@ async fn apply_event(
         ChangelogEvent::Unlink { fid, last_link, .. } => {
             tracing::debug!(fid = %fid, last_link = *last_link, "processing Unlink event");
             if *last_link {
+                // DNE rename stitching hedge: a cross-MDT rename can
+                // surface as a last-link UNLNK on the source MDT even
+                // though the file still lives under a different parent
+                // on another MDT. Check via llapi_fid2path before
+                // moving to removed_entries — if the FID still
+                // resolves, this is a rename we'll catch via the
+                // companion Rename event on the other MDT.
+                let live = fid_still_live(mount, fid).await;
+                if live {
+                    tracing::info!(
+                        fid = %fid,
+                        "last-link UNLNK but FID still resolves — treating as rename-away, skipping delete"
+                    );
+                    return Ok(false);
+                }
                 store.remove_entry(fid, event_time).await?;
                 Ok(true)
             } else {
@@ -533,4 +548,22 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Returns `true` when `llapi_fid2path` successfully resolves the FID
+/// under `mount`, i.e. the file still exists somewhere on the
+/// filesystem. Any FFI error (including ENOENT from a truly removed
+/// FID) returns `false`. Used as a DNE-rename hedge — a cross-MDT
+/// rename can surface as a last-link UNLNK on the source MDT even
+/// though the file lives on another.
+async fn fid_still_live(mount: &Path, fid: &lustre_api::LuFid) -> bool {
+    let lustre = lustre_api::LustreApi;
+    let fid = *fid;
+    let mount = mount.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mount_s = mount.to_string_lossy();
+        lustre.fid_to_path(&mount_s, &fid).is_ok()
+    })
+    .await
+    .unwrap_or(false)
 }
