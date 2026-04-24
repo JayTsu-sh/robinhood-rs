@@ -25,6 +25,7 @@ members = [
     "crates/rbh-daemon",
     "crates/rbh-cli",
     "crates/rbh-config-import",
+    "crates/rbh-backup",
 ]
 
 [workspace.package]

@@ -12,7 +12,10 @@ use rbh_entry_store::store::{AggregateKey, AggregateSort, QueryParam};
 use rbh_policy::{PolicyDef, PolicyError};
 use rbh_predicate::{Predicate, SortKey, SqlParam, to_sql};
 
-use crate::{AppState, state::{ScanRecord, ScanState}};
+use crate::{
+    AppState,
+    state::{ScanRecord, ScanState},
+};
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
@@ -59,11 +62,7 @@ async fn metrics_endpoint(State(state): State<AppState>) -> axum::response::Resp
             body,
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("metrics render error: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("metrics render error: {e}")).into_response(),
     }
 }
 
@@ -105,10 +104,10 @@ async fn create_policy(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let id = state.policy_store.create(&body.definition).await?;
     // Reconcile triggers → scheduler-rs schedules.
-    if let Some(ref scheduler) = state.scheduler {
-        if let Err(e) = rbh_policy::reconcile_triggers(scheduler, id, &body.definition).await {
-            tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
-        }
+    if let Some(ref scheduler) = state.scheduler
+        && let Err(e) = rbh_policy::reconcile_triggers(scheduler, id, &body.definition).await
+    {
+        tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
     }
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
@@ -130,10 +129,10 @@ async fn update_policy(
     State(state): State<AppState>, Path(id): Path<u64>, Json(body): Json<CreatePolicyRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.policy_store.update(id, &body.definition).await?;
-    if let Some(ref scheduler) = state.scheduler {
-        if let Err(e) = rbh_policy::reconcile_triggers(scheduler, id, &body.definition).await {
-            tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
-        }
+    if let Some(ref scheduler) = state.scheduler
+        && let Err(e) = rbh_policy::reconcile_triggers(scheduler, id, &body.definition).await
+    {
+        tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -151,9 +150,7 @@ pub struct RunRequest {
 /// or observe it. Requires the scheduler to be present in `AppState`.
 #[tracing::instrument(skip(state, req))]
 async fn run_policy_now(
-    State(state): State<AppState>,
-    Path(id): Path<u64>,
-    Json(req): Json<RunRequest>,
+    State(state): State<AppState>, Path(id): Path<u64>, Json(req): Json<RunRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use scheduler_rs::prelude::{MisfirePolicy, ScheduleConfig, Task};
     use scheduler_rs::trigger::ImmediateTrigger;
@@ -172,8 +169,7 @@ async fn run_policy_now(
         trigger_idx: u32::MAX, // sentinel: manual run, no trigger bound
         target,
     };
-    let task_data = serde_json::to_value(&task)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let task_data = serde_json::to_value(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
     let config = ScheduleConfig {
         misfire_policy: MisfirePolicy::Coalesce,
         max_instances: 1,
@@ -327,10 +323,9 @@ const MAX_LIMIT: u64 = 10_000;
 
 #[tracing::instrument(skip(state, req), fields(limit = req.limit, offset = req.offset))]
 async fn query_entries(
-    State(state): State<AppState>,
-    Json(req): Json<QueryRequest>,
+    State(state): State<AppState>, Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let limit = req.limit.min(MAX_LIMIT).max(1);
+    let limit = req.limit.clamp(1, MAX_LIMIT);
 
     let (where_clause, params) = match &req.predicate {
         Some(p) => to_sql(p),
@@ -424,10 +419,9 @@ impl From<rbh_entry_store::model::RemovedEntry> for RemovedDto {
 
 #[tracing::instrument(skip(state))]
 async fn list_removed(
-    State(state): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<RemovedQuery>,
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<RemovedQuery>,
 ) -> Result<Json<Vec<RemovedDto>>, ApiError> {
-    let limit = q.limit.min(10_000).max(1);
+    let limit = q.limit.clamp(1, 10_000);
     let rows = state
         .entry_store
         .list_removed(q.since, limit, q.offset)
@@ -437,13 +431,9 @@ async fn list_removed(
 }
 
 #[tracing::instrument(skip(state))]
-async fn forget_removed(
-    State(state): State<AppState>,
-    Path(fid_str): Path<String>,
-) -> Result<StatusCode, ApiError> {
+async fn forget_removed(State(state): State<AppState>, Path(fid_str): Path<String>) -> Result<StatusCode, ApiError> {
     use std::str::FromStr;
-    let fid = lustre_api::LuFid::from_str(&fid_str)
-        .map_err(|e| ApiError::Internal(format!("invalid fid: {e}")))?;
+    let fid = lustre_api::LuFid::from_str(&fid_str).map_err(|e| ApiError::Internal(format!("invalid fid: {e}")))?;
     let removed = state
         .entry_store
         .forget_removed(&fid)
@@ -491,8 +481,7 @@ pub struct AggregateRow {
 
 #[tracing::instrument(skip(state, req))]
 async fn report_aggregate(
-    State(state): State<AppState>,
-    Json(req): Json<AggregateRequest>,
+    State(state): State<AppState>, Json(req): Json<AggregateRequest>,
 ) -> Result<Json<Vec<AggregateRow>>, ApiError> {
     let sort = match req.sort {
         AggSort::Count => AggregateSort::Count,
@@ -500,7 +489,7 @@ async fn report_aggregate(
     };
     let rows = state
         .entry_store
-        .aggregate_by(req.key.as_column(), sort, req.limit.min(1_000).max(1))
+        .aggregate_by(req.key.as_column(), sort, req.limit.clamp(1, 1_000))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(
@@ -522,12 +511,11 @@ fn default_top_n() -> u64 {
 
 #[tracing::instrument(skip(state))]
 async fn top_size(
-    State(state): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<ListQuery>,
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<ListQuery>,
 ) -> Result<Json<Vec<EntryDto>>, ApiError> {
     let rows = state
         .entry_store
-        .query_page("1=1", &[], Some("size DESC"), q.n.min(1_000).max(1), 0)
+        .query_page("1=1", &[], Some("size DESC"), q.n.clamp(1, 1_000), 0)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(rows.into_iter().map(EntryDto::from).collect()))
@@ -541,9 +529,7 @@ pub struct SizeBucket {
 }
 
 #[tracing::instrument(skip(state))]
-async fn size_profile(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<SizeBucket>>, ApiError> {
+async fn size_profile(State(state): State<AppState>) -> Result<Json<Vec<SizeBucket>>, ApiError> {
     let rows = state
         .entry_store
         .size_profile()
@@ -562,12 +548,11 @@ async fn size_profile(
 
 #[tracing::instrument(skip(state))]
 async fn oldest_entries(
-    State(state): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<ListQuery>,
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<ListQuery>,
 ) -> Result<Json<Vec<EntryDto>>, ApiError> {
     let rows = state
         .entry_store
-        .query_page("1=1", &[], Some("atime ASC"), q.n.min(1_000).max(1), 0)
+        .query_page("1=1", &[], Some("atime ASC"), q.n.clamp(1, 1_000), 0)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(rows.into_iter().map(EntryDto::from).collect()))
@@ -602,8 +587,7 @@ fn now_epoch() -> i64 {
 
 #[tracing::instrument(skip(state, req))]
 async fn start_scan(
-    State(state): State<AppState>,
-    Json(req): Json<StartScanRequest>,
+    State(state): State<AppState>, Json(req): Json<StartScanRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let root = req.root.unwrap_or_else(|| "/lustre".to_string());
     let id = uuid::Uuid::new_v4().to_string();
@@ -662,11 +646,11 @@ async fn start_scan(
                 }
             }
         }
-        if !batch.is_empty() {
-            if let Err(e) = entry_store.upsert_batch(&batch).await {
-                tracing::warn!(scan_id, error = %e, "final batch upsert failed");
-                errors += 1;
-            }
+        if !batch.is_empty()
+            && let Err(e) = entry_store.upsert_batch(&batch).await
+        {
+            tracing::warn!(scan_id, error = %e, "final batch upsert failed");
+            errors += 1;
         }
 
         let (scanned, scan_errors, dirs) = progress.snapshot();
@@ -697,10 +681,7 @@ async fn list_scans(State(state): State<AppState>) -> Json<Vec<ScanRecord>> {
 }
 
 #[tracing::instrument(skip(state))]
-async fn get_scan(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<ScanRecord>, ApiError> {
+async fn get_scan(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<ScanRecord>, ApiError> {
     let map = state.scans.lock().await;
     map.get(&id)
         .cloned()

@@ -193,16 +193,19 @@ pub async fn run() -> Result<()> {
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
-        Command::PolicyRun { id, target_ost, target_pool, target_user } => {
+        Command::PolicyRun {
+            id,
+            target_ost,
+            target_pool,
+            target_user,
+        } => {
             // Build target JSON matching rbh_policy::TargetFilter enum.
             let target = if let Some(o) = target_ost {
                 Some(serde_json::json!({"kind": "ost", "osts": [o]}))
             } else if let Some(p) = target_pool {
                 Some(serde_json::json!({"kind": "pool", "name": p}))
-            } else if let Some(u) = target_user {
-                Some(serde_json::json!({"kind": "user", "uid": u}))
             } else {
-                None
+                target_user.map(|u| serde_json::json!({"kind": "user", "uid": u}))
             };
             let body = match target {
                 Some(t) => serde_json::json!({ "target": t }),
@@ -259,15 +262,10 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_scan(
-    client: &reqwest::Client,
-    api_url: &str,
-    root: Option<String>,
-    since_mtime: Option<i64>,
-    ignore: Vec<String>,
-    concurrency: Option<usize>,
-    max_depth: Option<usize>,
-    detach: bool,
+    client: &reqwest::Client, api_url: &str, root: Option<String>, since_mtime: Option<i64>, ignore: Vec<String>,
+    concurrency: Option<usize>, max_depth: Option<usize>, detach: bool,
 ) -> Result<()> {
     let body = serde_json::json!({
         "root": root,
@@ -312,11 +310,7 @@ async fn run_scan(
     Ok(())
 }
 
-async fn run_undelete(
-    client: &reqwest::Client,
-    api_url: &str,
-    cmd: UndeleteCmd,
-) -> Result<()> {
+async fn run_undelete(client: &reqwest::Client, api_url: &str, cmd: UndeleteCmd) -> Result<()> {
     match cmd {
         UndeleteCmd::List { n, since } => {
             let mut url = format!("{api_url}/api/removed?limit={n}");
@@ -325,23 +319,15 @@ async fn run_undelete(
             }
             let v = fetch_json(client, &url).await?;
             let arr = v.as_array().cloned().unwrap_or_default();
-            println!(
-                "{:<14} {:>12} {:>10} {:<8} {}",
-                "rm_time", "size", "uid", "kind", "name  fid"
-            );
+            println!("{:<14} {:>12} {:>10} {:<8} name  fid", "rm_time", "size", "uid", "kind");
             for e in arr {
                 let rm = e.get("rm_time").and_then(|v| v.as_i64()).unwrap_or(0);
                 let size = e.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
                 let uid = e.get("uid").and_then(|v| v.as_u64()).unwrap_or(0);
                 let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
                 let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let fid = e
-                    .get("fid")
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "?".into());
-                println!(
-                    "{rm:<14} {size:>12} {uid:>10} {kind:<8} {name}  fid={fid}"
-                );
+                let fid = e.get("fid").map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+                println!("{rm:<14} {size:>12} {uid:>10} {kind:<8} {name}  fid={fid}");
             }
         }
         UndeleteCmd::Forget { fid } => {
@@ -363,12 +349,7 @@ async fn run_undelete(
     Ok(())
 }
 
-async fn run_diff(
-    client: &reqwest::Client,
-    api_url: &str,
-    mount: &str,
-    limit: usize,
-) -> Result<()> {
+async fn run_diff(client: &reqwest::Client, api_url: &str, mount: &str, limit: usize) -> Result<()> {
     // Match by `(name, size)` tuples. Precise diff by parent_fid would
     // need an FS-side path_to_fid call per entry — that's an FFI a
     // pure-HTTP CLI client shouldn't own. `(name, size)` catches the
@@ -487,7 +468,12 @@ async fn run_report(client: &reqwest::Client, api_url: &str, cmd: ReportCmd) -> 
                 println!("{b:<12} {c:>10} {s:>18}");
             }
         }
-        ReportCmd::Dump { user, group, ost, limit } => {
+        ReportCmd::Dump {
+            user,
+            group,
+            ost,
+            limit,
+        } => {
             let mut children: Vec<serde_json::Value> = Vec::new();
             if let Some(u) = user {
                 children.push(serde_json::json!({
@@ -545,17 +531,8 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<serde_json::V
     Ok(value)
 }
 
-async fn post_json(
-    client: &reqwest::Client,
-    url: &str,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    let resp = client
-        .post(url)
-        .json(body)
-        .send()
-        .await
-        .context("request failed")?;
+async fn post_json(client: &reqwest::Client, url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    let resp = client.post(url).json(body).send().await.context("request failed")?;
     let status = resp.status();
     let value: serde_json::Value = resp.json().await.context("response is not JSON")?;
     if !status.is_success() {
@@ -645,10 +622,7 @@ async fn run_find(client: &reqwest::Client, api_url: &str, args: FindArgs) -> Re
         let size = e.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
         let uid = e.get("uid").and_then(|v| v.as_u64()).unwrap_or(0);
         let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-        let fid = e
-            .get("fid")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "?".into());
+        let fid = e.get("fid").map(|v| v.to_string()).unwrap_or_else(|| "?".into());
         println!("{kind:8} {size:>12} uid={uid:<6} {name}  fid={fid}");
     }
     Ok(())

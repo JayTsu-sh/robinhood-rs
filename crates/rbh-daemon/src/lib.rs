@@ -3,6 +3,8 @@
 //! The public [`run`] function boots the full stack: observability, database,
 //! changelog listener, fs-scan, scheduler-rs, and the axum HTTP server.
 
+#![allow(clippy::items_after_test_module)]
+
 mod changelog;
 mod signals;
 mod thresholds;
@@ -26,8 +28,7 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!("robinhood-rs daemon starting");
 
     // 2. Database connection.
-    let db_url = std::env::var("RBH_DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root@127.0.0.1/rbh_entries".to_string());
+    let db_url = std::env::var("RBH_DATABASE_URL").unwrap_or_else(|_| "mysql://root@127.0.0.1/rbh_entries".to_string());
     let pool = sqlx::MySqlPool::connect(&db_url)
         .await
         .context("failed to connect to MariaDB")?;
@@ -44,8 +45,7 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!("database migrations complete");
 
     // 4. Initial fs-scan if catalog is empty.
-    let mount_path = std::env::var("RBH_LUSTRE_MOUNT")
-        .unwrap_or_else(|_| "/lustre".to_string());
+    let mount_path = std::env::var("RBH_LUSTRE_MOUNT").unwrap_or_else(|_| "/lustre".to_string());
     let count = entry_store.entry_count().await.unwrap_or(0);
     if count == 0 {
         tracing::info!(mount = %mount_path, "catalog empty — running initial fs-scan");
@@ -64,15 +64,11 @@ pub async fn run() -> anyhow::Result<()> {
     //   RBH_CHANGELOG_USER   — either a single reader id reused on every MDT,
     //                          or a comma-separated list matching RBH_MDTS 1:1.
     let daemon_cancel = CancellationToken::new();
-    let cursor_store = Arc::new(
-        rbh_entry_store::store::MariaDbCursorStore::new(pool.clone()),
-    );
+    let cursor_store = Arc::new(rbh_entry_store::store::MariaDbCursorStore::new(pool.clone()));
 
     let mdt_specs = resolve_changelog_mdts();
     if mdt_specs.is_empty() {
-        tracing::info!(
-            "RBH_MDTS / RBH_CHANGELOG_USER not set — changelog listener disabled"
-        );
+        tracing::info!("RBH_MDTS / RBH_CHANGELOG_USER not set — changelog listener disabled");
     } else {
         for (mdt_name, reader_id) in mdt_specs {
             let listener_cfg = lustre_changelog::ListenerConfig {
@@ -83,12 +79,8 @@ pub async fn run() -> anyhow::Result<()> {
                 ..Default::default()
             };
 
-            match lustre_changelog::ChangelogListener::spawn(
-                listener_cfg,
-                cursor_store.clone(),
-                daemon_cancel.clone(),
-            )
-            .await
+            match lustre_changelog::ChangelogListener::spawn(listener_cfg, cursor_store.clone(), daemon_cancel.clone())
+                .await
             {
                 Ok(handle) => {
                     tracing::info!(
@@ -100,13 +92,7 @@ pub async fn run() -> anyhow::Result<()> {
                     let ingest_mount = PathBuf::from(&mount_path);
                     let ingest_cancel = daemon_cancel.clone();
                     tokio::spawn(async move {
-                        changelog::ingest_loop(
-                            handle,
-                            ingest_store,
-                            ingest_mount,
-                            ingest_cancel,
-                        )
-                        .await;
+                        changelog::ingest_loop(handle, ingest_store, ingest_mount, ingest_cancel).await;
                     });
                 }
                 Err(e) => {
@@ -137,9 +123,7 @@ pub async fn run() -> anyhow::Result<()> {
         .context("failed to build scheduler")?;
 
     // Register task types.
-    scheduler
-        .register::<rbh_policy::PolicyRunTask>()
-        .await;
+    scheduler.register::<rbh_policy::PolicyRunTask>().await;
 
     // Initialize the policy runtime (global state for PolicyRunTask).
     rbh_policy::init_runtime(Arc::new(rbh_policy::PolicyRuntime {
@@ -205,8 +189,7 @@ pub async fn run() -> anyhow::Result<()> {
     let app = rbh_api::router(state);
 
     // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
-    let listen_addr =
-        std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listen_addr = std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
@@ -241,10 +224,7 @@ pub async fn run() -> anyhow::Result<()> {
 /// after the one-shot runs but never removes them. This sweep drops
 /// Completed rows matching either prefix.
 async fn prune_threshold_schedules(scheduler: &Scheduler) {
-    let records = match scheduler
-        .list_schedules_by_name_prefix("rbh.policy.")
-        .await
-    {
+    let records = match scheduler.list_schedules_by_name_prefix("rbh.policy.").await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "prune: list_schedules_by_name_prefix failed");
@@ -283,11 +263,7 @@ fn resolve_changelog_mdts() -> Vec<(String, String)> {
 }
 
 /// Pure resolver used by [`resolve_changelog_mdts`]. Pulled out for testing.
-fn pair_mdts_with_users(
-    mdts_csv: Option<&str>,
-    legacy_mdt: Option<&str>,
-    user_csv: &str,
-) -> Vec<(String, String)> {
+fn pair_mdts_with_users(mdts_csv: Option<&str>, legacy_mdt: Option<&str>, user_csv: &str) -> Vec<(String, String)> {
     if user_csv.is_empty() {
         return Vec::new();
     }
@@ -365,10 +341,7 @@ mod tests {
     #[test]
     fn one_user_per_mdt() {
         let v = pair_mdts_with_users(Some("a,b"), None, "cl1,cl2");
-        assert_eq!(
-            v,
-            vec![("a".into(), "cl1".into()), ("b".into(), "cl2".into())]
-        );
+        assert_eq!(v, vec![("a".into(), "cl1".into()), ("b".into(), "cl2".into())]);
     }
 
     #[test]
@@ -387,27 +360,18 @@ mod tests {
     #[test]
     fn mdts_takes_precedence_over_legacy() {
         let v = pair_mdts_with_users(Some("a,b"), Some("legacy"), "cl1");
-        assert_eq!(
-            v,
-            vec![("a".into(), "cl1".into()), ("b".into(), "cl1".into())]
-        );
+        assert_eq!(v, vec![("a".into(), "cl1".into()), ("b".into(), "cl1".into())]);
     }
 
     #[test]
     fn empty_tokens_are_ignored() {
         let v = pair_mdts_with_users(Some(" a , , b "), None, "cl1, ,cl2");
-        assert_eq!(
-            v,
-            vec![("a".into(), "cl1".into()), ("b".into(), "cl2".into())]
-        );
+        assert_eq!(v, vec![("a".into(), "cl1".into()), ("b".into(), "cl2".into())]);
     }
 }
 
 /// Drain an fs-scan into the entry store.
-async fn run_initial_scan(
-    entry_store: &rbh_entry_store::store::EntryStore,
-    mount_path: &str,
-) {
+async fn run_initial_scan(entry_store: &rbh_entry_store::store::EntryStore, mount_path: &str) {
     let config = rbh_fs_scan::ScanConfig {
         root: PathBuf::from(mount_path),
         concurrency: 4,
@@ -436,10 +400,10 @@ async fn run_initial_scan(
         }
     }
     // Flush remaining.
-    if !batch.is_empty() {
-        if let Err(e) = entry_store.upsert_batch(&batch).await {
-            tracing::warn!(error = %e, "final batch upsert failed");
-        }
+    if !batch.is_empty()
+        && let Err(e) = entry_store.upsert_batch(&batch).await
+    {
+        tracing::warn!(error = %e, "final batch upsert failed");
     }
 
     let (scanned, errors, dirs) = progress.snapshot();
@@ -447,23 +411,14 @@ async fn run_initial_scan(
 }
 
 /// Reconcile all enabled policies to scheduler-rs schedules on startup.
-async fn reconcile_all_policies(
-    scheduler: &Scheduler,
-    policy_store: &rbh_policy::PolicyStore,
-) {
+async fn reconcile_all_policies(scheduler: &Scheduler, policy_store: &rbh_policy::PolicyStore) {
     match policy_store.list().await {
         Ok(policies) => {
             for policy in &policies {
                 if policy.enabled {
-                    match rbh_policy::reconcile_triggers(scheduler, policy.id, &policy.definition)
-                        .await
-                    {
+                    match rbh_policy::reconcile_triggers(scheduler, policy.id, &policy.definition).await {
                         Ok(ids) => {
-                            tracing::info!(
-                                policy_id = policy.id,
-                                schedules = ids.len(),
-                                "policy reconciled"
-                            );
+                            tracing::info!(policy_id = policy.id, schedules = ids.len(), "policy reconciled");
                         }
                         Err(e) => {
                             tracing::error!(

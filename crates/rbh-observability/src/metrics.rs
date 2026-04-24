@@ -6,16 +6,13 @@
 //! the `/metrics` endpoint.
 
 use once_cell::sync::Lazy;
-use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry,
-};
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry};
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 /// Current catalog entry count. Refreshed by the `/metrics` handler.
 pub static CATALOG_ENTRIES: Lazy<IntGauge> = Lazy::new(|| {
-    let g = IntGauge::new("rbh_catalog_entries", "Entries currently in the catalog")
-        .expect("metric registration");
+    let g = IntGauge::new("rbh_catalog_entries", "Entries currently in the catalog").expect("metric registration");
     REGISTRY.register(Box::new(g.clone())).ok();
     g
 });
@@ -35,13 +32,8 @@ pub static POLICY_RUNS: Lazy<IntCounterVec> = Lazy::new(|| {
 /// Per-run wall-clock duration, labeled by `policy_id`.
 pub static POLICY_RUN_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     let h = HistogramVec::new(
-        HistogramOpts::new(
-            "rbh_policy_run_duration_seconds",
-            "Policy run wall-clock duration",
-        )
-        .buckets(vec![
-            0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 3600.0,
-        ]),
+        HistogramOpts::new("rbh_policy_run_duration_seconds", "Policy run wall-clock duration")
+            .buckets(vec![0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 3600.0]),
         &["policy_id"],
     )
     .expect("metric registration");

@@ -103,25 +103,20 @@ pub async fn remove_policy_schedules(scheduler: &Scheduler, policy_id: u64) -> R
 ///
 /// Returns `Ok(None)` for threshold variants — those are driven by the
 /// daemon-level threshold checker, not by scheduler-rs.
-fn build_trigger(
-    spec: &TriggerSpec,
-) -> Result<Option<Box<dyn scheduler_rs::trigger::Trigger>>, PolicyError> {
+fn build_trigger(spec: &TriggerSpec) -> Result<Option<Box<dyn scheduler_rs::trigger::Trigger>>, PolicyError> {
     use scheduler_rs::trigger::*;
 
     match spec {
         TriggerSpec::Interval { secs } => {
             if *secs == 0 {
-                return Err(PolicyError::InvalidTrigger(
-                    "interval must be > 0 seconds".to_string(),
-                ));
+                return Err(PolicyError::InvalidTrigger("interval must be > 0 seconds".to_string()));
             }
-            Ok(Some(Box::new(IntervalTrigger::every(
-                std::time::Duration::from_secs(*secs),
-            ))))
+            Ok(Some(Box::new(IntervalTrigger::every(std::time::Duration::from_secs(
+                *secs,
+            )))))
         }
         TriggerSpec::Cron { expression } => {
-            let trigger = CronTrigger::new(expression)
-                .map_err(|e| PolicyError::InvalidTrigger(e.to_string()))?;
+            let trigger = CronTrigger::new(expression).map_err(|e| PolicyError::InvalidTrigger(e.to_string()))?;
             Ok(Some(Box::new(trigger)))
         }
         TriggerSpec::Once { at } => Ok(Some(Box::new(OnceTrigger::at(*at)))),

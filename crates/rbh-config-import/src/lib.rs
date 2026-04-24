@@ -161,11 +161,7 @@ fn parse_fileclass(name: &str, body: &str) -> Result<(String, Predicate)> {
     Ok((name.to_string(), pred))
 }
 
-fn parse_policy(
-    name: &str,
-    body: &str,
-    fileclasses: &HashMap<String, Predicate>,
-) -> Result<(PolicyDef, Vec<String>)> {
+fn parse_policy(name: &str, body: &str, fileclasses: &HashMap<String, Predicate>) -> Result<(PolicyDef, Vec<String>)> {
     let (blocks, kvs) = split_body(body);
     let mut warns = Vec::new();
 
@@ -174,13 +170,10 @@ fn parse_policy(
         parse_expression(b)?
     } else if let Some(v) = kvs.get("scope") {
         let name = v.trim().trim_end_matches(';').trim();
-        fileclasses
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| {
-                warns.push(format!("scope references unknown fileclass: {name}"));
-                Predicate::True
-            })
+        fileclasses.get(name).cloned().unwrap_or_else(|| {
+            warns.push(format!("scope references unknown fileclass: {name}"));
+            Predicate::True
+        })
     } else {
         Predicate::True
     };
@@ -253,10 +246,7 @@ fn parse_policy(
     Ok((def, warns))
 }
 
-fn parse_triggers(
-    blocks: &[(String, String)],
-    warns: &mut Vec<String>,
-) -> Vec<TriggerSpec> {
+fn parse_triggers(blocks: &[(String, String)], warns: &mut Vec<String>) -> Vec<TriggerSpec> {
     let mut out = Vec::new();
     for (hdr, body) in blocks {
         if !hdr.trim().ends_with("_trigger") && hdr.trim() != "trigger" {
@@ -296,7 +286,7 @@ fn parse_triggers(
 /// Unrecognised atoms are reduced to Predicate::True and logged.
 fn parse_expression(src: &str) -> Result<Predicate> {
     let tokens: Vec<&str> = src
-        .split(|c: char| c == '\n' || c == ';')
+        .split(['\n', ';'])
         .flat_map(|s| s.split(" and "))
         .flat_map(|s| s.split("&&"))
         .map(str::trim)
@@ -485,7 +475,11 @@ mod tests {
         let p = parse_atom("size > 1GB").unwrap();
         assert!(matches!(
             p,
-            Predicate::Cmp { field: Field::Size, cmp: CmpOp::Gt, value: Value::Num(1073741824) }
+            Predicate::Cmp {
+                field: Field::Size,
+                cmp: CmpOp::Gt,
+                value: Value::Num(1073741824)
+            }
         ));
     }
 
@@ -494,7 +488,11 @@ mod tests {
         let p = parse_atom("type == file").unwrap();
         assert!(matches!(
             p,
-            Predicate::Cmp { field: Field::Kind, cmp: CmpOp::Eq, value: Value::Num(0) }
+            Predicate::Cmp {
+                field: Field::Kind,
+                cmp: CmpOp::Eq,
+                value: Value::Num(0)
+            }
         ));
     }
 

@@ -40,10 +40,7 @@ impl SortKey {
 
     /// Join a slice of keys into a comma-separated fragment.
     pub fn list_to_sql(keys: &[SortKey]) -> String {
-        keys.iter()
-            .map(SortKey::to_sql_fragment)
-            .collect::<Vec<_>>()
-            .join(", ")
+        keys.iter().map(SortKey::to_sql_fragment).collect::<Vec<_>>().join(", ")
     }
 }
 
@@ -103,10 +100,7 @@ fn build(pred: &Predicate, params: &mut Vec<SqlParam>) -> String {
             if osts.is_empty() {
                 return "1=0".to_string();
             }
-            let placeholders = (0..osts.len())
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = (0..osts.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
             for idx in osts {
                 params.push(SqlParam::Num(*idx as i64));
             }
@@ -303,10 +297,7 @@ mod tests {
         let pred = Predicate::OnOst { osts: vec![1, 4, 7] };
         let (sql, params) = to_sql(&pred);
         assert!(sql.contains("IN (?, ?, ?)"));
-        assert_eq!(
-            params,
-            vec![SqlParam::Num(1), SqlParam::Num(4), SqlParam::Num(7)]
-        );
+        assert_eq!(params, vec![SqlParam::Num(1), SqlParam::Num(4), SqlParam::Num(7)]);
     }
 
     #[test]
@@ -317,7 +308,9 @@ mod tests {
 
     #[test]
     fn hsm_state_generates_json_extract() {
-        let p = Predicate::HsmStateEq { state: "archived".into() };
+        let p = Predicate::HsmStateEq {
+            state: "archived".into(),
+        };
         let (sql, params) = to_sql(&p);
         assert!(sql.contains("JSON_UNQUOTE"));
         assert!(sql.contains("$.hsm_state"));

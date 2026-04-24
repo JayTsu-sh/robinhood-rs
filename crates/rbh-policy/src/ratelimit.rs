@@ -3,7 +3,7 @@
 //! Two orthogonal limits:
 //! * `max_per_sec`        — a leaky-bucket counter of actions/second.
 //! * `max_bytes_per_sec`  — a leaky-bucket counter of bytes/second summed
-//!                          from `EntryRow::size`.
+//!   from `EntryRow::size`.
 //!
 //! Both are approximate: we bill bytes at action-start time rather than
 //! measuring real I/O, so a single large copy can temporarily exceed the
@@ -82,17 +82,14 @@ impl RateLimiter {
                     return;
                 }
 
-                let token_wait = if b.max_per_sec.is_some() && b.tokens < 1.0 {
-                    (1.0 - b.tokens) / b.max_per_sec.unwrap()
-                } else {
-                    0.0
+                let token_wait = match b.max_per_sec {
+                    Some(mps) if b.tokens < 1.0 => (1.0 - b.tokens) / mps,
+                    _ => 0.0,
                 };
-                let byte_wait =
-                    if b.max_bytes_per_sec.is_some() && b.bytes < bytes as f64 {
-                        (bytes as f64 - b.bytes) / b.max_bytes_per_sec.unwrap()
-                    } else {
-                        0.0
-                    };
+                let byte_wait = match b.max_bytes_per_sec {
+                    Some(mbps) if b.bytes < bytes as f64 => (bytes as f64 - b.bytes) / mbps,
+                    _ => 0.0,
+                };
                 let wait_secs = token_wait.max(byte_wait).max(0.001);
                 Duration::from_secs_f64(wait_secs.min(60.0))
             };
@@ -102,17 +99,18 @@ impl RateLimiter {
             // maximum, force a debit (go negative) so we don't spin.
             let mut b = self.inner.lock().await;
             b.refill();
-            if let Some(max) = b.max_bytes_per_sec {
-                if (bytes as f64) > max && b.bytes > 0.0 {
-                    if b.max_per_sec.is_some() && b.tokens < 1.0 {
-                        continue; // still need a token, retry loop
-                    }
-                    if b.max_per_sec.is_some() {
-                        b.tokens -= 1.0;
-                    }
-                    b.bytes -= bytes as f64; // allowed to go negative
-                    return;
+            if let Some(max) = b.max_bytes_per_sec
+                && (bytes as f64) > max
+                && b.bytes > 0.0
+            {
+                if b.max_per_sec.is_some() && b.tokens < 1.0 {
+                    continue; // still need a token, retry loop
                 }
+                if b.max_per_sec.is_some() {
+                    b.tokens -= 1.0;
+                }
+                b.bytes -= bytes as f64; // allowed to go negative
+                return;
             }
             // Otherwise: fall back to the loop to re-check invariants.
         }

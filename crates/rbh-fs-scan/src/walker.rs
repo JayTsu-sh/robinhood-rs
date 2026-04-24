@@ -318,10 +318,10 @@ async fn process_directory(state: &WalkState, dir_path: &Path, depth: usize, par
                     // Incremental scan: drop entries older than the cutoff.
                     // Directories are kept (their children may be newer);
                     // this filter applies only to files / symlinks / etc.
-                    if let Some(cut) = state.since_mtime {
-                        if row.mtime < cut {
-                            continue;
-                        }
+                    if let Some(cut) = state.since_mtime
+                        && row.mtime < cut
+                    {
+                        continue;
                     }
                     state.progress.entries_scanned.fetch_add(1, Ordering::Relaxed);
                     let _ = state.event_tx.send(ScanEvent::Entry(Box::new(row))).await;

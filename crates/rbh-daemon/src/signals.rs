@@ -2,7 +2,7 @@
 //!
 //! * `SIGTERM` / `SIGINT` — trigger graceful shutdown via `CancellationToken`.
 //! * `SIGHUP`             — reload log level (from env `RBH_LOG`) and invoke
-//!                          any installed reload callback (e.g. MDT rescan).
+//!   any installed reload callback (e.g. MDT rescan).
 //! * `SIGUSR1`            — dump runtime stats to `tracing::info!`.
 
 use std::sync::Arc;
@@ -22,10 +22,7 @@ pub type DumpHook = Arc<dyn Fn() + Send + Sync>;
 /// and the caller should shut down. The `cancel` token is flipped before
 /// returning.
 pub async fn supervise(
-    obs: ObsGuard,
-    cancel: CancellationToken,
-    reload_hook: Option<ReloadHook>,
-    dump_hook: Option<DumpHook>,
+    obs: ObsGuard, cancel: CancellationToken, reload_hook: Option<ReloadHook>, dump_hook: Option<DumpHook>,
 ) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -54,10 +51,10 @@ pub async fn supervise(
                     Ok(()) => tracing::info!(directive = %directive, "SIGHUP: log filter reloaded"),
                     Err(e) => tracing::warn!(error = %e, "SIGHUP: filter reload failed"),
                 }
-                if let Some(hook) = &reload_hook {
-                    if let Err(e) = hook() {
-                        tracing::warn!(error = %e, "SIGHUP: reload hook failed");
-                    }
+                if let Some(hook) = &reload_hook
+                    && let Err(e) = hook()
+                {
+                    tracing::warn!(error = %e, "SIGHUP: reload hook failed");
                 }
             }
             _ = sigusr1.recv() => {

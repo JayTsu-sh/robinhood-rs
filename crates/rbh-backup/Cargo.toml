@@ -1,23 +1,21 @@
 [package]
-name = "rbh-actions"
+name = "rbh-backup"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Action executors (Purge/HsmArchive/HsmRelease) + dispatch by PolicyKind."
+description = "External backup adapter trait + rbhext_tool-compatible subprocess implementation."
 
 [dependencies]
 lustre-api = { path = "../lustre-api" }
 rbh-entry-store = { path = "../rbh-entry-store" }
-rbh-backup = { path = "../rbh-backup" }
 
 async-trait = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-bytes = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "process"] }
+tempfile = "3"

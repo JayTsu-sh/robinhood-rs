@@ -54,8 +54,7 @@ impl Guard {
     /// Parse `directive` (e.g. `"info"`, `"rbh_policy=debug"`) and atomically
     /// replace the active filter. Used by SIGHUP reload in the daemon.
     pub fn reload_filter(&self, directive: &str) -> Result<(), ObsError> {
-        let new_filter = EnvFilter::try_new(directive)
-            .map_err(|e| ObsError::InvalidFilter(e.to_string()))?;
+        let new_filter = EnvFilter::try_new(directive).map_err(|e| ObsError::InvalidFilter(e.to_string()))?;
         self.reload_handle
             .reload(new_filter)
             .map_err(|e| ObsError::SetGlobal(e.to_string()))
@@ -72,8 +71,7 @@ pub enum ObsError {
 
 /// Initialize the global tracing subscriber. Must be called exactly once.
 pub fn init(cfg: ObservabilityConfig) -> Result<Guard, ObsError> {
-    let filter = EnvFilter::try_new(&cfg.level)
-        .map_err(|e| ObsError::InvalidFilter(e.to_string()))?;
+    let filter = EnvFilter::try_new(&cfg.level).map_err(|e| ObsError::InvalidFilter(e.to_string()))?;
     let (filter, reload_handle) = reload::Layer::new(filter);
 
     match cfg.format {
@@ -87,15 +85,13 @@ pub fn init(cfg: ObservabilityConfig) -> Result<Guard, ObsError> {
                     .with_thread_ids(false)
                     .with_thread_names(false),
             );
-            tracing::subscriber::set_global_default(subscriber)
-                .map_err(|e| ObsError::SetGlobal(e.to_string()))?;
+            tracing::subscriber::set_global_default(subscriber).map_err(|e| ObsError::SetGlobal(e.to_string()))?;
         }
         LogFormat::Pretty => {
             let subscriber = tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt::layer().pretty().with_writer(std::io::stderr));
-            tracing::subscriber::set_global_default(subscriber)
-                .map_err(|e| ObsError::SetGlobal(e.to_string()))?;
+            tracing::subscriber::set_global_default(subscriber).map_err(|e| ObsError::SetGlobal(e.to_string()))?;
         }
     }
 

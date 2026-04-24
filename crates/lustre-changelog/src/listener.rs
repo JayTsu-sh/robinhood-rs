@@ -156,7 +156,7 @@ impl ChangelogListener {
     fields(mdt = %cfg.mdt, reader_id = %cfg.reader_id, start_rec),
 )]
 fn run_blocking(
-    cfg: ListenerConfig, start_rec: i64, event_tx: mpsc::Sender<EventBatch>, mut ack_rx: mpsc::Receiver<EventAck>,
+    cfg: ListenerConfig, start_rec: i64, event_tx: mpsc::Sender<EventBatch>, ack_rx: mpsc::Receiver<EventAck>,
     cursor_store: Arc<dyn CursorStore>, cancel: CancellationToken,
 ) -> Result<(), ChangelogError> {
     let use_polling = cfg.follow && cfg.poll_interval > Duration::ZERO;
@@ -256,7 +256,14 @@ fn run_polling_loop(
         }
 
         // Process acks and advance watermarks.
-        process_acks(&api, &cfg.mdt, &cfg.reader_id, &mut ack_rx, &mut ack_state, &cursor_store);
+        process_acks(
+            &api,
+            &cfg.mdt,
+            &cfg.reader_id,
+            &mut ack_rx,
+            &mut ack_state,
+            &cursor_store,
+        );
 
         if drained > 0 {
             debug!(mdt = %cfg.mdt, drained, next_start, "drain cycle complete");
@@ -275,7 +282,14 @@ fn run_polling_loop(
             warn!(mdt = %cfg.mdt, dropped_events = count, "consumer gone; partial batch dropped on shutdown");
         }
     }
-    process_acks(&api, &cfg.mdt, &cfg.reader_id, &mut ack_rx, &mut ack_state, &cursor_store);
+    process_acks(
+        &api,
+        &cfg.mdt,
+        &cfg.reader_id,
+        &mut ack_rx,
+        &mut ack_state,
+        &cursor_store,
+    );
     info!(mdt = %cfg.mdt, last_cleared = ack_state.last_cleared, "changelog listener stopped");
     Ok(())
 }
@@ -302,7 +316,14 @@ fn run_follow_loop(
             break;
         }
 
-        process_acks(&api, &cfg.mdt, &cfg.reader_id, &mut ack_rx, &mut ack_state, &cursor_store);
+        process_acks(
+            &api,
+            &cfg.mdt,
+            &cfg.reader_id,
+            &mut ack_rx,
+            &mut ack_state,
+            &cursor_store,
+        );
 
         let buf = match api.recv_changelog(&handle) {
             Ok(Some(buf)) => buf,
@@ -360,7 +381,14 @@ fn run_follow_loop(
         }
     }
 
-    process_acks(&api, &cfg.mdt, &cfg.reader_id, &mut ack_rx, &mut ack_state, &cursor_store);
+    process_acks(
+        &api,
+        &cfg.mdt,
+        &cfg.reader_id,
+        &mut ack_rx,
+        &mut ack_state,
+        &cursor_store,
+    );
     api.close_changelog(handle)?;
     info!(mdt = %cfg.mdt, last_cleared = ack_state.last_cleared, "changelog listener stopped");
     Ok(())

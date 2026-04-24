@@ -32,8 +32,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let src = std::fs::read_to_string(&cli.config)
-        .with_context(|| format!("reading {}", cli.config.display()))?;
+    let src = std::fs::read_to_string(&cli.config).with_context(|| format!("reading {}", cli.config.display()))?;
     let result = rbh_config_import::import(&src)?;
 
     for w in &result.warnings {

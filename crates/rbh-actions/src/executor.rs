@@ -248,6 +248,112 @@ impl ActionExecutor for HsmReleaseExecutor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// External backup (rbhext_tool)
+// ---------------------------------------------------------------------------
+
+/// Runs an external backup tool (matching robinhood-C's `rbhext_tool`
+/// protocol) via a [`rbh_backup::BackupAdapter`].
+///
+/// Operation is selected by `op`:
+/// * `Archive` — copy Lustre → backend
+/// * `Restore` — copy backend → Lustre
+/// * `Remove`  — delete the backend copy
+///
+/// The source path is always resolved from the entry's FID. The
+/// destination path, when required, is either taken from the configured
+/// `dest_template` (supports `{src}`, `{mount}`, `{archive_id}`) or
+/// left empty so the tool itself can derive it (rbhext_tool scripts
+/// typically compute dest from src).
+pub struct BackupExecutor {
+    pub adapter: std::sync::Arc<dyn rbh_backup::BackupAdapter>,
+    pub op: rbh_backup::BackupOp,
+    pub archive_id: u32,
+    pub hints: Option<String>,
+    /// Template rendered to produce the `dest` path. `None` → pass empty
+    /// dest to the tool.
+    pub dest_template: Option<String>,
+}
+
+impl BackupExecutor {
+    /// Build from a parsed `BackupCommandConfig` with the given operation.
+    pub fn from_config(
+        cfg: &rbh_backup::BackupCommandConfig, op: rbh_backup::BackupOp, archive_id: u32, hints: Option<String>,
+        dest_template: Option<String>,
+    ) -> Self {
+        Self {
+            adapter: std::sync::Arc::new(cfg.build()),
+            op,
+            archive_id,
+            hints,
+            dest_template,
+        }
+    }
+
+    fn render_dest(&self, src: &Path, mount: &Path) -> Option<PathBuf> {
+        let tpl = self.dest_template.as_ref()?;
+        let rendered = tpl
+            .replace("{src}", &src.to_string_lossy())
+            .replace("{mount}", &mount.to_string_lossy())
+            .replace("{archive_id}", &self.archive_id.to_string());
+        Some(PathBuf::from(rendered))
+    }
+}
+
+#[async_trait]
+impl ActionExecutor for BackupExecutor {
+    #[tracing::instrument(
+        name = "action.backup",
+        skip(self, ctx),
+        fields(fid = %entry.fid, op = ?self.op, archive_id = self.archive_id)
+    )]
+    async fn execute(&self, entry: &EntryRow, ctx: &ActionContext) -> Result<ActionOutcome, ActionError> {
+        // Resolve FID → real path (required by the rbhext_tool contract:
+        // the script expects a regular filesystem path, not .lustre/fid/…).
+        let lustre = ctx.lustre;
+        let mount = ctx.mount_path.clone();
+        let fid = entry.fid;
+        let src = tokio::task::spawn_blocking(move || resolve_real_path(&lustre, &mount, &fid))
+            .await
+            .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))?;
+        let src = match src {
+            Some(p) => p,
+            None => {
+                return Ok(ActionOutcome::Skipped {
+                    reason: "could not resolve FID to path".to_string(),
+                });
+            }
+        };
+
+        let dest = self.render_dest(&src, &ctx.mount_path);
+        let inv = rbh_backup::ToolInvocation {
+            op: self.op,
+            src: &src,
+            dest: dest.as_deref(),
+            hints: self.hints.as_deref(),
+            archive_id: self.archive_id,
+        };
+
+        let res = match self.op {
+            rbh_backup::BackupOp::Archive => self.adapter.archive(&inv).await,
+            rbh_backup::BackupOp::Restore => self.adapter.restore(&inv).await,
+            rbh_backup::BackupOp::Remove => self.adapter.remove(&inv).await,
+        };
+        match res {
+            Ok(()) => {
+                tracing::info!(src = %src.display(), "backup tool succeeded");
+                Ok(ActionOutcome::Success)
+            }
+            Err(rbh_backup::BackupError::ToolFailed { code, stderr }) => {
+                tracing::warn!(code, %stderr, "backup tool failed");
+                Ok(ActionOutcome::Failed {
+                    error: format!("tool exit {code}: {stderr}"),
+                })
+            }
+            Err(e) => Err(ActionError::Backup(e)),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -15,18 +15,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use scheduler_rs::prelude::{Scheduler, ScheduleConfig, MisfirePolicy, Task};
+use scheduler_rs::prelude::{MisfirePolicy, ScheduleConfig, Scheduler, Task};
 use scheduler_rs::trigger::ImmediateTrigger;
 use tokio::sync::Mutex;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use rbh_entry_store::store::{EntryStore, QueryParam};
-use rbh_policy::{
-    PolicyRow, PolicyStore, PolicyRunTask, TargetFilter, TriggerSpec,
-    compose_scope_with_ignores,
-};
 use rbh_policy::model::ThresholdTarget;
+use rbh_policy::{PolicyRow, PolicyRunTask, PolicyStore, TargetFilter, TriggerSpec, compose_scope_with_ignores};
 use rbh_predicate::{Predicate, SqlParam, to_sql};
 
 /// Fire-time bookkeeping: last-fire timestamp per `(policy_id, trigger_idx)`.
@@ -50,10 +47,7 @@ impl ThresholdChecker {
         // trigger should next be re-evaluated.
         let mut next_check: HashMap<(u64, u32), u64> = HashMap::new();
 
-        tracing::info!(
-            tick_secs = self.tick.as_secs(),
-            "threshold checker started"
-        );
+        tracing::info!(tick_secs = self.tick.as_secs(), "threshold checker started");
 
         loop {
             if self.cancel.is_cancelled() {
@@ -61,10 +55,7 @@ impl ThresholdChecker {
                 return;
             }
 
-            if let Err(e) = self
-                .one_cycle(&last_fired, &mut next_check)
-                .await
-            {
+            if let Err(e) = self.one_cycle(&last_fired, &mut next_check).await {
                 tracing::warn!(error = %e, "threshold cycle error");
             }
 
@@ -78,11 +69,7 @@ impl ThresholdChecker {
         }
     }
 
-    async fn one_cycle(
-        &self,
-        last_fired: &LastFired,
-        next_check: &mut HashMap<(u64, u32), u64>,
-    ) -> anyhow::Result<()> {
+    async fn one_cycle(&self, last_fired: &LastFired, next_check: &mut HashMap<(u64, u32), u64>) -> anyhow::Result<()> {
         let policies = self.policy_store.list().await?;
         let now = now_secs();
 
@@ -113,19 +100,16 @@ impl ThresholdChecker {
                     continue;
                 }
 
-                let target = resolve_target(&params.target);
-                let scope_with_ignore = compose_scope_with_ignores(
-                    &policy.definition.scope,
-                    &policy.definition.ignore_fileclass,
-                );
+                let target = resolve_target(params.target);
+                let scope_with_ignore =
+                    compose_scope_with_ignores(&policy.definition.scope, &policy.definition.ignore_fileclass);
                 let scope_with_target = match target.to_predicate() {
                     Predicate::True => scope_with_ignore,
                     other => Predicate::And {
                         children: vec![scope_with_ignore, other],
                     },
                 };
-                let (where_clause, sql_params): (String, Vec<SqlParam>) =
-                    to_sql(&scope_with_target);
+                let (where_clause, sql_params): (String, Vec<SqlParam>) = to_sql(&scope_with_target);
                 let store_params: Vec<QueryParam> = sql_params
                     .into_iter()
                     .map(|p| match p {
@@ -148,12 +132,7 @@ impl ThresholdChecker {
                     }
                     Measure::Volume { high } => {
                         // SUM(size) WHERE scope — use a one-shot raw query.
-                        let v = sum_size_where(
-                            &self.entry_store,
-                            &where_clause,
-                            &store_params,
-                        )
-                        .await?;
+                        let v = sum_size_where(&self.entry_store, &where_clause, &store_params).await?;
                         tracing::debug!(
                             policy_id = policy.id,
                             trigger_idx = idx,
@@ -166,10 +145,7 @@ impl ThresholdChecker {
                 };
 
                 if fired {
-                    if let Err(e) = self
-                        .fire(policy, idx, &target)
-                        .await
-                    {
+                    if let Err(e) = self.fire(policy, idx, &target).await {
                         tracing::warn!(
                             policy_id = policy.id,
                             trigger_idx = idx,
@@ -195,12 +171,7 @@ impl ThresholdChecker {
         Ok(())
     }
 
-    async fn fire(
-        &self,
-        policy: &PolicyRow,
-        trigger_idx: u32,
-        target: &TargetFilter,
-    ) -> anyhow::Result<()> {
+    async fn fire(&self, policy: &PolicyRow, trigger_idx: u32, target: &TargetFilter) -> anyhow::Result<()> {
         let task = PolicyRunTask {
             policy_id: policy.id,
             trigger_idx,
@@ -212,12 +183,7 @@ impl ThresholdChecker {
             max_instances: 1,
             ..Default::default()
         };
-        let schedule_name = format!(
-            "rbh.policy.{}.threshold.{}.{}",
-            policy.id,
-            trigger_idx,
-            now_secs()
-        );
+        let schedule_name = format!("rbh.policy.{}.threshold.{}.{}", policy.id, trigger_idx, now_secs());
         self.scheduler
             .add_raw(
                 PolicyRunTask::TYPE_NAME.to_string(),
@@ -288,11 +254,7 @@ fn resolve_target(t: &ThresholdTarget) -> TargetFilter {
 
 /// Total size across all matching entries. Separated from EntryStore to
 /// avoid bloating its public API with a one-off helper.
-async fn sum_size_where(
-    store: &EntryStore,
-    where_clause: &str,
-    params: &[QueryParam],
-) -> anyhow::Result<u64> {
+async fn sum_size_where(store: &EntryStore, where_clause: &str, params: &[QueryParam]) -> anyhow::Result<u64> {
     use sqlx::Row;
     let sql = format!(
         "SELECT CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total \
@@ -350,14 +312,9 @@ mod tests {
 
     #[test]
     fn resolve_target_maps_pool_and_ost() {
+        assert_eq!(resolve_target(&ThresholdTarget::Fs), TargetFilter::Fs);
         assert_eq!(
-            resolve_target(&ThresholdTarget::Fs),
-            TargetFilter::Fs
-        );
-        assert_eq!(
-            resolve_target(&ThresholdTarget::Pool {
-                name: "flash".into()
-            }),
+            resolve_target(&ThresholdTarget::Pool { name: "flash".into() }),
             TargetFilter::Pool { name: "flash".into() }
         );
         assert_eq!(

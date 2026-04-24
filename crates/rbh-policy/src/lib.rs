@@ -16,12 +16,12 @@ pub mod store;
 pub mod task;
 
 pub use model::{
-    ActionParams, FileClassDef, HsmParams, LruSortAttr, PolicyDef, PolicyKind, PolicyRow,
-    RateLimit, RetryParams, Rule, TriggerSpec, WindowModeSpec, compose_scope_with_ignores,
+    ActionParams, FileClassDef, HsmParams, LruSortAttr, PolicyDef, PolicyKind, PolicyRow, RateLimit, RetryParams, Rule,
+    TriggerSpec, WindowModeSpec, compose_scope_with_ignores,
 };
-pub use task::TargetFilter;
 pub use reconcile::reconcile_triggers;
 pub use store::PolicyStore;
+pub use task::TargetFilter;
 pub use task::{PolicyRunTask, PolicyRuntime, init_runtime};
 
 /// Errors produced by the policy layer.

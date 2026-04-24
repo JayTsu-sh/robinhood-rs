@@ -268,19 +268,13 @@ impl EntryStore {
     /// Used by changelog ingest to detect rename-overwrite: when a rename
     /// destination already exists, the displaced entry must be removed.
     #[tracing::instrument(name = "store.lookup_by_parent_name", skip(self))]
-    pub async fn lookup_by_parent_name(
-        &self,
-        parent_fid: &LuFid,
-        name: &[u8],
-    ) -> Result<Option<LuFid>> {
+    pub async fn lookup_by_parent_name(&self, parent_fid: &LuFid, name: &[u8]) -> Result<Option<LuFid>> {
         let parent_bin = fid_codec::encode(parent_fid);
-        let row = sqlx::query(
-            "SELECT fid FROM entries WHERE parent_fid = ? AND name = ? LIMIT 1",
-        )
-        .bind(parent_bin.as_slice())
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT fid FROM entries WHERE parent_fid = ? AND name = ? LIMIT 1")
+            .bind(parent_bin.as_slice())
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
 
         match row {
             Some(r) => {
@@ -305,12 +299,7 @@ impl EntryStore {
     /// Used by PolicyRunTask to push predicate scope down to MariaDB.
     /// Params are `(i64 | String)` bound in order.
     #[tracing::instrument(name = "store.query_where", skip(self, params), fields(sql = %where_clause))]
-    pub async fn query_where(
-        &self,
-        where_clause: &str,
-        params: &[QueryParam],
-        limit: u64,
-    ) -> Result<Vec<EntryRow>> {
+    pub async fn query_where(&self, where_clause: &str, params: &[QueryParam], limit: u64) -> Result<Vec<EntryRow>> {
         self.query_page(where_clause, params, None, limit, 0).await
     }
 
@@ -318,12 +307,7 @@ impl EntryStore {
     /// pre-validated SQL fragment (column name + ASC/DESC). Callers build
     /// it via [`SortKey::to_sql_fragment`] — never from raw user input.
     pub async fn query_page(
-        &self,
-        where_clause: &str,
-        params: &[QueryParam],
-        order_by: Option<&str>,
-        limit: u64,
-        offset: u64,
+        &self, where_clause: &str, params: &[QueryParam], order_by: Option<&str>, limit: u64, offset: u64,
     ) -> Result<Vec<EntryRow>> {
         let order_clause = match order_by {
             Some(o) if !o.is_empty() => format!(" ORDER BY {o}"),
@@ -351,10 +335,7 @@ impl EntryStore {
     /// tuples. `group_col` MUST be a validated column name (never raw user
     /// input) — callers go through [`AggregateKey::as_column`].
     pub async fn aggregate_by(
-        &self,
-        group_col: &str,
-        order_by: AggregateSort,
-        limit: u64,
+        &self, group_col: &str, order_by: AggregateSort, limit: u64,
     ) -> Result<Vec<(String, u64, u64)>> {
         let order = match order_by {
             AggregateSort::Count => "cnt DESC",
@@ -430,11 +411,7 @@ impl EntryStore {
     /// the column as `{}` first if it's NULL. Missing rows are a no-op
     /// (HSM events can arrive before the initial scan); returns whether
     /// a row was touched.
-    pub async fn patch_sm_status(
-        &self,
-        fid: &LuFid,
-        patch: &serde_json::Value,
-    ) -> Result<bool> {
+    pub async fn patch_sm_status(&self, fid: &LuFid, patch: &serde_json::Value) -> Result<bool> {
         let bytes = fid_codec::encode(fid);
         // Pull, merge, write. Doing this in-app (not via MySQL
         // JSON_MERGE_PATCH) keeps the logic portable and testable.
@@ -450,9 +427,7 @@ impl EntryStore {
             Some(b) if !b.is_empty() => serde_json::from_slice(&b)?,
             _ => serde_json::Value::Object(serde_json::Map::new()),
         };
-        if let (Some(obj), Some(patch_obj)) =
-            (current.as_object_mut(), patch.as_object())
-        {
+        if let (Some(obj), Some(patch_obj)) = (current.as_object_mut(), patch.as_object()) {
             for (k, v) in patch_obj {
                 obj.insert(k.clone(), v.clone());
             }
@@ -477,10 +452,7 @@ impl EntryStore {
     /// Page the `removed_entries` table ordered by `rm_time` DESC
     /// (newest first). Optional `since` filters rm_time >= since.
     pub async fn list_removed(
-        &self,
-        since: Option<i64>,
-        limit: u64,
-        offset: u64,
+        &self, since: Option<i64>, limit: u64, offset: u64,
     ) -> Result<Vec<crate::model::RemovedEntry>> {
         let (sql, use_since) = match since {
             Some(_) => (
@@ -517,10 +489,7 @@ impl EntryStore {
     }
 
     /// Look up one removed entry by FID.
-    pub async fn get_removed(
-        &self,
-        fid: &LuFid,
-    ) -> Result<Option<crate::model::RemovedEntry>> {
+    pub async fn get_removed(&self, fid: &LuFid) -> Result<Option<crate::model::RemovedEntry>> {
         let bytes = fid_codec::encode(fid);
         let row = sqlx::query(
             "SELECT fid, parent_fid, name, kind, size, uid, gid, sm_status, rm_time \
@@ -534,11 +503,7 @@ impl EntryStore {
 
     /// Count matching rows (no limit/offset). Used for paginated responses
     /// that want a total count.
-    pub async fn count_where(
-        &self,
-        where_clause: &str,
-        params: &[QueryParam],
-    ) -> Result<u64> {
+    pub async fn count_where(&self, where_clause: &str, params: &[QueryParam]) -> Result<u64> {
         let sql = format!("SELECT COUNT(*) AS c FROM entries WHERE {where_clause}");
         let mut query = sqlx::query(&sql);
         for p in params {
@@ -662,22 +627,19 @@ fn row_to_entry(row: &sqlx::mysql::MySqlRow) -> Result<EntryRow> {
 
 fn row_to_removed(row: &sqlx::mysql::MySqlRow) -> Result<crate::model::RemovedEntry> {
     let fid_bytes: Vec<u8> = row.try_get("fid")?;
-    let fid = fid_codec::decode(&fid_bytes)
-        .ok_or(StoreError::FidCodec("invalid fid in removed_entries table"))?;
+    let fid = fid_codec::decode(&fid_bytes).ok_or(StoreError::FidCodec("invalid fid in removed_entries table"))?;
 
     let parent_bytes: Option<Vec<u8>> = row.try_get("parent_fid")?;
     let parent_fid = match parent_bytes {
-        Some(b) if !b.is_empty() => Some(
-            fid_codec::decode(&b)
-                .ok_or(StoreError::FidCodec("corrupted parent_fid in removed_entries"))?,
-        ),
+        Some(b) if !b.is_empty() => {
+            Some(fid_codec::decode(&b).ok_or(StoreError::FidCodec("corrupted parent_fid in removed_entries"))?)
+        }
         _ => None,
     };
 
     let name_bytes: Vec<u8> = row.try_get("name")?;
     let kind_u8: u8 = row.try_get("kind")?;
-    let kind = EntryKind::from_u8(kind_u8)
-        .ok_or(StoreError::FidCodec("invalid entry kind in removed_entries"))?;
+    let kind = EntryKind::from_u8(kind_u8).ok_or(StoreError::FidCodec("invalid entry kind in removed_entries"))?;
 
     let sm_bytes: Option<Vec<u8>> = row.try_get("sm_status")?;
     let sm_status: serde_json::Value = match sm_bytes {

@@ -96,9 +96,7 @@ pub fn build_query(args: &FindArgs, now: i64) -> Result<(Predicate, Vec<SortKey>
         preds.push(parse_size_filter(s)?);
     }
     if let Some(state) = &args.hsm_state {
-        preds.push(Predicate::HsmStateEq {
-            state: state.clone(),
-        });
+        preds.push(Predicate::HsmStateEq { state: state.clone() });
     }
     if let Some(t) = &args.mtime {
         preds.push(parse_time_filter(Field::Mtime, t, now)?);
@@ -134,7 +132,11 @@ pub fn build_query(args: &FindArgs, now: i64) -> Result<(Predicate, Vec<SortKey>
 }
 
 fn eq_num(field: Field, n: i64) -> Predicate {
-    Predicate::Cmp { field, cmp: CmpOp::Eq, value: Value::Num(n) }
+    Predicate::Cmp {
+        field,
+        cmp: CmpOp::Eq,
+        value: Value::Num(n),
+    }
 }
 
 fn type_char_to_kind(c: char) -> Result<u8> {
@@ -146,9 +148,7 @@ fn type_char_to_kind(c: char) -> Result<u8> {
         'b' => Ok(4),
         'p' => Ok(5),
         's' => Ok(6),
-        _ => Err(anyhow!(
-            "invalid --type {c:?}: expected one of f d l b c p s"
-        )),
+        _ => Err(anyhow!("invalid --type {c:?}: expected one of f d l b c p s")),
     }
 }
 

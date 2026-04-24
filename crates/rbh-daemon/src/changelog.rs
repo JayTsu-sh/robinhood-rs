@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 //! Changelog ingest — consumes [`EventBatch`]es from the changelog listener
 //! and applies them to the entry store.
 //!
@@ -26,10 +28,7 @@ use rbh_entry_store::store::EntryStore;
 /// Exits when the listener channel closes or the cancel token fires.
 #[tracing::instrument(name = "changelog.ingest", skip_all)]
 pub async fn ingest_loop(
-    mut handle: ListenerHandle,
-    entry_store: EntryStore,
-    mount_path: PathBuf,
-    cancel: CancellationToken,
+    mut handle: ListenerHandle, entry_store: EntryStore, mount_path: PathBuf, cancel: CancellationToken,
 ) {
     tracing::info!("changelog ingest loop started");
 
@@ -108,10 +107,15 @@ pub async fn ingest_loop(
         );
 
         // Ack after durable commit.
-        if let Err(_) = handle.acks.send(EventAck {
-            mdt,
-            committed_index: max_index,
-        }).await {
+        if handle
+            .acks
+            .send(EventAck {
+                mdt,
+                committed_index: max_index,
+            })
+            .await
+            .is_err()
+        {
             tracing::warn!("ack channel closed — listener may have stopped");
             break;
         }
@@ -123,10 +127,7 @@ pub async fn ingest_loop(
 /// Apply a single changelog event to the entry store.
 /// Returns `Ok(true)` if the store was modified, `Ok(false)` if skipped.
 async fn apply_event(
-    store: &EntryStore,
-    mount: &Path,
-    event: &ChangelogEvent,
-    event_time: i64,
+    store: &EntryStore, mount: &Path, event: &ChangelogEvent, event_time: i64,
 ) -> anyhow::Result<bool> {
     match event {
         // ── Creation events: stat the new file and upsert ──
@@ -222,7 +223,9 @@ async fn apply_event(
             // match, we fall back to a name-only search. The fallback handles
             // entries from initial scans or old changelog replays where
             // parent_fid may not yet be set correctly.
-            let displaced = store.lookup_by_parent_name(parent, name).await
+            let displaced = store
+                .lookup_by_parent_name(parent, name)
+                .await
                 .ok()
                 .flatten()
                 .filter(|dfid| *dfid != *fid);
@@ -268,13 +271,14 @@ async fn apply_event(
         ChangelogEvent::Truncate { fid }
         | ChangelogEvent::SetAttr { fid }
         | ChangelogEvent::MTime { fid }
-        | ChangelogEvent::CTime { fid } => {
-            restat_entry(store, mount, fid, None, Bytes::new()).await
-        }
+        | ChangelogEvent::CTime { fid } => restat_entry(store, mount, fid, None, Bytes::new()).await,
 
-        ChangelogEvent::Hsm { fid, hsm_event, hsm_flags, hsm_error } => {
-            apply_hsm_event(store, fid, *hsm_event, *hsm_flags, *hsm_error).await
-        }
+        ChangelogEvent::Hsm {
+            fid,
+            hsm_event,
+            hsm_flags,
+            hsm_error,
+        } => apply_hsm_event(store, fid, *hsm_event, *hsm_flags, *hsm_error).await,
 
         // ── Events we skip for now ──
         ChangelogEvent::XAttr { .. } | ChangelogEvent::Layout { .. } => Ok(false),
@@ -329,11 +333,7 @@ fn build_hsm_patch(hsm_event: u8, hsm_flags: u8, hsm_error: u8, now: i64) -> ser
 }
 
 async fn apply_hsm_event(
-    store: &EntryStore,
-    fid: &lustre_api::LuFid,
-    hsm_event: u8,
-    hsm_flags: u8,
-    hsm_error: u8,
+    store: &EntryStore, fid: &lustre_api::LuFid, hsm_event: u8, hsm_flags: u8, hsm_error: u8,
 ) -> anyhow::Result<bool> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -397,11 +397,7 @@ mod tests {
 
 /// Re-stat an existing entry and update it in the store.
 async fn restat_entry(
-    store: &EntryStore,
-    mount: &Path,
-    fid: &lustre_api::LuFid,
-    parent: Option<lustre_api::LuFid>,
-    name: Bytes,
+    store: &EntryStore, mount: &Path, fid: &lustre_api::LuFid, parent: Option<lustre_api::LuFid>, name: Bytes,
 ) -> anyhow::Result<bool> {
     if let Some(mut entry) = store.get_entry(fid).await? {
         // Re-stat via FID path for fresh metadata.
@@ -410,11 +406,13 @@ async fn restat_entry(
         let mount_owned = mount.to_owned();
         let stat_result = tokio::task::spawn_blocking(move || {
             let mount_str = mount_owned.to_string_lossy();
-            lustre.fid_to_path(&mount_str, &fid_copy)
+            lustre
+                .fid_to_path(&mount_str, &fid_copy)
                 .ok()
                 .map(|rel| mount_owned.join(rel))
                 .and_then(|p| std::fs::symlink_metadata(&p).ok())
-        }).await?;
+        })
+        .await?;
 
         if let Some(meta) = stat_result {
             entry.size = meta.size();
@@ -432,10 +430,10 @@ async fn restat_entry(
             }
             // Only update parent_fid if non-zero — some record types
             // (e.g. CLOSE, TRUNC) don't populate cr_pfid.
-            if let Some(p) = parent {
-                if !p.is_zero() {
-                    entry.parent_fid = Some(p);
-                }
+            if let Some(p) = parent
+                && !p.is_zero()
+            {
+                entry.parent_fid = Some(p);
             }
             store.upsert_entry(&entry).await?;
             Ok(true)
@@ -451,10 +449,7 @@ async fn restat_entry(
 
 /// Stat a file by FID and build an EntryRow.
 async fn stat_entry_by_fid(
-    mount: &Path,
-    fid: &lustre_api::LuFid,
-    parent_fid: Option<lustre_api::LuFid>,
-    name: Bytes,
+    mount: &Path, fid: &lustre_api::LuFid, parent_fid: Option<lustre_api::LuFid>, name: Bytes,
     _expected_kind: EntryKind,
 ) -> anyhow::Result<EntryRow> {
     let lustre = LustreApi;
@@ -463,12 +458,13 @@ async fn stat_entry_by_fid(
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<EntryRow> {
         let mount_str = mount_owned.to_string_lossy();
-        let rel_path = lustre.fid_to_path(&mount_str, &fid_copy)
+        let rel_path = lustre
+            .fid_to_path(&mount_str, &fid_copy)
             .map_err(|e| anyhow::anyhow!("fid_to_path: {e}"))?;
         let abs_path = mount_owned.join(&rel_path);
 
-        let meta = std::fs::symlink_metadata(&abs_path)
-            .map_err(|e| anyhow::anyhow!("stat {}: {e}", abs_path.display()))?;
+        let meta =
+            std::fs::symlink_metadata(&abs_path).map_err(|e| anyhow::anyhow!("stat {}: {e}", abs_path.display()))?;
 
         let kind = metadata_to_kind(&meta);
 
@@ -506,7 +502,8 @@ async fn stat_entry_by_fid(
             sm_status: serde_json::json!({}),
             last_seen: now_secs(),
         })
-    }).await??;
+    })
+    .await??;
 
     Ok(result)
 }

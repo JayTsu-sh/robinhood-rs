@@ -42,10 +42,7 @@ pub struct FileClassDef {
 
 /// Compose `scope AND NOT (ic1.predicate OR ic2.predicate OR …)`. Returns
 /// `scope` unchanged when `ignore` is empty.
-pub fn compose_scope_with_ignores(
-    scope: &Predicate,
-    ignore: &[FileClassDef],
-) -> Predicate {
+pub fn compose_scope_with_ignores(scope: &Predicate, ignore: &[FileClassDef]) -> Predicate {
     if ignore.is_empty() {
         return scope.clone();
     }
@@ -71,6 +68,7 @@ pub enum PolicyKind {
     HsmArchive,
     HsmRelease,
     Alert,
+    Backup,
 }
 
 impl PolicyKind {
@@ -81,6 +79,7 @@ impl PolicyKind {
             Self::HsmArchive => "hsm_archive",
             Self::HsmRelease => "hsm_release",
             Self::Alert => "alert",
+            Self::Backup => "backup",
         }
     }
 }
@@ -145,6 +144,10 @@ pub struct ActionParams {
     /// HSM action executors; ignored by other kinds.
     #[serde(default)]
     pub hsm: Option<HsmParams>,
+    /// External backup tool configuration — drives
+    /// [`PolicyKind::Backup`] via rbh-backup's CommandBackupAdapter.
+    #[serde(default)]
+    pub backup: Option<rbh_backup::BackupCommandConfig>,
 }
 
 /// Retry policy for a single entry. On `Failed`/error outcomes the
@@ -212,6 +215,7 @@ impl ActionParams {
                 (Some(a), None) => Some(a),
                 (None, b) => b,
             },
+            backup: self.backup.clone().or_else(|| base.backup.clone()),
         }
     }
 }
@@ -334,10 +338,19 @@ mod tests {
                 max_per_sec: Some(100),
                 max_bytes_per_sec: Some(10_000_000),
             }),
-            retry: Some(RetryParams { max_attempts: 3, backoff_secs: 2 }),
+            retry: Some(RetryParams {
+                max_attempts: 3,
+                backoff_secs: 2,
+            }),
             hsm: Some(HsmParams {
                 archive_id: Some(1),
                 hints: Some("tier=cold".into()),
+            }),
+            backup: Some(rbh_backup::BackupCommandConfig {
+                command: "/usr/local/bin/rbhext_tool".into(),
+                args: None,
+                timeout_secs: Some(600),
+                dest_template: None,
             }),
         };
         let over = ActionParams {
@@ -351,7 +364,11 @@ mod tests {
                 max_bytes_per_sec: None,
             }),
             retry: None,
-            hsm: Some(HsmParams { archive_id: Some(2), hints: None }),
+            hsm: Some(HsmParams {
+                archive_id: Some(2),
+                hints: None,
+            }),
+            backup: None,
         };
         let merged = over.merge_over(&base);
         assert_eq!(merged.max_count, Some(50));
@@ -371,6 +388,10 @@ mod tests {
         let h = merged.hsm.unwrap();
         assert_eq!(h.archive_id, Some(2));
         assert_eq!(h.hints.as_deref(), Some("tier=cold"));
+        // backup: over is None → base wins (both variants covered).
+        let b = merged.backup.unwrap();
+        assert_eq!(b.command, "/usr/local/bin/rbhext_tool");
+        assert_eq!(b.timeout_secs, Some(600));
     }
 
     #[test]

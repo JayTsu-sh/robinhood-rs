@@ -1701,6 +1701,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "lustre-api",
+ "rbh-backup",
  "rbh-entry-store",
  "serde",
  "serde_json",
@@ -1730,6 +1731,20 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rbh-backup"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lustre-api",
+ "rbh-entry-store",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1836,6 +1851,7 @@ dependencies = [
  "chrono",
  "lustre-api",
  "rbh-actions",
+ "rbh-backup",
  "rbh-entry-store",
  "rbh-observability",
  "rbh-predicate",

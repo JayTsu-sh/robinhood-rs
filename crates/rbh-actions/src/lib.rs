@@ -11,8 +11,7 @@
 mod executor;
 
 pub use executor::{
-    ActionContext, ActionExecutor, ActionOutcome, HsmArchiveExecutor, HsmReleaseExecutor,
-    PurgeExecutor,
+    ActionContext, ActionExecutor, ActionOutcome, BackupExecutor, HsmArchiveExecutor, HsmReleaseExecutor, PurgeExecutor,
 };
 
 /// Errors produced by action executors.
@@ -24,6 +23,8 @@ pub enum ActionError {
     Hsm(#[from] lustre_api::error::LustreApiError),
     #[error("entry store error: {0}")]
     Store(String),
+    #[error("external backup tool error: {0}")]
+    Backup(#[from] rbh_backup::BackupError),
     #[error("action not implemented: {0}")]
     NotImplemented(String),
     #[error("entry has no path (parent_fid or name missing)")]

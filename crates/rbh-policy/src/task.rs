@@ -32,7 +32,9 @@ pub fn init_runtime(rt: Arc<PolicyRuntime>) {
 }
 
 fn runtime() -> &'static Arc<PolicyRuntime> {
-    RUNTIME.get().expect("PolicyRuntime not initialized — call init_runtime() at startup")
+    RUNTIME
+        .get()
+        .expect("PolicyRuntime not initialized — call init_runtime() at startup")
 }
 
 /// Narrow a policy run to a specific subset of the filesystem. Injected by
@@ -41,10 +43,11 @@ fn runtime() -> &'static Arc<PolicyRuntime> {
 ///
 /// Serialized into the scheduler-rs task payload, so new variants must be
 /// backwards-compatible.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetFilter {
     /// Default — apply to the whole catalog.
+    #[default]
     Fs,
     /// Match files striped on any of the listed OST indices.
     Ost { osts: Vec<u32> },
@@ -82,12 +85,6 @@ impl TargetFilter {
                 value: Value::Num(*projid as i64),
             },
         }
-    }
-}
-
-impl Default for TargetFilter {
-    fn default() -> Self {
-        Self::Fs
     }
 }
 
@@ -162,6 +159,34 @@ impl Task for PolicyRunTask {
                 Arc::new(rbh_actions::HsmArchiveExecutor { archive_id, hints })
             }
             crate::PolicyKind::HsmRelease => Arc::new(rbh_actions::HsmReleaseExecutor),
+            crate::PolicyKind::Backup => {
+                let cfg = match def.default_action.backup.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::warn!("backup policy has no backup config — skipping run");
+                        rbh_observability::metrics::POLICY_RUNS
+                            .with_label_values(&[policy_id_lbl.as_str(), "misconfigured"])
+                            .inc();
+                        rbh_observability::metrics::POLICY_RUN_DURATION
+                            .with_label_values(&[policy_id_lbl.as_str()])
+                            .observe(run_started.elapsed().as_secs_f64());
+                        return Ok(());
+                    }
+                };
+                let (archive_id, hints) = def
+                    .default_action
+                    .hsm
+                    .as_ref()
+                    .map(|h| (h.archive_id.unwrap_or(1), h.hints.clone()))
+                    .unwrap_or((1, None));
+                Arc::new(rbh_actions::BackupExecutor::from_config(
+                    cfg,
+                    rbh_backup::BackupOp::Archive,
+                    archive_id,
+                    hints,
+                    cfg.dest_template.clone(),
+                ))
+            }
             other => {
                 tracing::warn!(kind = other.as_str(), "action not implemented for this kind");
                 rbh_observability::metrics::POLICY_RUNS
@@ -177,8 +202,7 @@ impl Task for PolicyRunTask {
         // 3. Query candidates via predicate SQL pushdown. Compose the scope
         // with ignore_fileclass AND the per-run target filter:
         //   WHERE scope AND <target> AND NOT (ignore1 OR ignore2 …).
-        let scope_with_ignore =
-            crate::model::compose_scope_with_ignores(&def.scope, &def.ignore_fileclass);
+        let scope_with_ignore = crate::model::compose_scope_with_ignores(&def.scope, &def.ignore_fileclass);
         let target_pred = self.target.to_predicate();
         let effective_scope = match &target_pred {
             rbh_predicate::Predicate::True => scope_with_ignore,
@@ -210,13 +234,7 @@ impl Task for PolicyRunTask {
             .map(|col| format!("{col} ASC"));
         let candidates = match rt
             .entry_store
-            .query_page(
-                &where_clause,
-                &query_params,
-                order_by.as_deref(),
-                max_count,
-                0,
-            )
+            .query_page(&where_clause, &query_params, order_by.as_deref(), max_count, 0)
             .await
         {
             Ok(c) => c,
@@ -238,11 +256,7 @@ impl Task for PolicyRunTask {
             mount_path: rt.mount_path.clone(),
             lustre: lustre_api::LustreApi,
         });
-        let concurrency = def
-            .default_action
-            .nb_threads
-            .map(|n| n.max(1) as usize)
-            .unwrap_or(1);
+        let concurrency = def.default_action.nb_threads.map(|n| n.max(1) as usize).unwrap_or(1);
         let rate_limiter = def
             .default_action
             .rate_limit
@@ -258,14 +272,8 @@ impl Task for PolicyRunTask {
         // If this run was fired by a threshold trigger that declares a
         // low watermark, spawn a monitor that re-evaluates the measure
         // and cancels `cancel` when we're under the low watermark.
-        let _low_watermark_guard = maybe_spawn_low_watermark_monitor(
-            def,
-            self,
-            &where_clause,
-            &query_params,
-            cancel.clone(),
-            rt,
-        );
+        let _low_watermark_guard =
+            maybe_spawn_low_watermark_monitor(def, self, &where_clause, &query_params, cancel.clone(), rt);
 
         let candidate_count = candidates.len();
         let rules = Arc::new(def.rules.clone());
@@ -342,11 +350,8 @@ impl Drop for MonitorGuard {
 /// Returns `None` when the firing trigger isn't a threshold trigger or
 /// has no positive low watermark (i.e. high-only trigger).
 fn maybe_spawn_low_watermark_monitor(
-    def: &crate::PolicyDef,
-    task: &PolicyRunTask,
-    where_clause: &str,
-    query_params: &[rbh_entry_store::store::QueryParam],
-    stop_token: scheduler_rs::prelude::CancellationToken,
+    def: &crate::PolicyDef, task: &PolicyRunTask, where_clause: &str,
+    query_params: &[rbh_entry_store::store::QueryParam], stop_token: scheduler_rs::prelude::CancellationToken,
     rt: &Arc<PolicyRuntime>,
 ) -> Option<MonitorGuard> {
     let trigger = def.triggers.get(task.trigger_idx as usize)?;
@@ -378,10 +383,7 @@ fn maybe_spawn_low_watermark_monitor(
                 _ = tokio::time::sleep(interval) => {}
             }
             let hit = match measure {
-                LowMeasure::Count(low) => match entry_store
-                    .count_where(&where_clause, &params)
-                    .await
-                {
+                LowMeasure::Count(low) => match entry_store.count_where(&where_clause, &params).await {
                     Ok(c) => c <= low,
                     Err(e) => {
                         tracing::warn!(
@@ -393,27 +395,21 @@ fn maybe_spawn_low_watermark_monitor(
                         false
                     }
                 },
-                LowMeasure::Volume(low) => {
-                    match sum_size_scope(&entry_store, &where_clause, &params).await {
-                        Ok(v) => v <= low,
-                        Err(e) => {
-                            tracing::warn!(
-                                policy_id,
-                                trigger_idx,
-                                error = %e,
-                                "low-watermark volume query failed"
-                            );
-                            false
-                        }
+                LowMeasure::Volume(low) => match sum_size_scope(&entry_store, &where_clause, &params).await {
+                    Ok(v) => v <= low,
+                    Err(e) => {
+                        tracing::warn!(
+                            policy_id,
+                            trigger_idx,
+                            error = %e,
+                            "low-watermark volume query failed"
+                        );
+                        false
                     }
-                }
+                },
             };
             if hit {
-                tracing::info!(
-                    policy_id,
-                    trigger_idx,
-                    "low watermark reached — stopping policy run"
-                );
+                tracing::info!(policy_id, trigger_idx, "low watermark reached — stopping policy run");
                 stop_token.cancel();
                 return;
             }
@@ -431,9 +427,7 @@ enum LowMeasure {
 /// Stand-in for rbh-daemon's sum_size_where — local to the policy crate
 /// because rbh-policy can't depend on rbh-daemon.
 async fn sum_size_scope(
-    store: &rbh_entry_store::store::EntryStore,
-    where_clause: &str,
-    params: &[rbh_entry_store::store::QueryParam],
+    store: &rbh_entry_store::store::EntryStore, where_clause: &str, params: &[rbh_entry_store::store::QueryParam],
 ) -> Result<u64, rbh_entry_store::StoreError> {
     use sqlx::Row;
     let sql = format!(
@@ -455,16 +449,12 @@ async fn sum_size_scope(
 /// tokio `JoinSet`. Returns `(success, skipped, failed)` totals. Respects
 /// the supplied cancel token: outstanding workers complete but no new
 /// entries are dispatched after cancellation.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_workers(
-    candidates: Vec<rbh_entry_store::model::EntryRow>,
-    executor: Arc<dyn rbh_actions::ActionExecutor>,
-    action_ctx: Arc<rbh_actions::ActionContext>,
-    concurrency: usize,
-    rate_limiter: Option<crate::ratelimit::RateLimiter>,
-    cancel: scheduler_rs::prelude::CancellationToken,
-    policy_id: u64,
-    rules: Arc<Vec<Rule>>,
-    default_action: Arc<ActionParams>,
+    candidates: Vec<rbh_entry_store::model::EntryRow>, executor: Arc<dyn rbh_actions::ActionExecutor>,
+    action_ctx: Arc<rbh_actions::ActionContext>, concurrency: usize,
+    rate_limiter: Option<crate::ratelimit::RateLimiter>, cancel: scheduler_rs::prelude::CancellationToken,
+    policy_id: u64, rules: Arc<Vec<Rule>>, default_action: Arc<ActionParams>,
 ) -> (u64, u64, u64) {
     use tokio::sync::Semaphore;
 
@@ -530,12 +520,7 @@ async fn dispatch_workers(
                 }
                 let fut = exec.execute(&entry, &ctx);
                 let result = match timeout {
-                    Some(secs) => match tokio::time::timeout(
-                        std::time::Duration::from_secs(secs),
-                        fut,
-                    )
-                    .await
-                    {
+                    Some(secs) => match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
                         Ok(r) => r,
                         Err(_) => Ok(rbh_actions::ActionOutcome::Failed {
                             error: format!("timeout after {secs}s"),
@@ -545,8 +530,7 @@ async fn dispatch_workers(
                 };
                 let is_terminal = matches!(
                     &result,
-                    Ok(rbh_actions::ActionOutcome::Success)
-                        | Ok(rbh_actions::ActionOutcome::Skipped { .. })
+                    Ok(rbh_actions::ActionOutcome::Success) | Ok(rbh_actions::ActionOutcome::Skipped { .. })
                 );
                 last_result = result;
                 if is_terminal || attempt == max_attempts {
@@ -610,9 +594,7 @@ enum WorkerOutcome {
 /// wraps the action call in a tokio::time::timeout; other fields stay
 /// run-level (enforced in dispatch_workers before the spawn).
 fn evaluate_rules(
-    rules: &[Rule],
-    default_action: &ActionParams,
-    entry: &rbh_entry_store::model::EntryRow,
+    rules: &[Rule], default_action: &ActionParams, entry: &rbh_entry_store::model::EntryRow,
 ) -> ActionParams {
     for rule in rules {
         if rbh_predicate::matches(&rule.condition, entry) {
@@ -709,33 +691,19 @@ mod tests {
 
     #[test]
     fn target_filter_fs_is_true() {
-        assert_eq!(
-            TargetFilter::Fs.to_predicate(),
-            rbh_predicate::Predicate::True
-        );
+        assert_eq!(TargetFilter::Fs.to_predicate(), rbh_predicate::Predicate::True);
     }
 
     #[test]
     fn target_filter_ost_produces_on_ost() {
         let p = TargetFilter::Ost { osts: vec![2, 5] }.to_predicate();
-        assert_eq!(
-            p,
-            rbh_predicate::Predicate::OnOst { osts: vec![2, 5] }
-        );
+        assert_eq!(p, rbh_predicate::Predicate::OnOst { osts: vec![2, 5] });
     }
 
     #[test]
     fn target_filter_pool_produces_in_pool() {
-        let p = TargetFilter::Pool {
-            name: "flash".into(),
-        }
-        .to_predicate();
-        assert_eq!(
-            p,
-            rbh_predicate::Predicate::InPool {
-                pool: "flash".into()
-            }
-        );
+        let p = TargetFilter::Pool { name: "flash".into() }.to_predicate();
+        assert_eq!(p, rbh_predicate::Predicate::InPool { pool: "flash".into() });
     }
 
     #[test]
@@ -773,9 +741,7 @@ mod tests {
     #[async_trait]
     impl rbh_actions::ActionExecutor for RecordingExecutor {
         async fn execute(
-            &self,
-            _entry: &EntryRow,
-            _ctx: &rbh_actions::ActionContext,
+            &self, _entry: &EntryRow, _ctx: &rbh_actions::ActionContext,
         ) -> std::result::Result<rbh_actions::ActionOutcome, rbh_actions::ActionError> {
             let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(n, Ordering::SeqCst);
@@ -786,11 +752,13 @@ mod tests {
     }
 
     fn mk_candidates(n: usize) -> Vec<EntryRow> {
-        (0..n).map(|i| {
-            let mut e = test_entry();
-            e.fid = LuFid::new(0x200000401, i as u32 + 100, 0);
-            e
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let mut e = test_entry();
+                e.fid = LuFid::new(0x200000401, i as u32 + 100, 0);
+                e
+            })
+            .collect()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -810,21 +778,10 @@ mod tests {
         let cancel = scheduler_rs::prelude::CancellationToken::new();
         let rules = Arc::new(Vec::new());
         let params = Arc::new(ActionParams::default());
-        let (succ, _, _) = dispatch_workers(
-            mk_candidates(12),
-            exec,
-            ctx,
-            3,
-            None,
-            cancel,
-            0,
-            rules,
-            params,
-        )
-        .await;
+        let (succ, _, _) = dispatch_workers(mk_candidates(12), exec, ctx, 3, None, cancel, 0, rules, params).await;
         assert_eq!(succ, 12);
         let peak = max_in_flight.load(Ordering::SeqCst);
-        assert!(peak >= 2 && peak <= 3, "expected peak ~3, got {peak}");
+        assert!((2..=3).contains(&peak), "expected peak ~3, got {peak}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -854,18 +811,7 @@ mod tests {
         let start = std::time::Instant::now();
         let rules = Arc::new(Vec::new());
         let params = Arc::new(ActionParams::default());
-        let (succ, _, _) = dispatch_workers(
-            mk_candidates(30),
-            exec,
-            ctx,
-            4,
-            rl,
-            cancel,
-            0,
-            rules,
-            params,
-        )
-        .await;
+        let (succ, _, _) = dispatch_workers(mk_candidates(30), exec, ctx, 4, rl, cancel, 0, rules, params).await;
         let elapsed = start.elapsed();
         assert_eq!(succ, 30);
         // First 10 tokens free, then 20 at 10/s = ~2s.
@@ -980,18 +926,8 @@ mod tests {
             timeout_secs: Some(1),
             ..Default::default()
         });
-        let (succ2, _, failed2) = dispatch_workers(
-            mk_candidates(2),
-            slow,
-            ctx,
-            2,
-            None,
-            cancel2,
-            0,
-            rules2,
-            params2,
-        )
-        .await;
+        let (succ2, _, failed2) =
+            dispatch_workers(mk_candidates(2), slow, ctx, 2, None, cancel2, 0, rules2, params2).await;
         assert_eq!(succ2, 0);
         assert_eq!(failed2, 2, "both should timeout");
     }
@@ -1004,9 +940,7 @@ mod tests {
     #[async_trait]
     impl rbh_actions::ActionExecutor for FailThenSucceedExecutor {
         async fn execute(
-            &self,
-            _entry: &EntryRow,
-            _ctx: &rbh_actions::ActionContext,
+            &self, _entry: &EntryRow, _ctx: &rbh_actions::ActionContext,
         ) -> std::result::Result<rbh_actions::ActionOutcome, rbh_actions::ActionError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_first_n {
@@ -1033,21 +967,13 @@ mod tests {
         let cancel = scheduler_rs::prelude::CancellationToken::new();
         let rules = Arc::new(Vec::new());
         let params = Arc::new(ActionParams {
-            retry: Some(crate::RetryParams { max_attempts: 3, backoff_secs: 0 }),
+            retry: Some(crate::RetryParams {
+                max_attempts: 3,
+                backoff_secs: 0,
+            }),
             ..Default::default()
         });
-        let (succ, _, failed) = dispatch_workers(
-            mk_candidates(1),
-            exec,
-            ctx,
-            1,
-            None,
-            cancel,
-            0,
-            rules,
-            params,
-        )
-        .await;
+        let (succ, _, failed) = dispatch_workers(mk_candidates(1), exec, ctx, 1, None, cancel, 0, rules, params).await;
         assert_eq!(succ, 1);
         assert_eq!(failed, 0);
         assert_eq!(calls.load(Ordering::SeqCst), 3, "expected 3 attempts");
@@ -1067,21 +993,13 @@ mod tests {
         let cancel = scheduler_rs::prelude::CancellationToken::new();
         let rules = Arc::new(Vec::new());
         let params = Arc::new(ActionParams {
-            retry: Some(crate::RetryParams { max_attempts: 2, backoff_secs: 0 }),
+            retry: Some(crate::RetryParams {
+                max_attempts: 2,
+                backoff_secs: 0,
+            }),
             ..Default::default()
         });
-        let (succ, _, failed) = dispatch_workers(
-            mk_candidates(1),
-            exec,
-            ctx,
-            1,
-            None,
-            cancel,
-            0,
-            rules,
-            params,
-        )
-        .await;
+        let (succ, _, failed) = dispatch_workers(mk_candidates(1), exec, ctx, 1, None, cancel, 0, rules, params).await;
         assert_eq!(succ, 0);
         assert_eq!(failed, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1113,10 +1031,7 @@ mod tests {
             max_volume: Some(7),
             ..Default::default()
         });
-        let (succ, skipped, failed) = dispatch_workers(
-            candidates, exec, ctx, 1, None, cancel, 0, rules, params,
-        )
-        .await;
+        let (succ, skipped, failed) = dispatch_workers(candidates, exec, ctx, 1, None, cancel, 0, rules, params).await;
         assert_eq!(succ + skipped + failed, 3, "expected only 3 dispatched");
     }
 
@@ -1143,18 +1058,8 @@ mod tests {
         });
         let rules = Arc::new(Vec::new());
         let params = Arc::new(ActionParams::default());
-        let (succ, skipped, failed) = dispatch_workers(
-            mk_candidates(50),
-            exec,
-            ctx,
-            2,
-            None,
-            cancel,
-            0,
-            rules,
-            params,
-        )
-        .await;
+        let (succ, skipped, failed) =
+            dispatch_workers(mk_candidates(50), exec, ctx, 2, None, cancel, 0, rules, params).await;
         assert!(
             succ + skipped + failed < 50,
             "expected partial run after cancel, got total={}",
