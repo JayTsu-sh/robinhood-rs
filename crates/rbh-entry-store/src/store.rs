@@ -52,6 +52,16 @@ impl AggregateKey {
     }
 }
 
+/// One row returned by [`EntryStore::stripe_distribution`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StripeDistRow {
+    pub ost_index: u32,
+    pub file_count: u64,
+    /// Approximate bytes physically on this OST, computed as
+    /// `SUM(file.size / file.stripe_count)`.
+    pub approx_bytes: u64,
+}
+
 /// Connection to the `rbh_entries` MariaDB database.
 #[derive(Clone)]
 pub struct EntryStore {
@@ -534,6 +544,35 @@ impl EntryStore {
         }
         let row = query.fetch_one(&self.pool).await?;
         Ok(row.try_get::<u64, _>("total").unwrap_or(0))
+    }
+
+    /// Per-OST stripe distribution: for each OST index that appears in
+    /// `stripe_items`, return `(ost_index, file_count, approx_bytes)`.
+    ///
+    /// `approx_bytes` is `SUM(size / stripe_count)` — the per-OST share
+    /// of file bytes under the assumption that Lustre splits each file
+    /// evenly across its stripes. Files with `stripe_count = 0` (not a
+    /// striped file, or metadata missing) are skipped via NULLIF.
+    ///
+    /// Ordered by `approx_bytes DESC` so "fullest OST first" is the
+    /// default view.
+    pub async fn stripe_distribution(&self) -> Result<Vec<StripeDistRow>> {
+        let sql = "SELECT si.ost_index, COUNT(*) AS n, \
+                   CAST(COALESCE(SUM(e.size / NULLIF(e.stripe_count, 0)), 0) AS UNSIGNED) AS bytes \
+                   FROM stripe_items si \
+                   JOIN entries e ON e.fid = si.fid \
+                   GROUP BY si.ost_index \
+                   ORDER BY bytes DESC";
+        let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(StripeDistRow {
+                ost_index: row.try_get::<u32, _>("ost_index")?,
+                file_count: row.try_get::<i64, _>("n")? as u64,
+                approx_bytes: row.try_get::<u64, _>("bytes").unwrap_or(0),
+            });
+        }
+        Ok(out)
     }
 
     /// Fetch one page of entries ordered by FID, strictly greater than

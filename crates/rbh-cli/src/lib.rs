@@ -173,6 +173,8 @@ pub enum ReportCmd {
     },
     /// File-size distribution (files only).
     SizeProfile,
+    /// Per-OST file count and approximate byte share.
+    StripeDist,
     /// Dump all entries matching a simple filter (user/group/ost).
     Dump {
         #[arg(long)]
@@ -552,6 +554,17 @@ async fn run_report(client: &reqwest::Client, api_url: &str, cmd: ReportCmd) -> 
                 let c = row.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
                 let s = row.get("total_size").and_then(|v| v.as_u64()).unwrap_or(0);
                 println!("{b:<12} {c:>10} {s:>18}");
+            }
+        }
+        ReportCmd::StripeDist => {
+            let v = fetch_json(client, &format!("{api_url}/api/reports/stripe-distribution")).await?;
+            let arr = v.as_array().cloned().unwrap_or_default();
+            println!("{:>4} {:>10} {:>18}", "ost", "files", "approx_bytes");
+            for row in arr {
+                let o = row.get("ost_index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let n = row.get("file_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let b = row.get("approx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("{o:>4} {n:>10} {b:>18}");
             }
         }
         ReportCmd::Dump {

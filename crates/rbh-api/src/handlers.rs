@@ -31,6 +31,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/reports/top-size", get(top_size))
         .route("/reports/oldest", get(oldest_entries))
         .route("/reports/size-profile", get(size_profile))
+        .route("/reports/stripe-distribution", get(stripe_distribution_report))
         .route("/metrics", get(metrics_endpoint))
         .route("/removed", get(list_removed))
         .route("/removed/{fid}", axum::routing::delete(forget_removed))
@@ -546,6 +547,18 @@ async fn size_profile(State(state): State<AppState>) -> Result<Json<Vec<SizeBuck
             })
             .collect(),
     ))
+}
+
+#[tracing::instrument(skip(state))]
+async fn stripe_distribution_report(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<rbh_entry_store::store::StripeDistRow>>, ApiError> {
+    let rows = state
+        .entry_store
+        .stripe_distribution()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(rows))
 }
 
 #[tracing::instrument(skip(state))]
