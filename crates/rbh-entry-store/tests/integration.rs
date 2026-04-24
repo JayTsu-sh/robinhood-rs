@@ -225,3 +225,114 @@ async fn upsert_is_idempotent() {
     assert_eq!(back.last_seen, 1_775_960_000, "last_seen should be updated");
     println!("idempotent upsert passed");
 }
+
+#[tokio::test]
+async fn sweep_orphans_moves_stale_files() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+
+    let fresh_ts = 1_900_000_000; // very future
+    let stale_ts = 1_700_000_000; // well before fresh
+
+    // Two fresh files, two stale files, one stale directory (must be spared).
+    let mut a = make_entry(0x301, 0x01, "fresh1.txt");
+    a.last_seen = fresh_ts;
+    let mut b = make_entry(0x301, 0x02, "fresh2.txt");
+    b.last_seen = fresh_ts;
+    let mut c = make_entry(0x301, 0x03, "stale1.txt");
+    c.last_seen = stale_ts;
+    let mut d = make_entry(0x301, 0x04, "stale2.txt");
+    d.last_seen = stale_ts;
+    let mut dir = make_entry(0x301, 0x05, "staledir");
+    dir.kind = EntryKind::Directory;
+    dir.last_seen = stale_ts;
+
+    store.upsert_batch(&[a, b, c, d, dir]).await.expect("upsert");
+    assert_eq!(store.entry_count().await.unwrap(), 5);
+
+    // Dry-run first: should report 2 candidates (two stale files; dir spared).
+    let dry = store.sweep_orphans(fresh_ts - 1_000, 100, true).await.expect("dry run");
+    assert_eq!(dry, 2, "dry run should count exactly 2 stale files");
+    assert_eq!(store.entry_count().await.unwrap(), 5, "dry run must not delete");
+
+    // Real sweep: both stale files move into removed_entries.
+    let swept = store.sweep_orphans(fresh_ts - 1_000, 100, false).await.expect("sweep");
+    assert_eq!(swept, 2);
+    assert_eq!(store.entry_count().await.unwrap(), 3, "dir + 2 fresh remain");
+
+    let rm = store.list_removed(None, 100, 0).await.expect("list_removed");
+    assert!(rm.len() >= 2, "removed_entries has the 2 stale files");
+    println!("sweep_orphans passed");
+}
+
+#[tokio::test]
+async fn subtree_totals_walks_parent_edge() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+
+    // Build a tiny tree:
+    //   root (dir)
+    //    ├─ a.txt (1000)
+    //    ├─ sub (dir)
+    //    │   ├─ b.txt (2000)
+    //    │   └─ c.txt (3000)
+    let root_fid = LuFid::new(0x401, 0x01, 0);
+    let sub_fid = LuFid::new(0x401, 0x02, 0);
+    let a_fid = LuFid::new(0x401, 0x03, 0);
+    let b_fid = LuFid::new(0x401, 0x04, 0);
+    let c_fid = LuFid::new(0x401, 0x05, 0);
+
+    let mk = |fid: LuFid, parent: Option<LuFid>, name: &str, size: u64, kind: EntryKind| {
+        let mut e = make_entry(0x401, 0, name);
+        e.fid = fid;
+        e.parent_fid = parent;
+        e.kind = kind;
+        e.size = size;
+        e
+    };
+    let root = mk(root_fid, None, "root", 0, EntryKind::Directory);
+    let sub = mk(sub_fid, Some(root_fid), "sub", 0, EntryKind::Directory);
+    let a = mk(a_fid, Some(root_fid), "a.txt", 1000, EntryKind::File);
+    let b = mk(b_fid, Some(sub_fid), "b.txt", 2000, EntryKind::File);
+    let c = mk(c_fid, Some(sub_fid), "c.txt", 3000, EntryKind::File);
+
+    store.upsert_batch(&[root, sub, a, b, c]).await.expect("upsert");
+
+    // Under root: 5 entries, 6000 bytes total.
+    let (n, bytes) = store.subtree_totals(&root_fid).await.expect("totals root");
+    assert_eq!(n, 5);
+    assert_eq!(bytes, 6000);
+
+    // Under sub only: 3 entries (sub + b + c), 5000 bytes.
+    let (n, bytes) = store.subtree_totals(&sub_fid).await.expect("totals sub");
+    assert_eq!(n, 3);
+    assert_eq!(bytes, 5000);
+
+    // A missing FID returns zero.
+    let ghost = LuFid::new(0xdead, 0xbeef, 0);
+    let (n, bytes) = store.subtree_totals(&ghost).await.expect("totals missing");
+    assert_eq!(n, 0);
+    assert_eq!(bytes, 0);
+
+    println!("subtree_totals passed");
+}
