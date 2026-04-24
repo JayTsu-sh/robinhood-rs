@@ -309,6 +309,27 @@ pub enum TriggerSpec {
         #[serde(default)]
         target: ThresholdTarget,
     },
+
+    /// Threshold on *live* OST disk usage (from `llapi_obd_statfs`),
+    /// not the DB-derived `SUM(size)`. Fires when any targeted OST's
+    /// used ratio reaches `high_pct`; the firing run is narrowed to
+    /// that OST so purging reclaims space on the hot OST first.
+    ///
+    /// `target` accepts `Fs` (any OST), `Pool { name }` (any OST in
+    /// the pool, matched by name prefix after stripping the `OSTxxxx`
+    /// suffix), or `Ost { osts }` (one or more explicit OST indices).
+    ThresholdOstPct {
+        check_interval_secs: u64,
+        /// Fire when `used/total >= high_pct`. Percent as 0..100.
+        high_pct: u32,
+        /// Low-watermark for the in-run stopper. 0 disables.
+        #[serde(default)]
+        low_pct: u32,
+        #[serde(default)]
+        post_trigger_wait_secs: u64,
+        #[serde(default)]
+        target: ThresholdTarget,
+    },
 }
 
 /// Per-threshold target. Kept separate from `TargetFilter` in `task.rs` so

@@ -36,6 +36,34 @@ pub struct ChangelogUser {
     pub current_index: i64,
 }
 
+/// A single OST's capacity snapshot from `llapi_obd_statfs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OstUsage {
+    /// Zero-based OST index (matches lov index, e.g. `0001` for OST0001).
+    pub index: u32,
+    /// Short OST name (UUID minus `_UUID` suffix), e.g. `testfs-OST0001`.
+    pub name: String,
+    /// Filesystem total size in bytes.
+    pub total_bytes: u64,
+    /// Currently in-use bytes (`total - free`).
+    pub used_bytes: u64,
+    /// Free bytes (root reserves excluded on ext, but not on ZFS).
+    pub free_bytes: u64,
+    /// Bytes available to unprivileged users.
+    pub avail_bytes: u64,
+}
+
+impl OstUsage {
+    /// Used ratio in 0.0..1.0; `0` when `total_bytes == 0`.
+    pub fn used_ratio(&self) -> f64 {
+        if self.total_bytes == 0 {
+            0.0
+        } else {
+            self.used_bytes as f64 / self.total_bytes as f64
+        }
+    }
+}
+
 impl LustreApi {
     /// List active MDT short names (e.g. `["testfs-MDT0000"]`).
     ///
@@ -106,6 +134,80 @@ impl LustreApi {
         }
 
         debug!(count = out.len(), mdts = ?out, "active MDTs discovered");
+        Ok(out)
+    }
+
+    /// Per-OST usage snapshot via `llapi_obd_statfs(LL_STATFS_LOV, index)`.
+    /// Skips sparse index slots (ENODEV / EAGAIN) the same way MDT
+    /// enumeration does.
+    ///
+    /// `total_bytes` / `used_bytes` are in bytes, derived from the
+    /// `os_bsize`-scaled block counters so callers don't need to know
+    /// about Lustre's block-size quirks.
+    #[tracing::instrument(name = "lustre.ost_usage", skip(self), fields(mount = %mount.display()))]
+    pub fn ost_usage(&self, mount: &Path) -> Result<Vec<OstUsage>> {
+        let mut c_mount = CString::new(mount.as_os_str().as_bytes())?.into_bytes_with_nul();
+
+        let mut count: c_int = 0;
+        let rc = unsafe {
+            sys::llapi_get_obd_count(
+                c_mount.as_mut_ptr() as *mut c_char,
+                &mut count,
+                0, /* is_mdt=false → OSTs */
+            )
+        };
+        check_rc(rc, "llapi_get_obd_count(OST)")?;
+        if count < 0 {
+            return Err(LustreApiError::IntegerOverflow("llapi_get_obd_count returned negative"));
+        }
+        let count = count as u32;
+
+        let mut out = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let mut stat_buf: MaybeUninit<sys::obd_statfs> = MaybeUninit::uninit();
+            let mut uuid_buf: MaybeUninit<sys::obd_uuid> = MaybeUninit::uninit();
+
+            // SAFETY: both out-params live on the stack for the duration.
+            let rc = unsafe {
+                sys::llapi_obd_statfs(
+                    c_mount.as_mut_ptr() as *mut c_char,
+                    sys::LL_STATFS_LOV,
+                    index,
+                    stat_buf.as_mut_ptr(),
+                    uuid_buf.as_mut_ptr(),
+                )
+            };
+            if rc < 0 {
+                if rc == -libc::ENODEV || rc == -libc::EAGAIN {
+                    continue;
+                }
+                check_rc(rc, "llapi_obd_statfs(OST)")?;
+            }
+
+            // SAFETY: rc >= 0 means both are initialized.
+            let st = unsafe { stat_buf.assume_init() };
+            let uuid = unsafe { uuid_buf.assume_init() };
+
+            let name_bytes: &[c_char] = &uuid.uuid;
+            let cstr = unsafe { CStr::from_ptr(name_bytes.as_ptr()) };
+            let full = cstr.to_string_lossy();
+            let name = full.strip_suffix("_UUID").unwrap_or(&full).to_owned();
+
+            let bsize = st.os_bsize as u64;
+            let total_bytes = st.os_blocks.saturating_mul(bsize);
+            let free_bytes = st.os_bfree.saturating_mul(bsize);
+            let avail_bytes = st.os_bavail.saturating_mul(bsize);
+            let used_bytes = total_bytes.saturating_sub(free_bytes);
+
+            out.push(OstUsage {
+                index,
+                name,
+                total_bytes,
+                used_bytes,
+                free_bytes,
+                avail_bytes,
+            });
+        }
         Ok(out)
     }
 

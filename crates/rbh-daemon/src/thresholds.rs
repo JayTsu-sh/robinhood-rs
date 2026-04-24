@@ -33,6 +33,8 @@ pub struct ThresholdChecker {
     pub policy_store: PolicyStore,
     pub entry_store: EntryStore,
     pub scheduler: Scheduler,
+    pub lustre: lustre_api::LustreApi,
+    pub mount_path: std::path::PathBuf,
     /// Minimum sleep between cycles. Each trigger has its own
     /// `check_interval_secs`; the loop wakes at the shortest.
     pub tick: Duration,
@@ -118,7 +120,7 @@ impl ThresholdChecker {
                     })
                     .collect();
 
-                let fired = match params.measure {
+                let (fired, fire_target) = match params.measure {
                     Measure::Count { high } => {
                         let c = self.entry_store.count_where(&where_clause, &store_params).await?;
                         tracing::debug!(
@@ -128,11 +130,11 @@ impl ThresholdChecker {
                             high,
                             "threshold count evaluated"
                         );
-                        c >= high
+                        (c >= high, target.clone())
                     }
                     Measure::Volume { high } => {
                         // SUM(size) WHERE scope — use a one-shot raw query.
-                        let v = sum_size_where(&self.entry_store, &where_clause, &store_params).await?;
+                        let v = self.entry_store.sum_size_where(&where_clause, &store_params).await?;
                         tracing::debug!(
                             policy_id = policy.id,
                             trigger_idx = idx,
@@ -140,12 +142,55 @@ impl ThresholdChecker {
                             high,
                             "threshold volume evaluated"
                         );
-                        v >= high
+                        (v >= high, target.clone())
+                    }
+                    Measure::OstPct { high_pct } => {
+                        // Live per-OST usage via llapi_obd_statfs — runs on a
+                        // blocking thread because the FFI is sync.
+                        let lustre = self.lustre;
+                        let mount = self.mount_path.clone();
+                        let usages = match tokio::task::spawn_blocking(move || lustre.ost_usage(&mount)).await {
+                            Ok(Ok(v)) => v,
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    policy_id = policy.id,
+                                    trigger_idx = idx,
+                                    error = %e,
+                                    "ost statfs failed — skipping cycle"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(policy_id = policy.id, error = %e, "ost_usage join error");
+                                continue;
+                            }
+                        };
+                        match first_ost_over_pct(&usages, params.target, high_pct) {
+                            Some(hot) => {
+                                tracing::debug!(
+                                    policy_id = policy.id,
+                                    trigger_idx = idx,
+                                    hot_ost = hot,
+                                    high_pct,
+                                    "ost threshold fired — narrowing run to hot OST"
+                                );
+                                (true, TargetFilter::Ost { osts: vec![hot] })
+                            }
+                            None => {
+                                tracing::debug!(
+                                    policy_id = policy.id,
+                                    trigger_idx = idx,
+                                    high_pct,
+                                    "no OST exceeds threshold"
+                                );
+                                (false, target.clone())
+                            }
+                        }
                     }
                 };
 
                 if fired {
-                    if let Err(e) = self.fire(policy, idx, &target).await {
+                    if let Err(e) = self.fire(policy, idx, &fire_target).await {
                         tracing::warn!(
                             policy_id = policy.id,
                             trigger_idx = idx,
@@ -161,7 +206,7 @@ impl ThresholdChecker {
                         tracing::info!(
                             policy_id = policy.id,
                             trigger_idx = idx,
-                            target = ?target,
+                            target = ?fire_target,
                             "threshold triggered — policy run scheduled"
                         );
                     }
@@ -207,9 +252,19 @@ struct ThresholdParams<'a> {
     measure: Measure,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Measure {
-    Count { high: u64 },
-    Volume { high: u64 },
+    Count {
+        high: u64,
+    },
+    Volume {
+        high: u64,
+    },
+    /// Live OST usage percentage via `llapi_obd_statfs`. `high_pct` is
+    /// 0..=100; the checker fires when any targeted OST exceeds this.
+    OstPct {
+        high_pct: u32,
+    },
 }
 
 fn decode_threshold(spec: &TriggerSpec) -> Option<ThresholdParams<'_>> {
@@ -238,8 +293,49 @@ fn decode_threshold(spec: &TriggerSpec) -> Option<ThresholdParams<'_>> {
             target,
             measure: Measure::Volume { high: *high_bytes },
         }),
+        TriggerSpec::ThresholdOstPct {
+            check_interval_secs,
+            high_pct,
+            post_trigger_wait_secs,
+            target,
+            ..
+        } => Some(ThresholdParams {
+            check_interval_secs: *check_interval_secs,
+            post_trigger_wait_secs: *post_trigger_wait_secs,
+            target,
+            measure: Measure::OstPct { high_pct: *high_pct },
+        }),
         _ => None,
     }
+}
+
+/// Return `Some(index)` for the first OST whose `used_ratio * 100 >=
+/// high_pct`, restricted to `target`. `Fs` considers every OST; `Ost`
+/// restricts to the listed indices; `Pool { name }` does a naive name
+/// prefix match (stripped of the `-OSTxxxx` suffix).
+fn first_ost_over_pct(
+    usages: &[lustre_api::OstUsage], target: &rbh_policy::model::ThresholdTarget, high_pct: u32,
+) -> Option<u32> {
+    use rbh_policy::model::ThresholdTarget as T;
+    let hot = high_pct as f64 / 100.0;
+    for u in usages {
+        let belongs = match target {
+            T::Fs => true,
+            T::Ost { osts } => osts.contains(&u.index),
+            T::Pool { name } => {
+                // Lustre pool membership is recorded out-of-band; we
+                // approximate by matching the pool name against the
+                // filesystem prefix of the OST name (e.g. "testfs").
+                // For a true pool check callers should use Ost{...}.
+                u.name.starts_with(name.as_str())
+            }
+            T::User { .. } | T::Group { .. } => return None,
+        };
+        if belongs && u.used_ratio() >= hot {
+            return Some(u.index);
+        }
+    }
+    None
 }
 
 fn resolve_target(t: &ThresholdTarget) -> TargetFilter {
@@ -250,25 +346,6 @@ fn resolve_target(t: &ThresholdTarget) -> TargetFilter {
         ThresholdTarget::User { uid } => TargetFilter::User { uid: *uid },
         ThresholdTarget::Group { gid } => TargetFilter::Group { gid: *gid },
     }
-}
-
-/// Total size across all matching entries. Separated from EntryStore to
-/// avoid bloating its public API with a one-off helper.
-async fn sum_size_where(store: &EntryStore, where_clause: &str, params: &[QueryParam]) -> anyhow::Result<u64> {
-    use sqlx::Row;
-    let sql = format!(
-        "SELECT CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total \
-         FROM entries WHERE {where_clause}"
-    );
-    let mut q = sqlx::query(&sql);
-    for p in params {
-        q = match p {
-            QueryParam::Int(n) => q.bind(*n),
-            QueryParam::Str(s) => q.bind(s.as_str()),
-        };
-    }
-    let row = q.fetch_one(store.pool()).await?;
-    Ok(row.try_get::<u64, _>("total").unwrap_or(0))
 }
 
 fn now_secs() -> u64 {
@@ -308,6 +385,79 @@ mod tests {
             Measure::Volume { high: n } if n == 1 << 30
         ));
         assert!(decode_threshold(&interval).is_none());
+
+        let o = TriggerSpec::ThresholdOstPct {
+            check_interval_secs: 30,
+            high_pct: 85,
+            low_pct: 60,
+            post_trigger_wait_secs: 600,
+            target: ThresholdTarget::Fs,
+        };
+        assert!(matches!(
+            decode_threshold(&o).unwrap().measure,
+            Measure::OstPct { high_pct: 85 }
+        ));
+    }
+
+    fn mk_usage(index: u32, name: &str, total: u64, used: u64) -> lustre_api::OstUsage {
+        lustre_api::OstUsage {
+            index,
+            name: name.into(),
+            total_bytes: total,
+            used_bytes: used,
+            free_bytes: total - used,
+            avail_bytes: total - used,
+        }
+    }
+
+    #[test]
+    fn ost_pct_fs_target_flags_any_over_threshold() {
+        let usages = vec![
+            mk_usage(0, "testfs-OST0000", 1_000, 500), // 50%
+            mk_usage(1, "testfs-OST0001", 1_000, 900), // 90%
+        ];
+        assert_eq!(first_ost_over_pct(&usages, &ThresholdTarget::Fs, 85), Some(1));
+        assert_eq!(first_ost_over_pct(&usages, &ThresholdTarget::Fs, 95), None);
+    }
+
+    #[test]
+    fn ost_pct_ost_target_restricts_indices() {
+        let usages = vec![
+            mk_usage(0, "fs-OST0000", 1_000, 950), // 95%
+            mk_usage(1, "fs-OST0001", 1_000, 300),
+        ];
+        // Even though OST0 is 95%, target says only index 1 counts.
+        assert_eq!(
+            first_ost_over_pct(&usages, &ThresholdTarget::Ost { osts: vec![1] }, 85),
+            None
+        );
+        assert_eq!(
+            first_ost_over_pct(&usages, &ThresholdTarget::Ost { osts: vec![0, 1] }, 85),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn ost_pct_pool_target_prefix_matches_fs_name() {
+        let usages = vec![mk_usage(0, "flash-OST0000", 1_000, 900)];
+        assert_eq!(
+            first_ost_over_pct(&usages, &ThresholdTarget::Pool { name: "flash".into() }, 85),
+            Some(0)
+        );
+        assert_eq!(
+            first_ost_over_pct(&usages, &ThresholdTarget::Pool { name: "bulk".into() }, 85),
+            None
+        );
+    }
+
+    #[test]
+    fn ost_pct_user_target_rejects() {
+        let usages = vec![mk_usage(0, "fs-OST0000", 1_000, 999)];
+        // User target isn't meaningful for OST-level thresholds.
+        assert_eq!(
+            first_ost_over_pct(&usages, &ThresholdTarget::User { uid: 1000 }, 10),
+            None
+        );
     }
 
     #[test]

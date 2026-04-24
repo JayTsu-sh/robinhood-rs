@@ -174,6 +174,8 @@ pub async fn run() -> anyhow::Result<()> {
         policy_store: policy_store.clone(),
         entry_store: entry_store.clone(),
         scheduler: scheduler.clone(),
+        lustre: lustre_api::LustreApi,
+        mount_path: PathBuf::from(&mount_path),
         tick: std::time::Duration::from_secs(threshold_tick_secs),
         cancel: daemon_cancel.clone(),
     };

@@ -135,7 +135,9 @@ fn build_trigger(spec: &TriggerSpec) -> Result<Option<Box<dyn scheduler_rs::trig
         }
         // Threshold triggers are driven by the daemon's threshold checker,
         // not by scheduler-rs.
-        TriggerSpec::ThresholdCount { .. } | TriggerSpec::ThresholdVolume { .. } => Ok(None),
+        TriggerSpec::ThresholdCount { .. }
+        | TriggerSpec::ThresholdVolume { .. }
+        | TriggerSpec::ThresholdOstPct { .. } => Ok(None),
     }
 }
 

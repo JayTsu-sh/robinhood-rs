@@ -517,6 +517,25 @@ impl EntryStore {
         Ok(c as u64)
     }
 
+    /// `SUM(size)` across all rows matching the predicate. Returns 0 when
+    /// nothing matches. Used by threshold triggers (fire condition) and by
+    /// the low-watermark in-run stopper.
+    pub async fn sum_size_where(&self, where_clause: &str, params: &[QueryParam]) -> Result<u64> {
+        let sql = format!(
+            "SELECT CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total \
+             FROM entries WHERE {where_clause}"
+        );
+        let mut query = sqlx::query(&sql);
+        for p in params {
+            query = match p {
+                QueryParam::Int(n) => query.bind(*n),
+                QueryParam::Str(s) => query.bind(s.as_str()),
+            };
+        }
+        let row = query.fetch_one(&self.pool).await?;
+        Ok(row.try_get::<u64, _>("total").unwrap_or(0))
+    }
+
     /// Fetch one page of entries ordered by FID, strictly greater than
     /// `after`. Used by the catalog dump to stream the whole table in
     /// deterministic, resumable chunks without holding a long-running

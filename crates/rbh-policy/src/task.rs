@@ -409,7 +409,7 @@ fn maybe_spawn_low_watermark_monitor(
                         false
                     }
                 },
-                LowMeasure::Volume(low) => match sum_size_scope(&entry_store, &where_clause, &params).await {
+                LowMeasure::Volume(low) => match entry_store.sum_size_where(&where_clause, &params).await {
                     Ok(v) => v <= low,
                     Err(e) => {
                         tracing::warn!(
@@ -436,27 +436,6 @@ fn maybe_spawn_low_watermark_monitor(
 enum LowMeasure {
     Count(u64),
     Volume(u64),
-}
-
-/// Stand-in for rbh-daemon's sum_size_where — local to the policy crate
-/// because rbh-policy can't depend on rbh-daemon.
-async fn sum_size_scope(
-    store: &rbh_entry_store::store::EntryStore, where_clause: &str, params: &[rbh_entry_store::store::QueryParam],
-) -> Result<u64, rbh_entry_store::StoreError> {
-    use sqlx::Row;
-    let sql = format!(
-        "SELECT CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total \
-         FROM entries WHERE {where_clause}"
-    );
-    let mut q = sqlx::query(&sql);
-    for p in params {
-        q = match p {
-            rbh_entry_store::store::QueryParam::Int(n) => q.bind(*n),
-            rbh_entry_store::store::QueryParam::Str(s) => q.bind(s.as_str()),
-        };
-    }
-    let row = q.fetch_one(store.pool()).await?;
-    Ok(row.try_get::<u64, _>("total").unwrap_or(0))
 }
 
 /// Fan out candidate processing across `concurrency` workers using a

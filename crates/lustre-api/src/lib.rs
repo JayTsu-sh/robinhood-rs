@@ -41,7 +41,7 @@ pub use changelog::{ChangelogHandle, RecvBuf};
 pub use error::{HsmOp, LustreApiError, Result};
 pub use fid::{FidParseError, LuFid};
 pub use hsm::{HsmAction, HsmRequestBuilder, HsmRequestFlags, HsmState, HsmUserStateInfo};
-pub use mdt::ChangelogUser;
+pub use mdt::{ChangelogUser, OstUsage};
 pub use rec::{ChangelogEventType, RecView};
 pub use stripe::StripeInfo;
 
