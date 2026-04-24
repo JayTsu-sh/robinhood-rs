@@ -516,6 +516,29 @@ impl EntryStore {
         let c: i64 = row.try_get("c")?;
         Ok(c as u64)
     }
+
+    /// Fetch one page of entries ordered by FID, strictly greater than
+    /// `after`. Used by the catalog dump to stream the whole table in
+    /// deterministic, resumable chunks without holding a long-running
+    /// server-side cursor (MariaDB doesn't expose one to sqlx).
+    ///
+    /// Returns at most `limit` rows; callers continue with
+    /// `dump_page(rows.last().map(|r| r.fid), limit)` until the result
+    /// is shorter than `limit`.
+    pub async fn dump_page(&self, after: Option<LuFid>, limit: u64) -> Result<Vec<EntryRow>> {
+        let sql = "SELECT fid, parent_fid, name, kind, size, blocks, uid, gid, projid, \
+                   mode, nlink, atime, mtime, ctime, stripe_count, stripe_size, \
+                   pool_name, sm_status, last_seen \
+                   FROM entries WHERE fid > ? ORDER BY fid LIMIT ?";
+        let lo = after.unwrap_or(LuFid::ZERO);
+        let lo_bin = crate::fid_codec::encode(&lo);
+        let rows = sqlx::query(sql)
+            .bind(lo_bin.as_slice())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_entry).collect()
+    }
 }
 
 // ── MariaDB CursorStore implementation ──────────────────────────────────

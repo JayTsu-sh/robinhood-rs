@@ -36,6 +36,8 @@ pub fn api_routes() -> Router<AppState> {
         .route("/removed/{fid}", axum::routing::delete(forget_removed))
         .route("/scans", post(start_scan).get(list_scans))
         .route("/scans/{id}", get(get_scan))
+        .route("/admin/dump", get(admin_dump))
+        .route("/admin/restore", post(admin_restore))
         .route("/health", get(health))
 }
 
@@ -687,6 +689,129 @@ async fn get_scan(State(state): State<AppState>, Path(id): Path<String>) -> Resu
         .cloned()
         .map(Json)
         .ok_or_else(|| ApiError::Internal(format!("scan not found: {id}")))
+}
+
+// ---------------------------------------------------------------------------
+// Admin: catalog dump / restore
+// ---------------------------------------------------------------------------
+
+/// Stream the entire `entries` table as newline-delimited JSON
+/// (application/x-ndjson). Rows are emitted in FID order so a dump
+/// truncated mid-stream can be resumed client-side by filtering on the
+/// last seen FID. Chunks of 1000 rows are fetched per DB round-trip.
+///
+/// Disaster-recovery use case: `rbh admin dump > catalog.ndjson`, then
+/// after a rebuild `rbh admin restore < catalog.ndjson`.
+async fn admin_dump(State(state): State<AppState>) -> axum::response::Response {
+    use axum::body::Body;
+    use futures_util::stream;
+    use lustre_api::LuFid;
+
+    const PAGE: u64 = 1000;
+    let store = state.entry_store.clone();
+
+    // Cursor state: `Some(after)` = continue scanning strictly after `after`,
+    // `None` = finished, end of stream.
+    let stream = stream::try_unfold(Some(None::<LuFid>), move |cursor| {
+        let store = store.clone();
+        async move {
+            let Some(after) = cursor else {
+                return Ok::<_, std::io::Error>(None);
+            };
+            let rows = store
+                .dump_page(after, PAGE)
+                .await
+                .map_err(|e| std::io::Error::other(format!("dump_page: {e}")))?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let last = rows.last().map(|r| r.fid);
+            let mut out = Vec::with_capacity(rows.len() * 256);
+            for row in &rows {
+                match serde_json::to_vec(row) {
+                    Ok(mut b) => {
+                        out.append(&mut b);
+                        out.push(b'\n');
+                    }
+                    Err(e) => return Err(std::io::Error::other(format!("serialize: {e}"))),
+                }
+            }
+            let next_cursor = if rows.len() < PAGE as usize { None } else { Some(last) };
+            Ok(Some((axum::body::Bytes::from(out), next_cursor)))
+        }
+    });
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreQuery {
+    /// Process at most N lines per batch. Defaults to 500.
+    #[serde(default = "default_restore_batch")]
+    batch: usize,
+}
+
+fn default_restore_batch() -> usize {
+    500
+}
+
+#[derive(Debug, Serialize)]
+struct RestoreSummary {
+    restored: u64,
+    failed: u64,
+}
+
+/// Consume a newline-delimited JSON stream of `EntryRow`s and upsert
+/// them back into the catalog. Silently skips blank lines; a batch that
+/// fails to parse or upsert is logged and counted under `failed` but
+/// does not abort the import.
+async fn admin_restore(
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<RestoreQuery>, body: axum::body::Bytes,
+) -> Result<Json<RestoreSummary>, ApiError> {
+    let batch_size = q.batch.clamp(1, 10_000);
+    let mut restored = 0u64;
+    let mut failed = 0u64;
+    let mut batch: Vec<EntryRow> = Vec::with_capacity(batch_size);
+
+    for (lineno, line) in body.split(|&b| b == b'\n').enumerate() {
+        let has_content = line.iter().any(|b| !b.is_ascii_whitespace());
+        if !has_content {
+            continue;
+        }
+        match serde_json::from_slice::<EntryRow>(line) {
+            Ok(row) => batch.push(row),
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(lineno = lineno + 1, error = %e, "restore: bad JSON line");
+                continue;
+            }
+        }
+        if batch.len() >= batch_size {
+            match state.entry_store.upsert_batch(&batch).await {
+                Ok(()) => restored += batch.len() as u64,
+                Err(e) => {
+                    failed += batch.len() as u64;
+                    tracing::warn!(error = %e, "restore: batch upsert failed");
+                }
+            }
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        match state.entry_store.upsert_batch(&batch).await {
+            Ok(()) => restored += batch.len() as u64,
+            Err(e) => {
+                failed += batch.len() as u64;
+                tracing::warn!(error = %e, "restore: final batch upsert failed");
+            }
+        }
+    }
+    Ok(Json(RestoreSummary { restored, failed }))
 }
 
 // ---------------------------------------------------------------------------

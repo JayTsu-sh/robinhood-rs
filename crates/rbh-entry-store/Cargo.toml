@@ -11,6 +11,7 @@ lustre-api = { path = "../lustre-api" }
 lustre-changelog = { path = "../lustre-changelog" }
 
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

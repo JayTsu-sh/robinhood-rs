@@ -16,6 +16,7 @@ lustre-api = { path = "../lustre-api" }
 scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", features = ["sqlx-mysql"] }
 
 axum = { version = "0.8", features = ["json"] }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }

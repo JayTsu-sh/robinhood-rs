@@ -99,6 +99,30 @@ pub enum Command {
         #[arg(long)]
         detach: bool,
     },
+
+    /// Disaster-recovery — dump/restore the whole catalog as NDJSON.
+    #[command(subcommand)]
+    Admin(AdminCmd),
+}
+
+#[derive(Subcommand)]
+pub enum AdminCmd {
+    /// Stream the full catalog to stdout as newline-delimited JSON.
+    Dump {
+        /// Write to this file instead of stdout.
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Read newline-delimited JSON from a file (or stdin) and upsert
+    /// each row back into the catalog.
+    Restore {
+        /// Read from this file instead of stdin.
+        #[arg(long)]
+        input: Option<String>,
+        /// Upsert batch size sent to the server per request.
+        #[arg(long, default_value = "500")]
+        batch: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -257,8 +281,70 @@ pub async fn run() -> Result<()> {
             )
             .await?
         }
+        Command::Admin(cmd) => match cmd {
+            AdminCmd::Dump { out } => run_admin_dump(&client, &cli.api_url, out).await?,
+            AdminCmd::Restore { input, batch } => run_admin_restore(&client, &cli.api_url, input, batch).await?,
+        },
     }
 
+    Ok(())
+}
+
+async fn run_admin_dump(client: &reqwest::Client, api_url: &str, out: Option<String>) -> Result<()> {
+    use std::io::Write;
+    let resp = client
+        .get(format!("{api_url}/api/admin/dump"))
+        .send()
+        .await
+        .context("GET /api/admin/dump")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server {status}: {body}");
+    }
+    let mut writer: Box<dyn Write> = match out {
+        Some(path) => Box::new(std::fs::File::create(&path).context("create output file")?),
+        None => Box::new(std::io::stdout()),
+    };
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt;
+    let mut bytes_written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read stream chunk")?;
+        writer.write_all(&chunk).context("write chunk")?;
+        bytes_written += chunk.len() as u64;
+    }
+    writer.flush().ok();
+    eprintln!("dump complete: {bytes_written} bytes");
+    Ok(())
+}
+
+async fn run_admin_restore(client: &reqwest::Client, api_url: &str, input: Option<String>, batch: usize) -> Result<()> {
+    use std::io::Read;
+    let mut body = Vec::with_capacity(64 * 1024);
+    match input {
+        Some(path) => {
+            let mut f = std::fs::File::open(&path).context("open input file")?;
+            f.read_to_end(&mut body).context("read input file")?;
+        }
+        None => {
+            std::io::stdin().read_to_end(&mut body).context("read stdin")?;
+        }
+    }
+    let url = format!("{api_url}/api/admin/restore?batch={batch}");
+    let resp = client
+        .post(url)
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await
+        .context("POST /api/admin/restore")?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("server {status}: {v}");
+    }
+    println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
 }
 
