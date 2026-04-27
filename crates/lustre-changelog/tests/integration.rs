@@ -160,14 +160,13 @@ async fn listener_receives_creat_and_acks() {
                 }
             }
 
-            // Ack this batch to drive clear_changelog.
-            let _ = handle
-                .acks
-                .send(EventAck {
-                    mdt: TEST_MDT.to_string(),
-                    committed_index: max_idx,
-                })
-                .await;
+            // Use try_send to avoid ack-channel back-pressure deadlock during
+            // the initial drain of historical records (the blocking thread is
+            // busy sending events and can't drain acks until drain completes).
+            let _ = handle.acks.try_send(EventAck {
+                mdt: TEST_MDT.to_string(),
+                committed_index: max_idx,
+            });
 
             if found_batch_max_index.is_some() {
                 break;
@@ -377,14 +376,15 @@ async fn listener_captures_hsm_archive_event() {
         return;
     }
 
-    let archive_root = std::env::var("RBH_HSM_ARCHIVE_ROOT")
-        .unwrap_or_else(|_| "/tmp/hsm_archive".to_string());
+    let archive_root = std::env::var("RBH_HSM_ARCHIVE_ROOT").unwrap_or_else(|_| "/tmp/hsm_archive".to_string());
     std::fs::create_dir_all(&archive_root).expect("create archive root");
 
     // Kill any stale copytool processes so the new one can register cleanly.
     // Stale processes with the same UUID cause "already registered" on the MDS
     // and the coordinator won't update its socket reference.
-    let _ = std::process::Command::new("pkill").args(["-f", "lhsmtool_posix"]).status();
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "lhsmtool_posix"])
+        .status();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Start lhsmtool_posix in the background.
@@ -434,38 +434,48 @@ async fn listener_captures_hsm_archive_event() {
     assert!(status.success(), "lfs hsm_archive failed: {status}");
     println!("lfs hsm_archive issued for {name}");
 
-    // Collect events for up to 60 seconds looking for the CL_HSM archive event.
-    // The coordinator may take 20-30 s to drain its backlog before dispatching
-    // the new archive request (depends on queue depth and loop_period).
+    // Collect events for up to 60 seconds looking for CL_CREATE and then
+    // a CL_HSM ARCHIVE event for the SAME FID. We must not accept HSM events
+    // from older files in the historical changelog — only the one we created.
     let name_bytes = name.as_bytes();
     let mut found_create = false;
     let mut found_hsm = false;
+    // Track the FID discovered from the CL_CREATE so the CL_HSM check is
+    // scoped to this file only (prevents false-positives from historical records).
+    let mut target_fid: Option<lustre_api::LuFid> = None;
 
     let timeout = tokio::time::timeout(Duration::from_secs(60), async {
         while let Some(batch) = handle.events.recv().await {
             let max_idx = batch.max_index;
             for env in &batch.events {
                 match &env.event {
-                    ChangelogEvent::Create { name, .. } if name.as_ref() == name_bytes => {
-                        println!("  ✓ CL_CREATE at index {}", env.index);
+                    ChangelogEvent::Create { name, fid, .. } if name.as_ref() == name_bytes => {
+                        println!("  ✓ CL_CREATE at index {} fid={fid:?}", env.index);
                         found_create = true;
+                        target_fid = Some(*fid);
                     }
                     ChangelogEvent::Hsm { fid, hsm_event, .. } => {
-                        // hsm_event == 0 is ARCHIVE per enum hsm_event in Lustre.
-                        println!(
-                            "  ✓ CL_HSM at index {} fid={fid:?} event={hsm_event}",
-                            env.index
-                        );
-                        if *hsm_event == 0 {
+                        // Only accept ARCHIVE (hsm_event == 0) for the specific FID
+                        // we created. Historical records from previous test runs must
+                        // not satisfy this assertion even if they also have event == 0.
+                        let is_our_fid = target_fid.map_or(false, |tf| *fid == tf);
+                        if *hsm_event == 0 && is_our_fid {
+                            println!(
+                                "  ✓ CL_HSM ARCHIVE at index {} fid={fid:?}",
+                                env.index
+                            );
                             found_hsm = true;
                         }
                     }
                     _ => {}
                 }
             }
-            // Use try_send to avoid ack-channel back-pressure causing deadlock
-            // with event_tx during the initial drain of historical records.
-            let _ = handle.acks.try_send(EventAck { mdt: TEST_MDT.to_string(), committed_index: max_idx });
+            // Use try_send to avoid ack-channel back-pressure deadlock during
+            // the initial drain of historical records.
+            let _ = handle.acks.try_send(EventAck {
+                mdt: TEST_MDT.to_string(),
+                committed_index: max_idx,
+            });
             if found_create && found_hsm {
                 break;
             }
@@ -484,6 +494,9 @@ async fn listener_captures_hsm_archive_event() {
     let _ = fs::remove_file(&path);
 
     assert!(found_create, "did not find CL_CREATE for {name}");
-    assert!(found_hsm, "did not find CL_HSM ARCHIVE for {name} — check lhsmtool_posix started correctly");
+    assert!(
+        found_hsm,
+        "did not find CL_HSM ARCHIVE for {name} — check lhsmtool_posix started correctly"
+    );
     println!("HSM E2E test passed: CL_CREATE + CL_HSM ARCHIVE both captured in changelog");
 }
