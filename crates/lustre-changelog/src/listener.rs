@@ -416,7 +416,18 @@ fn process_acks(
                     // M4 fix: only increment on successful clear.
                     state.records_since_commit += 1;
                 }
-                Err(e) => warn!(mdt, idx, err = %e, "clear_changelog failed"),
+                Err(e) => {
+                    if matches!(&e, lustre_api::LustreApiError::Ffi { errno, .. } if *errno == libc::EINVAL) {
+                        // EINVAL means idx precedes this reader's registration start on
+                        // the MDS (common in drain-mode tests that open from rec 0).
+                        // Advance last_cleared so we don't retry the same index on
+                        // every ack round.
+                        state.last_cleared = idx;
+                        debug!(mdt, idx, "clear_changelog EINVAL — pre-registration record, advancing cursor");
+                    } else {
+                        warn!(mdt, idx, err = %e, "clear_changelog failed");
+                    }
+                }
             }
         }
     }

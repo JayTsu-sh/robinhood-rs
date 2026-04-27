@@ -345,3 +345,145 @@ async fn listener_resumes_from_cursor() {
     cancel.cancel();
     println!("cursor resume test passed: all received events had index > 200");
 }
+
+/// End-to-end HSM archive event: start lhsmtool_posix as a real copytool,
+/// create a file, issue `lfs hsm_archive`, and verify the listener sees a
+/// `CL_HSM` (Hsm) event with `hsm_event == 0` (ARCHIVE) in the changelog.
+///
+/// **Prerequisites** (in addition to RBH_INTEGRATION + RBH_TEST_CHANGELOG_USER):
+///   - `RBH_INTEGRATION_HSM=1`  — gates this test
+///   - `RBH_HSM_ARCHIVE_ROOT`   — directory for lhsmtool_posix (default: /tmp/hsm_archive)
+///   - HSM must be enabled on the MDS: `lctl set_param mdt.*.hsm_control=enabled`
+///   - `lhsmtool_posix` must be in PATH
+///
+/// Run with:
+/// ```sh
+/// RBH_INTEGRATION=1 RBH_TEST_CHANGELOG_USER=cl11 RBH_INTEGRATION_HSM=1 \
+///   cargo test -p lustre-changelog --test integration -- listener_captures_hsm_archive_event \
+///     --test-threads=1 --nocapture
+/// ```
+#[tokio::test]
+async fn listener_captures_hsm_archive_event() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+    let Some(user) = test_changelog_user() else {
+        eprintln!("skipping (set RBH_TEST_CHANGELOG_USER=cl<N>)");
+        return;
+    };
+    if !matches!(std::env::var("RBH_INTEGRATION_HSM"), Ok(v) if !v.is_empty() && v != "0") {
+        eprintln!("skipping HSM test (set RBH_INTEGRATION_HSM=1)");
+        return;
+    }
+
+    let archive_root = std::env::var("RBH_HSM_ARCHIVE_ROOT")
+        .unwrap_or_else(|_| "/tmp/hsm_archive".to_string());
+    std::fs::create_dir_all(&archive_root).expect("create archive root");
+
+    // Kill any stale copytool processes so the new one can register cleanly.
+    // Stale processes with the same UUID cause "already registered" on the MDS
+    // and the coordinator won't update its socket reference.
+    let _ = std::process::Command::new("pkill").args(["-f", "lhsmtool_posix"]).status();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Start lhsmtool_posix in the background.
+    let mut copytool = std::process::Command::new("lhsmtool_posix")
+        .args(["--hsm_root", &archive_root, "--archive", "1", LUSTRE_MOUNT])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start lhsmtool_posix");
+
+    // Give the copytool time to register with the HSM coordinator.
+    // With loop_period=1 and a backlog of queued actions the coordinator may
+    // take ~30 s to drain the queue before dispatching our new archive request.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let cursor_store = Arc::new(MemoryCursorStore::new());
+    let cancel = CancellationToken::new();
+    let cfg = ListenerConfig {
+        mdt: TEST_MDT.to_string(),
+        reader_id: user.clone(),
+        follow: true,
+        poll_interval: Duration::from_millis(500),
+        batcher: BatcherConfig {
+            flush_interval: Duration::from_millis(200),
+            flush_batch_size: 1,
+            pending_soft_cap: 100,
+        },
+        channel_buffer: 32,
+        ..Default::default()
+    };
+
+    // Create the test file, then immediately start the listener so we catch
+    // the CREAT and the subsequent CL_HSM in the same stream.
+    let name = unique_name("rbh_hsm_e2e");
+    let path = Path::new(LUSTRE_MOUNT).join(&name);
+    fs::write(&path, b"hsm e2e integration test content").expect("write test file");
+
+    let mut handle = ChangelogListener::spawn(cfg, cursor_store.clone(), cancel.clone())
+        .await
+        .expect("spawn listener");
+
+    // Issue lfs hsm_archive via CLI.
+    let status = std::process::Command::new("lfs")
+        .args(["hsm_archive", path.to_str().unwrap()])
+        .status()
+        .expect("lfs hsm_archive");
+    assert!(status.success(), "lfs hsm_archive failed: {status}");
+    println!("lfs hsm_archive issued for {name}");
+
+    // Collect events for up to 60 seconds looking for the CL_HSM archive event.
+    // The coordinator may take 20-30 s to drain its backlog before dispatching
+    // the new archive request (depends on queue depth and loop_period).
+    let name_bytes = name.as_bytes();
+    let mut found_create = false;
+    let mut found_hsm = false;
+
+    let timeout = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some(batch) = handle.events.recv().await {
+            let max_idx = batch.max_index;
+            for env in &batch.events {
+                match &env.event {
+                    ChangelogEvent::Create { name, .. } if name.as_ref() == name_bytes => {
+                        println!("  ✓ CL_CREATE at index {}", env.index);
+                        found_create = true;
+                    }
+                    ChangelogEvent::Hsm { fid, hsm_event, .. } => {
+                        // hsm_event == 0 is ARCHIVE per enum hsm_event in Lustre.
+                        println!(
+                            "  ✓ CL_HSM at index {} fid={fid:?} event={hsm_event}",
+                            env.index
+                        );
+                        if *hsm_event == 0 {
+                            found_hsm = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Use try_send to avoid ack-channel back-pressure causing deadlock
+            // with event_tx during the initial drain of historical records.
+            let _ = handle.acks.try_send(EventAck { mdt: TEST_MDT.to_string(), committed_index: max_idx });
+            if found_create && found_hsm {
+                break;
+            }
+        }
+    });
+
+    match timeout.await {
+        Ok(()) => {}
+        Err(_) => {
+            eprintln!("WARN: timed out — create={found_create} hsm={found_hsm}");
+        }
+    }
+
+    cancel.cancel();
+    let _ = copytool.kill();
+    let _ = fs::remove_file(&path);
+
+    assert!(found_create, "did not find CL_CREATE for {name}");
+    assert!(found_hsm, "did not find CL_HSM ARCHIVE for {name} — check lhsmtool_posix started correctly");
+    println!("HSM E2E test passed: CL_CREATE + CL_HSM ARCHIVE both captured in changelog");
+}

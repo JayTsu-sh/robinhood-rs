@@ -138,7 +138,9 @@ impl LustreApi {
         let c_mdt = CString::new(mdt_device)?;
         let mut priv_: *mut c_void = ptr::null_mut();
 
-        let mut flags = sys::CHANGELOG_FLAG_JOBID;
+        // CHANGELOG_FLAG_EXTRA_FLAGS enables extended record format (CLF_EXTRA_FLAGS),
+        // required to receive open/xattr metadata in newer record types.
+        let mut flags = sys::CHANGELOG_FLAG_JOBID | sys::CHANGELOG_FLAG_EXTRA_FLAGS;
         if follow {
             flags |= sys::CHANGELOG_FLAG_FOLLOW | sys::CHANGELOG_FLAG_BLOCK;
         }
