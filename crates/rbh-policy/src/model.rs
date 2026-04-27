@@ -67,6 +67,10 @@ pub enum PolicyKind {
     Migration,
     HsmArchive,
     HsmRelease,
+    /// Restore a released file from the HSM backend back to Lustre.
+    HsmRestore,
+    /// Remove the HSM backend copy (file stays on Lustre).
+    HsmRemove,
     Alert,
     Backup,
 }
@@ -78,6 +82,8 @@ impl PolicyKind {
             Self::Migration => "migration",
             Self::HsmArchive => "hsm_archive",
             Self::HsmRelease => "hsm_release",
+            Self::HsmRestore => "hsm_restore",
+            Self::HsmRemove => "hsm_remove",
             Self::Alert => "alert",
             Self::Backup => "backup",
         }
@@ -166,9 +172,15 @@ pub struct ActionParams {
 }
 
 /// Arbitrary-command action parameters. `command` is resolved on PATH;
-/// each item in `args` is rendered with `{fid}`, `{path}`, `{size}`,
-/// `{uid}`, `{gid}`. `{path}` expands to the `.lustre/fid/<FID>` virtual
-/// path — use `{fid}` if the target tool prefers the literal FID.
+/// each item in `args` is rendered with built-in placeholders and
+/// any operator-defined key=value pairs in `cmd_vars`:
+///
+/// Built-in: `{fid}`, `{path}` (.lustre/fid virtual path), `{fullpath}`
+/// (real POSIX path via fid_to_path), `{size}`, `{uid}`, `{gid}`,
+/// `{mtime}`, `{ctime}`, `{atime}`.
+///
+/// Custom: any key in `cmd_vars` is available as `{key}` in `args`.
+/// Mirrors robinhood-C's `action_params { key = value; }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CmdParams {
     pub command: String,
@@ -177,6 +189,10 @@ pub struct CmdParams {
     /// Per-invocation timeout in seconds (overrides action `timeout_secs`).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Custom template variables — each key becomes `{key}` in args.
+    /// Mirrors robinhood-C's `action_params { target_pool = hddpool; }`.
+    #[serde(default)]
+    pub cmd_vars: std::collections::HashMap<String, String>,
 }
 
 /// Alert sink configuration. Exactly one of `webhook` / `log_only`
@@ -425,6 +441,7 @@ mod tests {
                 command: "/usr/bin/logger".into(),
                 args: vec!["base".into()],
                 timeout_secs: Some(5),
+                cmd_vars: std::collections::HashMap::new(),
             }),
             alert: Some(AlertParams {
                 webhook: Some("http://alerts.invalid/hook".into()),

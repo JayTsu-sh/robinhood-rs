@@ -249,6 +249,115 @@ impl ActionExecutor for HsmReleaseExecutor {
 }
 
 // ---------------------------------------------------------------------------
+// HSM Restore — drives PolicyKind::HsmRestore
+// ---------------------------------------------------------------------------
+
+/// Submits an HSM restore request to bring a released file back to Lustre.
+///
+/// Only acts on files that are currently in the `released` state; files
+/// that are already present on OSTs (not released) are skipped.
+pub struct HsmRestoreExecutor;
+
+#[async_trait]
+impl ActionExecutor for HsmRestoreExecutor {
+    #[tracing::instrument(name = "action.hsm_restore", skip(self, ctx), fields(fid = %entry.fid))]
+    async fn execute(&self, entry: &EntryRow, ctx: &ActionContext) -> Result<ActionOutcome, ActionError> {
+        if entry.kind != EntryKind::File {
+            return Ok(ActionOutcome::Skipped {
+                reason: "HSM restore only applies to files".to_string(),
+            });
+        }
+
+        let path = fid_path(&ctx.mount_path, entry);
+        let state = {
+            let p = path.clone();
+            let lustre = ctx.lustre;
+            tokio::task::spawn_blocking(move || lustre.hsm_state_get(&p))
+                .await
+                .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??
+        };
+
+        if !state.states.contains(lustre_api::hsm::HsmState::RELEASED) {
+            return Ok(ActionOutcome::Skipped {
+                reason: "file is not released — restore not needed".to_string(),
+            });
+        }
+
+        let fid = entry.fid;
+        let mount = ctx.mount_path.clone();
+        let lustre = ctx.lustre;
+        tokio::task::spawn_blocking(move || {
+            HsmRequestBuilder::new(HsmAction::Restore)
+                .add_fid(fid)
+                .submit(&lustre, &mount)
+        })
+        .await
+        .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
+
+        tracing::info!("HSM restore request submitted");
+        Ok(ActionOutcome::Success)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HSM Remove — drives PolicyKind::HsmRemove
+// ---------------------------------------------------------------------------
+
+/// Submits an HSM remove request to delete the backend copy of an archived file.
+///
+/// The Lustre-side file is NOT deleted. After this action the file's HSM
+/// state returns to `0x00000000` (no archive copy). Only acts on files that
+/// are `archived` and NOT `dirty` — dirty files still have pending changes
+/// that haven't been re-archived yet.
+pub struct HsmRemoveExecutor;
+
+#[async_trait]
+impl ActionExecutor for HsmRemoveExecutor {
+    #[tracing::instrument(name = "action.hsm_remove", skip(self, ctx), fields(fid = %entry.fid))]
+    async fn execute(&self, entry: &EntryRow, ctx: &ActionContext) -> Result<ActionOutcome, ActionError> {
+        if entry.kind != EntryKind::File {
+            return Ok(ActionOutcome::Skipped {
+                reason: "HSM remove only applies to files".to_string(),
+            });
+        }
+
+        let path = fid_path(&ctx.mount_path, entry);
+        let state = {
+            let p = path.clone();
+            let lustre = ctx.lustre;
+            tokio::task::spawn_blocking(move || lustre.hsm_state_get(&p))
+                .await
+                .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??
+        };
+
+        if !state.states.contains(lustre_api::hsm::HsmState::ARCHIVED) {
+            return Ok(ActionOutcome::Skipped {
+                reason: "file has no HSM archive copy — nothing to remove".to_string(),
+            });
+        }
+        if state.states.contains(lustre_api::hsm::HsmState::DIRTY) {
+            return Ok(ActionOutcome::Skipped {
+                reason: "file is dirty (modified after archive) — re-archive first".to_string(),
+            });
+        }
+
+        let fid = entry.fid;
+        let mount = ctx.mount_path.clone();
+        let lustre = ctx.lustre;
+        tokio::task::spawn_blocking(move || {
+            HsmRequestBuilder::new(HsmAction::Remove)
+                .add_fid(fid)
+                .submit(&lustre, &mount)
+        })
+        .await
+        .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
+
+        tracing::info!("HSM remove request submitted");
+        Ok(ActionOutcome::Success)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // External backup (rbhext_tool)
 // ---------------------------------------------------------------------------
 
@@ -360,47 +469,78 @@ impl ActionExecutor for BackupExecutor {
 // ---------------------------------------------------------------------------
 
 /// Runs an operator-defined shell command, one invocation per entry.
-/// The arg template supports these placeholders (all optional):
 ///
-///   `{fid}`  — literal FID, e.g. `[0x200000401:0x42:0x0]`
-///   `{path}` — `.lustre/fid/<FID>` virtual path
+/// Built-in template placeholders:
+///   `{fid}`      — literal FID, e.g. `[0x200000401:0x42:0x0]`
+///   `{path}`     — `.lustre/fid/<FID>` virtual path (for ioctl/open)
+///   `{fullpath}` — real POSIX path via fid_to_path (for rename/unlink/migrate)
 ///   `{size}`, `{uid}`, `{gid}`, `{mtime}`, `{ctime}`, `{atime}`
 ///
-/// Matches robinhood-C's `common.cmd`/`cmd(...)` DSL. Non-zero exit
-/// codes are surfaced as [`ActionOutcome::Failed`]. STDERR (up to
-/// 4 KiB) is captured into the failure reason.
+/// Custom placeholders: any key in `cmd_vars` becomes `{key}`.
+/// Mirrors robinhood-C's `action_params { target_pool = hddpool; }`.
+///
+/// Non-zero exit codes are surfaced as [`ActionOutcome::Failed`].
+/// STDERR (up to 4 KiB) is captured into the failure reason.
 pub struct CmdExecutor {
     pub command: std::path::PathBuf,
     pub args_template: Vec<String>,
     pub timeout: Option<std::time::Duration>,
+    /// Operator-defined substitution variables (from `cmd_vars` in policy JSON).
+    pub cmd_vars: std::collections::HashMap<String, String>,
 }
 
 impl CmdExecutor {
-    pub fn new(command: impl Into<std::path::PathBuf>, args: Vec<String>, timeout_secs: Option<u64>) -> Self {
+    pub fn new(
+        command: impl Into<std::path::PathBuf>, args: Vec<String>, timeout_secs: Option<u64>,
+        cmd_vars: std::collections::HashMap<String, String>,
+    ) -> Self {
         Self {
             command: command.into(),
             args_template: args,
             timeout: timeout_secs.map(std::time::Duration::from_secs),
+            cmd_vars,
         }
     }
 
-    fn render_args(&self, entry: &EntryRow, mount: &Path) -> Vec<String> {
+    /// Render one arg string, substituting all built-in and custom placeholders.
+    /// `fullpath` is resolved lazily — pass `None` if fid_to_path is not available.
+    fn render_arg(&self, template: &str, entry: &EntryRow, fid_path_s: &str, fullpath: &str) -> String {
+        let fid_str = entry.fid.to_string();
+        let mut out = template
+            .replace("{fid}", &fid_str)
+            .replace("{path}", fid_path_s)
+            .replace("{fullpath}", fullpath)
+            .replace("{size}", &entry.size.to_string())
+            .replace("{uid}", &entry.uid.to_string())
+            .replace("{gid}", &entry.gid.to_string())
+            .replace("{mtime}", &entry.mtime.to_string())
+            .replace("{ctime}", &entry.ctime.to_string())
+            .replace("{atime}", &entry.atime.to_string());
+        for (k, v) in &self.cmd_vars {
+            out = out.replace(&format!("{{{k}}}"), v);
+        }
+        out
+    }
+
+    fn render_args(&self, entry: &EntryRow, mount: &Path, lustre: &LustreApi) -> Vec<String> {
         let fid_str = entry.fid.to_string();
         let stripped = fid_str.trim_start_matches('[').trim_end_matches(']');
-        let path = mount.join(".lustre").join("fid").join(stripped);
-        let path_s = path.to_string_lossy().into_owned();
+        let fid_vpath = mount.join(".lustre").join("fid").join(stripped);
+        let fid_path_s = fid_vpath.to_string_lossy().into_owned();
+
+        // Resolve real path only if any template needs {fullpath}.
+        let needs_fullpath = self.args_template.iter().any(|t| t.contains("{fullpath}"));
+        let fullpath = if needs_fullpath {
+            resolve_real_path(lustre, mount, &entry.fid)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         self.args_template
             .iter()
-            .map(|t| {
-                t.replace("{fid}", &fid_str)
-                    .replace("{path}", &path_s)
-                    .replace("{size}", &entry.size.to_string())
-                    .replace("{uid}", &entry.uid.to_string())
-                    .replace("{gid}", &entry.gid.to_string())
-                    .replace("{mtime}", &entry.mtime.to_string())
-                    .replace("{ctime}", &entry.ctime.to_string())
-                    .replace("{atime}", &entry.atime.to_string())
-            })
+            .map(|t| self.render_arg(t, entry, &fid_path_s, &fullpath))
             .collect()
     }
 }
@@ -409,7 +549,7 @@ impl CmdExecutor {
 impl ActionExecutor for CmdExecutor {
     #[tracing::instrument(name = "action.cmd", skip(self, ctx), fields(fid = %entry.fid))]
     async fn execute(&self, entry: &EntryRow, ctx: &ActionContext) -> Result<ActionOutcome, ActionError> {
-        let args = self.render_args(entry, &ctx.mount_path);
+        let args = self.render_args(entry, &ctx.mount_path, &ctx.lustre);
         let child_res = tokio::process::Command::new(&self.command)
             .args(&args)
             .stdout(std::process::Stdio::piped())
@@ -602,8 +742,9 @@ mod tests {
                 "{mtime}".into(),
             ],
             None,
+            std::collections::HashMap::new(),
         );
-        let args = exec.render_args(&entry, Path::new("/lustre"));
+        let args = exec.render_args(&entry, Path::new("/lustre"), &LustreApi);
         assert!(args[0].starts_with("["), "fid literal: {}", args[0]);
         assert!(args[1].contains("/lustre/.lustre/fid/"), "path: {}", args[1]);
         assert_eq!(args[2], "1024");
@@ -619,7 +760,7 @@ mod tests {
             mount_path: PathBuf::from("/lustre"),
             lustre: LustreApi,
         };
-        let exec = CmdExecutor::new("/bin/true", vec![], None);
+        let exec = CmdExecutor::new("/bin/true", vec![], None, std::collections::HashMap::new());
         assert_eq!(exec.execute(&entry, &ctx).await.unwrap(), ActionOutcome::Success);
     }
 
@@ -630,7 +771,7 @@ mod tests {
             mount_path: PathBuf::from("/lustre"),
             lustre: LustreApi,
         };
-        let exec = CmdExecutor::new("/bin/false", vec![], None);
+        let exec = CmdExecutor::new("/bin/false", vec![], None, std::collections::HashMap::new());
         let outcome = exec.execute(&entry, &ctx).await.unwrap();
         assert!(matches!(outcome, ActionOutcome::Failed { .. }));
     }
@@ -642,7 +783,12 @@ mod tests {
             mount_path: PathBuf::from("/lustre"),
             lustre: LustreApi,
         };
-        let exec = CmdExecutor::new("/bin/sleep", vec!["5".into()], Some(1));
+        let exec = CmdExecutor::new(
+            "/bin/sleep",
+            vec!["5".into()],
+            Some(1),
+            std::collections::HashMap::new(),
+        );
         // Use try_for_1s via timeout_secs=1; /bin/sleep 5 will time out.
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), exec.execute(&entry, &ctx))
             .await
@@ -674,5 +820,87 @@ mod tests {
         let exec = AlertExecutor::new(Some("http://127.0.0.1:1/".into()), false, None);
         let outcome = exec.execute(&entry, &ctx).await.unwrap();
         assert!(matches!(outcome, ActionOutcome::Failed { .. }), "got {outcome:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // CmdExecutor: cmd_vars custom template substitution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cmd_vars_substitute_custom_placeholders() {
+        let entry = test_file_entry();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("target_pool".into(), "hddpool".into());
+        vars.insert("stripe_count".into(), "-1".into());
+        let exec = CmdExecutor::new(
+            "/usr/bin/lfs",
+            vec![
+                "migrate".into(),
+                "-c".into(),
+                "{stripe_count}".into(),
+                "-p".into(),
+                "{target_pool}".into(),
+                // {fullpath} resolves via fid_to_path; in unit tests it
+                // returns an error so we get an empty string — just verify
+                // substitution itself doesn't panic.
+                "{fullpath}".into(),
+            ],
+            None,
+            vars,
+        );
+        let args = exec.render_args(&entry, Path::new("/lustre"), &LustreApi);
+        assert_eq!(args[0], "migrate");
+        assert_eq!(args[2], "-1", "stripe_count var");
+        assert_eq!(args[4], "hddpool", "target_pool var");
+        // {fullpath} on mock LustreApi fails fid_to_path → empty string (not panics)
+        assert_eq!(args[5], "", "fullpath falls back to empty on fid_to_path failure");
+    }
+
+    #[test]
+    fn cmd_vars_unknown_placeholder_left_as_is() {
+        let entry = test_file_entry();
+        let exec = CmdExecutor::new(
+            "/bin/echo",
+            vec!["{unknown_key}".into()],
+            None,
+            std::collections::HashMap::new(),
+        );
+        let args = exec.render_args(&entry, Path::new("/lustre"), &LustreApi);
+        assert_eq!(
+            args[0], "{unknown_key}",
+            "unknown placeholder must not be silently dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HsmRestoreExecutor / HsmRemoveExecutor: state-guard skips
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn hsm_restore_skips_non_file_entries() {
+        use rbh_entry_store::model::EntryKind;
+        let mut entry = test_file_entry();
+        entry.kind = EntryKind::Directory;
+        let ctx = ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: LustreApi,
+        };
+        let exec = HsmRestoreExecutor;
+        let out = exec.execute(&entry, &ctx).await.unwrap();
+        assert!(matches!(out, ActionOutcome::Skipped { .. }), "dirs must be skipped");
+    }
+
+    #[tokio::test]
+    async fn hsm_remove_skips_non_file_entries() {
+        use rbh_entry_store::model::EntryKind;
+        let mut entry = test_file_entry();
+        entry.kind = EntryKind::Directory;
+        let ctx = ActionContext {
+            mount_path: PathBuf::from("/lustre"),
+            lustre: LustreApi,
+        };
+        let exec = HsmRemoveExecutor;
+        let out = exec.execute(&entry, &ctx).await.unwrap();
+        assert!(matches!(out, ActionOutcome::Skipped { .. }), "dirs must be skipped");
     }
 }

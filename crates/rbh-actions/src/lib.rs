@@ -1,18 +1,20 @@
 //! Action executors for robinhood-rs policies.
 //!
 //! Each [`PolicyKind`] maps to a concrete [`ActionExecutor`] implementation:
-//! * `Purge` → [`PurgeExecutor`] (unlink files, rmdir empty dirs)
-//! * `HsmArchive` → [`HsmArchiveExecutor`] (submit HSM archive request)
-//! * `HsmRelease` → [`HsmReleaseExecutor`] (submit HSM release request)
-//! * `Migration` / `Alert` → stubs for later phases
-//!
-//! The [`dispatch`] function selects the right executor based on policy kind.
+//! * `Purge`      → [`PurgeExecutor`]         (unlink files, rmdir empty dirs)
+//! * `HsmArchive` → [`HsmArchiveExecutor`]    (submit HSM archive request)
+//! * `HsmRelease` → [`HsmReleaseExecutor`]    (submit HSM release request)
+//! * `HsmRestore` → [`HsmRestoreExecutor`]    (restore released file from HSM)
+//! * `HsmRemove`  → [`HsmRemoveExecutor`]     (remove HSM backend copy)
+//! * `Migration`  → [`CmdExecutor`]           (arbitrary shell command, e.g. lfs migrate)
+//! * `Alert`      → [`AlertExecutor`]         (webhook / tracing log)
+//! * `Backup`     → [`BackupExecutor`]        (external rbhext_tool protocol)
 
 mod executor;
 
 pub use executor::{
     ActionContext, ActionExecutor, ActionOutcome, AlertExecutor, BackupExecutor, CmdExecutor, HsmArchiveExecutor,
-    HsmReleaseExecutor, PurgeExecutor,
+    HsmReleaseExecutor, HsmRemoveExecutor, HsmRestoreExecutor, PurgeExecutor,
 };
 
 /// Errors produced by action executors.

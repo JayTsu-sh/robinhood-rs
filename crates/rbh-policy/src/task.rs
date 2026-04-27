@@ -164,11 +164,14 @@ impl Task for PolicyRunTask {
                 Arc::new(rbh_actions::HsmArchiveExecutor { archive_id, hints })
             }
             crate::PolicyKind::HsmRelease => Arc::new(rbh_actions::HsmReleaseExecutor),
+            crate::PolicyKind::HsmRestore => Arc::new(rbh_actions::HsmRestoreExecutor),
+            crate::PolicyKind::HsmRemove => Arc::new(rbh_actions::HsmRemoveExecutor),
             crate::PolicyKind::Migration => match def.default_action.cmd.as_ref() {
                 Some(c) => Arc::new(rbh_actions::CmdExecutor::new(
                     &c.command,
                     c.args.clone(),
                     c.timeout_secs.or(def.default_action.timeout_secs),
+                    c.cmd_vars.clone(),
                 )),
                 None => {
                     tracing::warn!("migration policy has no cmd config — skipping run");
