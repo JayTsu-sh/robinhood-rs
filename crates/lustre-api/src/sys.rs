@@ -44,8 +44,7 @@ pub(crate) const CLFE_SUPPORTED: u32 = bindings::changelog_rec_extra_flags_CLFE_
 pub(crate) const CHANGELOG_FLAG_FOLLOW: c_int = bindings::changelog_send_flag_CHANGELOG_FLAG_FOLLOW as c_int;
 pub(crate) const CHANGELOG_FLAG_BLOCK: c_int = bindings::changelog_send_flag_CHANGELOG_FLAG_BLOCK as c_int;
 pub(crate) const CHANGELOG_FLAG_JOBID: c_int = bindings::changelog_send_flag_CHANGELOG_FLAG_JOBID as c_int;
-pub(crate) const CHANGELOG_FLAG_EXTRA_FLAGS: c_int =
-    bindings::changelog_send_flag_CHANGELOG_FLAG_EXTRA_FLAGS as c_int;
+pub(crate) const CHANGELOG_FLAG_EXTRA_FLAGS: c_int = bindings::changelog_send_flag_CHANGELOG_FLAG_EXTRA_FLAGS as c_int;
 
 pub(crate) const HS_EXISTS: u32 = bindings::hsm_states_HS_EXISTS;
 pub(crate) const HS_DIRTY: u32 = bindings::hsm_states_HS_DIRTY;

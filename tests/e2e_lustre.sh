@@ -193,12 +193,12 @@ SCAN_ID=$(curl -sf -X POST "$API/api/scans" -H 'content-type: application/json' 
 note "  -> scan id $SCAN_ID"
 # Poll for completion
 for _ in $(seq 1 30); do
-    STATUS=$(curl -sf "$API/api/scans/$SCAN_ID" | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')
+    STATUS=$(curl -sf "$API/api/scans/$SCAN_ID" | python3 -c 'import json,sys;print(json.load(sys.stdin)["state"])')
     if [[ "$STATUS" == "completed" ]]; then break; fi
     if [[ "$STATUS" == "failed" ]]; then die "scan failed"; fi
     sleep 1
 done
-assert_eq "$STATUS" "completed" "scan status"
+assert_eq "$STATUS" "completed" "scan state"
 note "  -> scan completed"
 
 note "scenario 6: orphan sweep (dry-run then real)"
@@ -239,8 +239,8 @@ POLICY_JSON=$(cat <<JSON
 {
   "name": "e2e_purge",
   "kind": "purge",
-  "scope": {"kind":"cmp","field":"uid","cmp":"ge","value":{"kind":"num","value":0}},
-  "rules": [{"condition":{"kind":"true"},"action":{}}],
+  "scope": {"op":"cmp","field":"uid","cmp":"ge","value":0},
+  "rules": [{"condition":{"op":"true"},"action":{}}],
   "default_action": {"max_count": 2, "nb_threads": 1},
   "triggers": []
 }

@@ -423,7 +423,10 @@ fn process_acks(
                         // Advance last_cleared so we don't retry the same index on
                         // every ack round.
                         state.last_cleared = idx;
-                        debug!(mdt, idx, "clear_changelog EINVAL — pre-registration record, advancing cursor");
+                        debug!(
+                            mdt,
+                            idx, "clear_changelog EINVAL — pre-registration record, advancing cursor"
+                        );
                     } else {
                         warn!(mdt, idx, err = %e, "clear_changelog failed");
                     }

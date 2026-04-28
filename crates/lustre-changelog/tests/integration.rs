@@ -458,12 +458,9 @@ async fn listener_captures_hsm_archive_event() {
                         // Only accept ARCHIVE (hsm_event == 0) for the specific FID
                         // we created. Historical records from previous test runs must
                         // not satisfy this assertion even if they also have event == 0.
-                        let is_our_fid = target_fid.map_or(false, |tf| *fid == tf);
+                        let is_our_fid = target_fid == Some(*fid);
                         if *hsm_event == 0 && is_our_fid {
-                            println!(
-                                "  ✓ CL_HSM ARCHIVE at index {} fid={fid:?}",
-                                env.index
-                            );
+                            println!("  ✓ CL_HSM ARCHIVE at index {} fid={fid:?}", env.index);
                             found_hsm = true;
                         }
                     }
@@ -491,6 +488,7 @@ async fn listener_captures_hsm_archive_event() {
 
     cancel.cancel();
     let _ = copytool.kill();
+    let _ = copytool.wait();
     let _ = fs::remove_file(&path);
 
     assert!(found_create, "did not find CL_CREATE for {name}");
