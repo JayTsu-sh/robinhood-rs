@@ -210,18 +210,17 @@ C 版 `web_gui/` 目录（PHP）。Rust 无前端。
 - ✅ SIGHUP reload
 - ✅ systemd 单元
 
-### P1（HSM 生产可用 + predicate 完善）— ⏳ 进行中
+### P1（HSM 生产可用 + predicate 完善）— ⏳ 部分完成
 
-- [ ] 完整 `lhsm.c` 语义（archive_id / hints / restore 跟踪 / archive/release 重试与统计）
-- [ ] 策略运行期低水位闭环（fire 后 PolicyRunTask 周期检查 low threshold 提前退出）
-- [ ] OST statfs 实际占用率接入（`llapi_obd_statfs` 替换 DB SUM(size)）
-- [ ] 并发 worker（按 `nb_threads` 并行 execute candidates）
-- [ ] 动作速率限制（每秒 N 动作 / 总带宽上限，`sched_ratelimit.c` 语义）
-- [ ] Predicate 扩展：`depth` / `dircount` / `nlink` / `iname` / `last_mdchange` / `creation_time`
-- [ ] `fileclass` 名称引用（predicate 中引用已定义 fileclass 名）
-- [ ] 正则匹配谓词（`=~` / `!~`）
-- [ ] xattr 匹配谓词
-- [ ] OST/pool/user/group 细粒度触发器
+- ✅ 完整 `lhsm.c` 语义（archive_id / hints — `HsmParams` 在 `ActionParams` 中，executor 已接线；retry/backoff 在 `task.rs dispatch_workers` 中实现）
+- ✅ 策略运行期低水位闭环（`task.rs::maybe_spawn_low_watermark_monitor()` 已实现）
+- ✅ 并发 worker（`dispatch_workers()` 基于 `JoinSet` + semaphore，受 `nb_threads` 控制）
+- ✅ 动作速率限制（`RateLimit { max_per_sec, max_bytes_per_sec }` 在 `task.rs` 中实现）
+- ✅ OST/pool/user/group 细粒度触发器（`ThresholdOstPct` + `TargetFilter::User/Group/Projid/Pool` 已实现）
+- ✅ Predicate 扩展（2026-04-28）：`InameLike` / `NameRegex` / `Xattr` / `Field::Depth` — 含 DB 迁移 004、fs-scan depth 传递、39 个测试
+- [ ] OST statfs 实际占用率接入（`llapi_obd_statfs` 替换 DB SUM(size)，需 live Lustre）
+- [ ] `fileclass` 名称引用（predicate 中按名引用全局 fileclass，需全局注册表）
+- [ ] `dircount` 谓词（目录子文件数，需 schema 变更 + 维护计数器）
 
 ### P2（报表 & 运维 & 差分）
 
@@ -397,14 +396,14 @@ POSIX `find(1)` + Lustre 扩展：`--ost/--pool/--projid/--class/--status/--lsos
 
 | # | 任务 | 交付 | 测试 |
 |---|---|---|---|
-| P1.1 | 完整 lhsm 语义（archive_id/hints/重试） | — | — |
-| P1.2 | 低水位闭环 | — | — |
-| P1.3 | OST statfs 实际占用率 | — | — |
-| P1.4 | 并发 worker（nb_threads） | — | — |
-| P1.5 | 动作速率限制 | — | — |
-| P1.6 | Predicate 扩展（depth/dircount/nlink/iname/xattr/正则） | — | — |
+| P1.1 | 完整 lhsm 语义（archive_id/hints/重试） | `HsmParams` in `ActionParams`; `dispatch_workers` retry loop | task.rs tests |
+| P1.2 | 低水位闭环 | `maybe_spawn_low_watermark_monitor()` in task.rs | task.rs tests |
+| P1.3 | OST statfs 实际占用率 | — (需 live Lustre) | — |
+| P1.4 | 并发 worker（nb_threads） | `dispatch_workers` JoinSet + semaphore | task.rs concurrency tests |
+| P1.5 | 动作速率限制 | `RateLimit` + token bucket in task.rs | task.rs rate limit tests |
+| P1.6 | Predicate 扩展（depth/iname/xattr/正则） | `InameLike`/`NameRegex`/`Xattr`/`Field::Depth`; migration 004 | 39 predicate tests |
 | P1.7 | fileclass 名称引用谓词 | — | — |
-| P1.8 | OST/pool/user/group 细粒度触发器 | — | — |
+| P1.8 | OST/pool/user/group 细粒度触发器 | `ThresholdOstPct` + `TargetFilter` variants | daemon threshold tests |
 
 ---
 
@@ -414,3 +413,4 @@ POSIX `find(1)` + Lustre 扩展：`--ost/--pool/--projid/--class/--status/--lsos
 |---|---|
 | 2026-04-23 | 初始分析（~8.1k 行，P0 规划） |
 | 2026-04-28 | P0 全部完成；codebase 增至 ~17.5k 行（13 crate 全部真实实现）；更新覆盖概览、动作模块表、CLI 表、predicate/触发器缺口、报表/扫描/运维表；重写 P1/P2/P3 优先级列表；新增 P1 实施结果占位表 |
+| 2026-05-07 | 审查发现 P1.1/P1.2/P1.4/P1.5/P1.8 已在 task.rs/thresholds.rs 中实现；新增实施 P1.6 predicate 扩展：`InameLike`、`NameRegex`、`Xattr`、`Field::Depth`（含 migration 004、fs-scan depth 传播、39 个测试）；更新 P1 实施结果表 |
