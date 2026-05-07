@@ -355,6 +355,21 @@ pub enum TriggerSpec {
         #[serde(default)]
         target: ThresholdTarget,
     },
+    /// Trigger when the **aggregate** filesystem usage percentage
+    /// (sum-of-used / sum-of-total across all OSTs, via `llapi_obd_statfs`)
+    /// reaches `high_pct`. Unlike `ThresholdOstPct` which fires on any
+    /// individual hot OST, this fires on the whole-filesystem fill level
+    /// (equivalent to `trigger_on = global_usage` in robinhood-C).
+    ThresholdFsPct {
+        check_interval_secs: u64,
+        /// Fire when aggregate `used/total >= high_pct/100`. Range 0..=100.
+        high_pct: u32,
+        /// Stop in-run when aggregate drops to or below `low_pct/100`. 0 disables.
+        #[serde(default)]
+        low_pct: u32,
+        #[serde(default)]
+        post_trigger_wait_secs: u64,
+    },
 }
 
 /// Per-threshold target. Kept separate from `TargetFilter` in `task.rs` so

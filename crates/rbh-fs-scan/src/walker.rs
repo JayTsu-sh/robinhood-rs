@@ -461,4 +461,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_rbh_ignore_file(dir.path()).is_empty());
     }
+
+    /// Scan /lustre with depth limit 0 and verify depth is set correctly.
+    /// max_depth=0 emits: /lustre itself (depth=0) and its direct file children (depth=1).
+    /// Subdirectories of /lustre are NOT recursed into, so all seen depths are 0 or 1.
+    /// Gated on RBH_INTEGRATION=1 (requires a live Lustre mount at /lustre).
+    #[tokio::test]
+    async fn scan_lustre_depth_is_correct() {
+        if !matches!(std::env::var("RBH_INTEGRATION"), Ok(v) if !v.is_empty() && v != "0") {
+            eprintln!("skipping (set RBH_INTEGRATION=1)");
+            return;
+        }
+        let config = ScanConfig {
+            root: PathBuf::from("/lustre"),
+            concurrency: 1,
+            max_depth: Some(0), // root (depth=0) + direct non-dir children (depth=1); no subdir recursion
+            channel_size: 256,
+            since_mtime: None,
+            ignore_globs: Vec::new(),
+        };
+        let (mut rx, _progress) = FsScanner::run(config);
+
+        let mut entries_seen = 0u32;
+        while let Some(event) = rx.recv().await {
+            if let ScanEvent::Entry(entry) = event {
+                entries_seen += 1;
+                // All entries must be depth 0 (root) or depth 1 (direct children).
+                assert!(
+                    entry.depth <= 1,
+                    "with max_depth=0, depth must be 0 or 1, got {} for {:?}",
+                    entry.depth,
+                    std::str::from_utf8(&entry.name).unwrap_or("<binary>"),
+                );
+                // The root itself has no parent_fid.
+                if entry.parent_fid.is_none() {
+                    assert_eq!(entry.depth, 0, "root entry must have depth=0");
+                } else {
+                    assert_eq!(entry.depth, 1, "direct child must have depth=1");
+                }
+            }
+        }
+        assert!(entries_seen > 0, "expected at least one entry from /lustre");
+        println!("scan_lustre_depth_is_correct passed ({entries_seen} entries)");
+    }
 }

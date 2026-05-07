@@ -138,7 +138,8 @@ fn build_trigger(spec: &TriggerSpec) -> Result<Option<Box<dyn scheduler_rs::trig
         // not by scheduler-rs.
         TriggerSpec::ThresholdCount { .. }
         | TriggerSpec::ThresholdVolume { .. }
-        | TriggerSpec::ThresholdOstPct { .. } => Ok(None),
+        | TriggerSpec::ThresholdOstPct { .. }
+        | TriggerSpec::ThresholdFsPct { .. } => Ok(None),
     }
 }
 

@@ -145,25 +145,9 @@ impl ThresholdChecker {
                         (v >= high, target.clone())
                     }
                     Measure::OstPct { high_pct } => {
-                        // Live per-OST usage via llapi_obd_statfs — runs on a
-                        // blocking thread because the FFI is sync.
-                        let lustre = self.lustre;
-                        let mount = self.mount_path.clone();
-                        let usages = match tokio::task::spawn_blocking(move || lustre.ost_usage(&mount)).await {
-                            Ok(Ok(v)) => v,
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    policy_id = policy.id,
-                                    trigger_idx = idx,
-                                    error = %e,
-                                    "ost statfs failed — skipping cycle"
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(policy_id = policy.id, error = %e, "ost_usage join error");
-                                continue;
-                            }
+                        let usages = match fetch_ost_usage(self, policy.id, idx).await {
+                            Some(v) => v,
+                            None => continue,
                         };
                         match first_ost_over_pct(&usages, params.target, high_pct) {
                             Some(hot) => {
@@ -186,6 +170,28 @@ impl ThresholdChecker {
                                 (false, target.clone())
                             }
                         }
+                    }
+                    Measure::FsPct { high_pct } => {
+                        // Aggregate all OSTs: sum(used) / sum(total) × 100.
+                        let usages = match fetch_ost_usage(self, policy.id, idx).await {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let total: u64 = usages.iter().map(|u| u.total_bytes).sum();
+                        let used: u64 = usages.iter().map(|u| u.used_bytes).sum();
+                        let agg_pct = if total == 0 {
+                            0.0
+                        } else {
+                            used as f64 / total as f64 * 100.0
+                        };
+                        tracing::debug!(
+                            policy_id = policy.id,
+                            trigger_idx = idx,
+                            agg_pct,
+                            high_pct,
+                            "fs aggregate usage evaluated"
+                        );
+                        (agg_pct >= high_pct as f64, target.clone())
                     }
                 };
 
@@ -266,6 +272,11 @@ enum Measure {
     OstPct {
         high_pct: u32,
     },
+    /// Aggregate filesystem usage (sum-used / sum-total across all OSTs).
+    /// Equivalent to robinhood-C `trigger_on = global_usage`.
+    FsPct {
+        high_pct: u32,
+    },
 }
 
 fn decode_threshold(spec: &TriggerSpec) -> Option<ThresholdParams<'_>> {
@@ -306,7 +317,38 @@ fn decode_threshold(spec: &TriggerSpec) -> Option<ThresholdParams<'_>> {
             target,
             measure: Measure::OstPct { high_pct: *high_pct },
         }),
+        TriggerSpec::ThresholdFsPct {
+            check_interval_secs,
+            high_pct,
+            post_trigger_wait_secs,
+            ..
+        } => Some(ThresholdParams {
+            check_interval_secs: *check_interval_secs,
+            post_trigger_wait_secs: *post_trigger_wait_secs,
+            target: &ThresholdTarget::Fs,
+            measure: Measure::FsPct { high_pct: *high_pct },
+        }),
         _ => None,
+    }
+}
+
+/// Fetch OST statfs data on a blocking thread; returns `None` and logs a
+/// warning on error so callers can `continue` the polling loop cleanly.
+async fn fetch_ost_usage(
+    checker: &ThresholdChecker, policy_id: u64, trigger_idx: u32,
+) -> Option<Vec<lustre_api::OstUsage>> {
+    let lustre = checker.lustre;
+    let mount = checker.mount_path.clone();
+    match tokio::task::spawn_blocking(move || lustre.ost_usage(&mount)).await {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(e)) => {
+            tracing::warn!(policy_id, trigger_idx, error = %e, "ost statfs failed — skipping cycle");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(policy_id, trigger_idx, error = %e, "ost_usage join error");
+            None
+        }
     }
 }
 
@@ -477,4 +519,51 @@ mod tests {
             TargetFilter::User { uid: 1000 }
         );
     }
+}
+
+#[test]
+fn fs_pct_decodes_correctly() {
+    let spec = TriggerSpec::ThresholdFsPct {
+        check_interval_secs: 120,
+        high_pct: 90,
+        low_pct: 70,
+        post_trigger_wait_secs: 300,
+    };
+    match decode_threshold(&spec) {
+        Some(p) => {
+            assert_eq!(p.check_interval_secs, 120);
+            assert!(matches!(p.measure, Measure::FsPct { high_pct: 90 }));
+        }
+        None => panic!("ThresholdFsPct should decode to Some"),
+    }
+}
+
+#[test]
+fn aggregate_pct_computation() {
+    use lustre_api::OstUsage;
+    // Two OSTs: 50GiB total, 10GiB used → 20%
+    let usages = vec![
+        OstUsage {
+            index: 0,
+            name: "fs-OST0000".into(),
+            total_bytes: 25 << 30,
+            used_bytes: 5 << 30,
+            free_bytes: 20 << 30,
+            avail_bytes: 20 << 30,
+        },
+        OstUsage {
+            index: 1,
+            name: "fs-OST0001".into(),
+            total_bytes: 25 << 30,
+            used_bytes: 5 << 30,
+            free_bytes: 20 << 30,
+            avail_bytes: 20 << 30,
+        },
+    ];
+    let total: u64 = usages.iter().map(|u| u.total_bytes).sum();
+    let used: u64 = usages.iter().map(|u| u.used_bytes).sum();
+    let pct = used as f64 / total as f64 * 100.0;
+    assert!((pct - 20.0).abs() < 0.01, "expected ~20%, got {pct}");
+    // Should NOT fire at high_pct=85
+    assert!(pct < 85.0);
 }

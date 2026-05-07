@@ -24,13 +24,14 @@ fn integration_enabled() -> bool {
 
 /// Reset the test database: drop all tables, let migrations recreate them.
 async fn reset_db(pool: &sqlx::Pool<MySql>) {
-    // Drop tables in reverse dependency order.
+    // Drop tables in reverse dependency order (policies has no FK deps).
     for table in &[
         "stripe_items",
         "names",
         "removed_entries",
         "changelog_cursor",
         "entries",
+        "policies",
         "_sqlx_migrations",
     ] {
         let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
@@ -336,4 +337,28 @@ async fn subtree_totals_walks_parent_edge() {
     assert_eq!(bytes, 0);
 
     println!("subtree_totals passed");
+}
+
+#[tokio::test]
+async fn depth_field_roundtrips() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+
+    let mut entry = make_entry(0x200000501, 0x01, "deep_file.txt");
+    entry.depth = 7;
+    store.upsert_entry(&entry).await.expect("upsert");
+
+    let back = store.get_entry(&entry.fid).await.expect("get").expect("not found");
+    assert_eq!(back.depth, 7, "depth should round-trip through DB");
+    println!("depth field roundtrip passed (depth={})", back.depth);
 }
