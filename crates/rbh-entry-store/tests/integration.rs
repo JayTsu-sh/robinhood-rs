@@ -32,6 +32,7 @@ async fn reset_db(pool: &sqlx::Pool<MySql>) {
         "changelog_cursor",
         "entries",
         "policies",
+        "classifiers",
         "_sqlx_migrations",
     ] {
         let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))

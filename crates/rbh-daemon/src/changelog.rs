@@ -29,6 +29,7 @@ use rbh_entry_store::store::EntryStore;
 #[tracing::instrument(name = "changelog.ingest", skip_all)]
 pub async fn ingest_loop(
     mut handle: ListenerHandle, entry_store: EntryStore, mount_path: PathBuf, cancel: CancellationToken,
+    classifier_cache: std::sync::Arc<tokio::sync::RwLock<Vec<rbh_policy::ClassifierRow>>>,
 ) {
     tracing::info!("changelog ingest loop started");
 
@@ -83,7 +84,15 @@ pub async fn ingest_loop(
 
         for envelope in &batch.events {
             match apply_event(&entry_store, &mount_path, &envelope.event, envelope.time).await {
-                Ok(true) => applied += 1,
+                Ok(true) => {
+                    applied += 1;
+                    // Incremental classification: re-classify the affected entry.
+                    let fid = envelope.event.fid();
+                    let classifiers = classifier_cache.read().await;
+                    if !classifiers.is_empty() && let Ok(Some(row)) = entry_store.get_entry(&fid).await {
+                        apply_classifiers(&classifiers, &row, &entry_store).await;
+                    }
+                }
                 Ok(false) => skipped += 1,
                 Err(e) => {
                     errors += 1;
@@ -122,6 +131,23 @@ pub async fn ingest_loop(
     }
 
     tracing::info!("changelog ingest loop exiting");
+}
+
+/// Run all enabled classifiers against a single entry in-memory and write back any tags.
+async fn apply_classifiers(
+    classifiers: &[rbh_policy::ClassifierRow], entry: &rbh_entry_store::model::EntryRow,
+    store: &rbh_entry_store::store::EntryStore,
+) {
+    for classifier in classifiers {
+        if !classifier.enabled {
+            continue;
+        }
+        if let Some(tags) = rbh_policy::evaluate_classifier(&classifier.definition, entry) {
+            let _ = store
+                .update_xattr(&entry.fid, tags, &classifier.definition.manages)
+                .await;
+        }
+    }
 }
 
 /// Apply a single changelog event to the entry store.

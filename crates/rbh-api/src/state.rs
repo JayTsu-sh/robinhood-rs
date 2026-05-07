@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rbh_entry_store::store::EntryStore;
-use rbh_policy::PolicyStore;
+use rbh_policy::{ClassifierStore, PolicyStore};
 use scheduler_rs::prelude::Scheduler;
 use tokio::sync::Mutex;
 
@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct AppState {
     pub policy_store: PolicyStore,
+    pub classifier_store: ClassifierStore,
     pub entry_store: EntryStore,
     pub scheduler: Option<Scheduler>,
     /// In-memory registry of scans started via POST /api/scans. Lives

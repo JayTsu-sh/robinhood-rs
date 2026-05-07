@@ -74,6 +74,16 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
         // so the evaluator stays conservative. Push down to SQL for accurate
         // OST filtering.
         Predicate::OnOst { .. } => false,
+
+        Predicate::Tags { match_tags } => {
+            if match_tags.is_empty() {
+                return true;
+            }
+            let xattr = entry.sm_status.get("xattr");
+            match_tags
+                .iter()
+                .all(|(k, v)| xattr.and_then(|x| x.get(k)).and_then(|val| val.as_str()) == Some(v.as_str()))
+        }
     }
 }
 

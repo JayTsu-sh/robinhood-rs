@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use rbh_entry_store::store::{EntryStore, QueryParam};
 use rbh_policy::model::ThresholdTarget;
-use rbh_policy::{PolicyRow, PolicyRunTask, PolicyStore, TargetFilter, TriggerSpec, compose_scope_with_ignores};
+use rbh_policy::{PolicyRow, PolicyRunTask, PolicyStore, TargetFilter, TriggerSpec, parse_trigger};
 use rbh_predicate::{Predicate, SqlParam, to_sql};
 
 /// Fire-time bookkeeping: last-fire timestamp per `(policy_id, trigger_idx)`.
@@ -79,9 +79,13 @@ impl ThresholdChecker {
             if !policy.enabled {
                 continue;
             }
-            for (idx, trigger) in policy.definition.triggers.iter().enumerate() {
-                let idx = idx as u32;
-                let params = match decode_threshold(trigger) {
+            let trigger_spec = match parse_trigger(&policy.definition.trigger) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let idx: u32 = 0;
+            {
+                let params = match decode_threshold(&trigger_spec) {
                     Some(p) => p,
                     None => continue, // not a threshold trigger
                 };
@@ -103,12 +107,13 @@ impl ThresholdChecker {
                 }
 
                 let target = resolve_target(params.target);
-                let scope_with_ignore =
-                    compose_scope_with_ignores(&policy.definition.scope, &policy.definition.ignore_fileclass);
+                let tags_pred = Predicate::Tags {
+                    match_tags: policy.definition.match_tags.clone(),
+                };
                 let scope_with_target = match target.to_predicate() {
-                    Predicate::True => scope_with_ignore,
+                    Predicate::True => tags_pred,
                     other => Predicate::And {
-                        children: vec![scope_with_ignore, other],
+                        children: vec![tags_pred, other],
                     },
                 };
                 let (where_clause, sql_params): (String, Vec<SqlParam>) = to_sql(&scope_with_target);
@@ -542,7 +547,7 @@ fn fs_pct_decodes_correctly() {
 fn aggregate_pct_computation() {
     use lustre_api::OstUsage;
     // Two OSTs: 50GiB total, 10GiB used → 20%
-    let usages = vec![
+    let usages: Vec<OstUsage> = vec![
         OstUsage {
             index: 0,
             name: "fs-OST0000".into(),

@@ -557,6 +557,56 @@ impl EntryStore {
     /// refreshes `last_seen` on everything currently on disk, so anything
     /// still stale after the scan completed is presumed gone.
     ///
+    /// Atomically update xattr tags in `sm_status.xattr`.
+    ///
+    /// Clears every key in `clear_keys`, then sets each key in `tags`.
+    /// Other fields in `sm_status` (e.g. `hsm_state`) are untouched.
+    pub async fn update_xattr(
+        &self, fid: &LuFid, tags: &std::collections::HashMap<String, String>, clear_keys: &[String],
+    ) -> Result<()> {
+        if tags.is_empty() && clear_keys.is_empty() {
+            return Ok(());
+        }
+        let fid_bin = fid_codec::encode(fid);
+
+        // Read current sm_status, patch in Rust, write back atomically.
+        // This avoids complex nested JSON_SET SQL that varies by row count.
+        let row = sqlx::query("SELECT sm_status FROM entries WHERE fid = ?")
+            .bind(fid_bin.as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+
+        let sm_bytes: Option<Vec<u8>> = row.try_get("sm_status")?;
+        let mut sm: serde_json::Value = match sm_bytes {
+            Some(b) if !b.is_empty() => serde_json::from_slice(&b)?,
+            _ => serde_json::json!({}),
+        };
+
+        // Ensure sm_status.xattr sub-object exists
+        if sm.get("xattr").is_none() {
+            sm["xattr"] = serde_json::json!({});
+        }
+        let xattr = sm["xattr"].as_object_mut().expect("xattr is object");
+
+        for key in clear_keys {
+            xattr.remove(key);
+        }
+        for (k, v) in tags {
+            xattr.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
+
+        let sm_json = serde_json::to_string(&sm)?;
+        sqlx::query("UPDATE entries SET sm_status = ? WHERE fid = ?")
+            .bind(&sm_json)
+            .bind(fid_bin.as_slice())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Never sweeps directories (they're handled by the scanner
     /// distinctly) and caps work at `limit` rows per call. Call
     /// repeatedly until the returned count is zero.

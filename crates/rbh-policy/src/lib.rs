@@ -1,28 +1,31 @@
-//! Policy engine — bridges predicates to scheduler-rs for timed execution.
+//! Policy engine — two-tier classification + action architecture.
 //!
-//! A [`PolicyDef`] is a declarative struct (stored as JSON in MariaDB) that
-//! combines a scope predicate, first-match rules, action parameters, and
-//! trigger specifications. Each trigger maps 1:1 to a scheduler-rs schedule;
-//! [`reconcile_triggers`] handles the create/delete lifecycle.
+//! **Layer 1 — Classifiers** (`/api/classifiers`):
+//! Write tag key-value pairs into `entries.sm_status.xattr.*` based on file
+//! attributes. Driven by periodic scheduler-rs runs and Lustre changelog events.
 //!
-//! At fire time, [`PolicyRunTask`] loads the definition, queries candidates
-//! from `rbh-entry-store` via SQL pushdown, evaluates rules in-memory, and
-//! dispatches matched entries to action executors (stubbed until `rbh-actions`).
+//! **Layer 2 — Action Policies** (`/api/policies`):
+//! Filter entries by tags (`match_tags`) and execute a single action kind.
+//! All attribute-based logic lives in classifiers; policies only reference tags.
 
+pub mod classifier;
 pub mod model;
 pub mod ratelimit;
 pub mod reconcile;
 pub mod store;
 pub mod task;
+pub mod trigger_parser;
 
+pub use classifier::{ClassifierDef, ClassifierRow, ClassifierRule, ClassifierStore, evaluate_classifier, parse_when};
 pub use model::{
-    ActionParams, FileClassDef, HsmParams, LruSortAttr, PolicyDef, PolicyKind, PolicyRow, RateLimit, RetryParams, Rule,
-    TriggerSpec, WindowModeSpec, compose_scope_with_ignores,
+    ActionOpts, AlertParams, CmdParams, HsmParams, LruSortAttr, PolicyDef, PolicyKind, PolicyRow, RateLimit,
+    RetryParams, TriggerSpec, WindowModeSpec,
 };
 pub use reconcile::reconcile_triggers;
 pub use store::PolicyStore;
 pub use task::TargetFilter;
 pub use task::{PolicyRunTask, PolicyRuntime, init_runtime};
+pub use trigger_parser::parse_trigger;
 
 /// Errors produced by the policy layer.
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +40,8 @@ pub enum PolicyError {
     Migration(String),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("store error: {0}")]
+    Store(String),
     #[error("invalid trigger: {0}")]
     InvalidTrigger(String),
     #[error("scheduler error: {0}")]

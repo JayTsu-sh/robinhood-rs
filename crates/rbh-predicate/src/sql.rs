@@ -147,6 +147,29 @@ fn build(pred: &Predicate, params: &mut Vec<SqlParam>) -> String {
             let inner_sql = build(inner, params);
             format!("NOT ({})", inner_sql)
         }
+
+        Predicate::Tags { match_tags } => {
+            if match_tags.is_empty() {
+                return "1=1".to_string();
+            }
+            // Expand to AND(Xattr(k1=v1), Xattr(k2=v2), …) — sort keys for determinism.
+            let mut keys: Vec<&String> = match_tags.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let json_path = format!("$.xattr.{k}");
+                    params.push(SqlParam::Str(json_path));
+                    params.push(SqlParam::Str(match_tags[*k].clone()));
+                    "JSON_UNQUOTE(JSON_EXTRACT(sm_status, ?)) = ?".to_string()
+                })
+                .collect();
+            if parts.len() == 1 {
+                parts.into_iter().next().unwrap()
+            } else {
+                format!("({})", parts.join(" AND "))
+            }
+        }
     }
 }
 

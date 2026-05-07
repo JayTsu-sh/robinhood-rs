@@ -56,6 +56,32 @@ pub enum Command {
         dry_run: bool,
     },
 
+    /// List all classifiers.
+    #[command(name = "classifier-list")]
+    ClassifierList,
+
+    /// Show a classifier by ID.
+    #[command(name = "classifier-show")]
+    ClassifierShow {
+        /// Classifier ID.
+        id: u64,
+    },
+
+    /// Create a classifier from a JSON definition file or stdin.
+    #[command(name = "classifier-create")]
+    ClassifierCreate {
+        /// Path to JSON file with ClassifierDef, or "-" to read from stdin.
+        #[arg(long, default_value = "-")]
+        file: String,
+    },
+
+    /// Delete a classifier by ID.
+    #[command(name = "classifier-delete")]
+    ClassifierDelete {
+        /// Classifier ID.
+        id: u64,
+    },
+
     /// Show entry catalog count.
     Status,
 
@@ -284,6 +310,50 @@ pub async fn run() -> Result<()> {
                 anyhow::bail!("server {status}: {out}");
             }
             println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Command::ClassifierList => {
+            let resp = client.get(format!("{}/api/classifiers", cli.api_url)).send().await?;
+            let out: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Command::ClassifierShow { id } => {
+            let resp = client
+                .get(format!("{}/api/classifiers/{id}", cli.api_url))
+                .send()
+                .await?;
+            let out: serde_json::Value = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Command::ClassifierCreate { file } => {
+            let body = if file == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&file)?
+            };
+            let resp = client
+                .post(format!("{}/api/classifiers", cli.api_url))
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await?;
+            let status = resp.status();
+            let out: serde_json::Value = resp.json().await?;
+            if !status.is_success() {
+                anyhow::bail!("server {status}: {out}");
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Command::ClassifierDelete { id } => {
+            let resp = client
+                .delete(format!("{}/api/classifiers/{id}", cli.api_url))
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("delete failed: {}", resp.status());
+            }
+            println!("classifier {id} deleted");
         }
         Command::Status => {
             let resp = client.get(format!("{}/api/entries/count", cli.api_url)).send().await?;

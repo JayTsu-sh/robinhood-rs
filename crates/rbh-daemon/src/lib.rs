@@ -43,6 +43,12 @@ pub async fn run() -> anyhow::Result<()> {
         .check_schema()
         .await
         .context("policy schema check failed")?;
+    let classifier_store = rbh_policy::ClassifierStore::new(pool.clone());
+
+    // Load classifier cache for changelog-driven classification.
+    let classifier_cache: std::sync::Arc<tokio::sync::RwLock<Vec<rbh_policy::ClassifierRow>>> = std::sync::Arc::new(
+        tokio::sync::RwLock::new(classifier_store.list().await.unwrap_or_default()),
+    );
     tracing::info!("database migrations complete");
 
     // 4. Initial fs-scan if catalog is empty.
@@ -92,8 +98,16 @@ pub async fn run() -> anyhow::Result<()> {
                     let ingest_store = entry_store.clone();
                     let ingest_mount = PathBuf::from(&mount_path);
                     let ingest_cancel = daemon_cancel.clone();
+                    let classifier_cache_cl = classifier_cache.clone();
                     tokio::spawn(async move {
-                        changelog::ingest_loop(handle, ingest_store, ingest_mount, ingest_cancel).await;
+                        changelog::ingest_loop(
+                            handle,
+                            ingest_store,
+                            ingest_mount,
+                            ingest_cancel,
+                            classifier_cache_cl.clone(),
+                        )
+                        .await;
                     });
                 }
                 Err(e) => {
@@ -222,6 +236,7 @@ pub async fn run() -> anyhow::Result<()> {
     // 7. Build router with scheduler for trigger reconciliation.
     let state = rbh_api::AppState {
         policy_store,
+        classifier_store,
         entry_store,
         scheduler: Some(scheduler.clone()),
         scans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -468,9 +483,16 @@ async fn reconcile_all_policies(scheduler: &Scheduler, policy_store: &rbh_policy
         Ok(policies) => {
             for policy in &policies {
                 if policy.enabled {
-                    match rbh_policy::reconcile_triggers(scheduler, policy.id, &policy.definition).await {
+                    match rbh_policy::reconcile_triggers(
+                        scheduler,
+                        policy.id,
+                        &policy.definition.trigger,
+                        policy.definition.enabled,
+                    )
+                    .await
+                    {
                         Ok(ids) => {
-                            tracing::info!(policy_id = policy.id, schedules = ids.len(), "policy reconciled");
+                            tracing::info!(policy_id = policy.id, scheduled = ids.is_some(), "policy reconciled");
                         }
                         Err(e) => {
                             tracing::error!(

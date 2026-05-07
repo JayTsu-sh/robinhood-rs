@@ -19,6 +19,16 @@ use crate::{
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/classifiers",
+            post(crate::classifier_handlers::create_classifier).get(crate::classifier_handlers::list_classifiers),
+        )
+        .route(
+            "/classifiers/{id}",
+            get(crate::classifier_handlers::get_classifier)
+                .put(crate::classifier_handlers::update_classifier)
+                .delete(crate::classifier_handlers::delete_classifier),
+        )
         .route("/policies", post(create_policy).get(list_policies))
         .route(
             "/policies/{id}",
@@ -110,7 +120,8 @@ async fn create_policy(
     let id = state.policy_store.create(&body.definition).await?;
     // Reconcile triggers → scheduler-rs schedules.
     if let Some(ref scheduler) = state.scheduler
-        && let Err(e) = rbh_policy::reconcile_triggers(scheduler, id, &body.definition).await
+        && let Err(e) =
+            rbh_policy::reconcile_triggers(scheduler, id, &body.definition.trigger, body.definition.enabled).await
     {
         tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
     }
@@ -135,7 +146,8 @@ async fn update_policy(
 ) -> Result<StatusCode, ApiError> {
     state.policy_store.update(id, &body.definition).await?;
     if let Some(ref scheduler) = state.scheduler
-        && let Err(e) = rbh_policy::reconcile_triggers(scheduler, id, &body.definition).await
+        && let Err(e) =
+            rbh_policy::reconcile_triggers(scheduler, id, &body.definition.trigger, body.definition.enabled).await
     {
         tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
     }
@@ -210,7 +222,7 @@ async fn run_policy_now(
 #[tracing::instrument(skip(state))]
 async fn delete_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
     if let Some(ref scheduler) = state.scheduler {
-        let _ = rbh_policy::reconcile::remove_policy_schedules(scheduler, id).await;
+        let _ = rbh_policy::reconcile::remove_policy_schedule(scheduler, id).await;
     }
     state.policy_store.delete(id).await?;
     Ok(StatusCode::NO_CONTENT)

@@ -12,6 +12,7 @@
 //! No auth layer (trusted microservice). Uses `tower-http::TraceLayer` for
 //! per-request spans with method/path/status/latency.
 
+mod classifier_handlers;
 mod handlers;
 pub mod state;
 

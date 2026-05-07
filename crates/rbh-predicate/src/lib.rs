@@ -56,6 +56,12 @@ pub enum Predicate {
     /// MySQL's `JSON_UNQUOTE(JSON_EXTRACT(...))` so the comparison is
     /// insensitive to JSON escape form.
     HsmStateEq { state: String },
+    /// Match entries where ALL tag key-value pairs are present in
+    /// `sm_status.xattr`. Shorthand for `AND(Xattr(k1=v1), Xattr(k2=v2), …)`.
+    /// An empty `match_tags` map is equivalent to `True`.
+    Tags {
+        match_tags: std::collections::HashMap<String, String>,
+    },
     /// Always true — useful as default rule condition.
     True,
     /// Always false.

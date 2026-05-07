@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use rbh_policy::{ActionParams, LruSortAttr, PolicyDef, PolicyKind, TriggerSpec};
+use rbh_policy::{ActionOpts, LruSortAttr, PolicyDef, PolicyKind};
 use rbh_predicate::{CmpOp, Field, Predicate, Value};
 
 /// Output of the importer for a single config file.
@@ -166,7 +166,7 @@ fn parse_policy(name: &str, body: &str, fileclasses: &HashMap<String, Predicate>
     let mut warns = Vec::new();
 
     // scope { ... }  OR  scope = <fileclass>;
-    let scope = if let Some((_, b)) = blocks.iter().find(|(h, _)| h.trim() == "scope") {
+    let _scope = if let Some((_, b)) = blocks.iter().find(|(h, _)| h.trim() == "scope") {
         parse_expression(b)?
     } else if let Some(v) = kvs.get("scope") {
         let name = v.trim().trim_end_matches(';').trim();
@@ -227,26 +227,25 @@ fn parse_policy(name: &str, body: &str, fileclasses: &HashMap<String, Predicate>
     // back to a daily interval if none was found.
     let triggers = parse_triggers(&blocks, &mut warns);
 
-    let default_action = ActionParams {
-        lru_sort,
-        ..ActionParams::default()
-    };
+    let trigger_str = triggers_to_string(&triggers, &mut warns);
 
     let def = PolicyDef {
         name: name.to_string(),
         kind,
-        scope,
-        rules: vec![],
-        default_action,
-        triggers,
-        ignore_fileclass: vec![],
+        match_tags: std::collections::HashMap::new(), // populated by user after import
+        trigger: trigger_str,
+        action: ActionOpts {
+            lru_sort,
+            ..ActionOpts::default()
+        },
         enabled: true,
     };
 
     Ok((def, warns))
 }
 
-fn parse_triggers(blocks: &[(String, String)], warns: &mut Vec<String>) -> Vec<TriggerSpec> {
+/// Parse trigger blocks from the config into TriggerSpec values (internal only).
+fn parse_triggers(blocks: &[(String, String)], warns: &mut Vec<String>) -> Vec<rbh_policy::TriggerSpec> {
     let mut out = Vec::new();
     for (hdr, body) in blocks {
         if !hdr.trim().ends_with("_trigger") && hdr.trim() != "trigger" {
@@ -262,10 +261,10 @@ fn parse_triggers(blocks: &[(String, String)], warns: &mut Vec<String>) -> Vec<T
             .and_then(|v| parse_duration_secs(v.trim().trim_end_matches(';')))
             .unwrap_or(86_400);
         match kind.as_str() {
-            "scheduled" | "periodic" => out.push(TriggerSpec::Interval { secs: check }),
+            "scheduled" | "periodic" => out.push(rbh_policy::TriggerSpec::Interval { secs: check }),
             "cron" => {
                 if let Some(expr) = kvs.get("expression") {
-                    out.push(TriggerSpec::Cron {
+                    out.push(rbh_policy::TriggerSpec::Cron {
                         expression: expr.trim().trim_matches('"').to_string(),
                     });
                 }
@@ -274,6 +273,27 @@ fn parse_triggers(blocks: &[(String, String)], warns: &mut Vec<String>) -> Vec<T
         }
     }
     out
+}
+
+/// Convert parsed TriggerSpec list to the new human-readable trigger string.
+fn triggers_to_string(triggers: &[rbh_policy::TriggerSpec], warns: &mut Vec<String>) -> String {
+    match triggers.first() {
+        Some(rbh_policy::TriggerSpec::Interval { secs }) => {
+            if secs % 3600 == 0 {
+                format!("{}h", secs / 3600)
+            } else if secs % 60 == 0 {
+                format!("{}m", secs / 60)
+            } else {
+                format!("{secs}s")
+            }
+        }
+        Some(rbh_policy::TriggerSpec::Cron { expression }) => format!("cron:{expression}"),
+        Some(other) => {
+            warns.push(format!("trigger {other:?} converted to daily fallback"));
+            "24h".to_string()
+        }
+        None => "24h".to_string(),
+    }
 }
 
 /// Crude expression parser: handles AND (`and`, `&&`) of simple atoms.
@@ -521,7 +541,7 @@ mod tests {
         let p = &r.policies[0];
         assert_eq!(p.name, "lhsm_archive");
         assert_eq!(p.kind, PolicyKind::HsmArchive);
-        assert_eq!(p.default_action.lru_sort, Some(LruSortAttr::Mtime));
+        assert_eq!(p.action.lru_sort, Some(LruSortAttr::Mtime));
     }
 
     #[test]
