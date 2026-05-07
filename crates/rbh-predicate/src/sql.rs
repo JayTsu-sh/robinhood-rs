@@ -86,6 +86,23 @@ fn build(pred: &Predicate, params: &mut Vec<SqlParam>) -> String {
             "name LIKE ?".to_string()
         }
 
+        Predicate::InameLike { pattern } => {
+            params.push(SqlParam::Str(pattern.clone()));
+            "LOWER(name) LIKE LOWER(?)".to_string()
+        }
+
+        Predicate::NameRegex { pattern } => {
+            params.push(SqlParam::Str(pattern.clone()));
+            "name REGEXP ?".to_string()
+        }
+
+        Predicate::Xattr { key, cmp, value } => {
+            let json_path = format!("$.xattr.{key}");
+            params.push(SqlParam::Str(json_path.clone()));
+            params.push(value_to_param(value));
+            format!("JSON_UNQUOTE(JSON_EXTRACT(sm_status, ?)) {} ?", cmp.sql())
+        }
+
         Predicate::InPool { pool } => {
             params.push(SqlParam::Str(pool.clone()));
             "pool_name = ?".to_string()
@@ -304,6 +321,52 @@ mod tests {
     fn on_ost_empty_is_false() {
         let pred = Predicate::OnOst { osts: vec![] };
         assert_eq!(to_sql(&pred).0, "1=0");
+    }
+
+    #[test]
+    fn iname_like_lowercases_both_sides() {
+        let p = Predicate::InameLike {
+            pattern: "%.CSV".to_string(),
+        };
+        let (sql, params) = to_sql(&p);
+        assert_eq!(sql, "LOWER(name) LIKE LOWER(?)");
+        assert_eq!(params, vec![SqlParam::Str("%.CSV".to_string())]);
+    }
+
+    #[test]
+    fn name_regex_generates_regexp() {
+        let p = Predicate::NameRegex {
+            pattern: r"^report_\d+".to_string(),
+        };
+        let (sql, params) = to_sql(&p);
+        assert_eq!(sql, "name REGEXP ?");
+        assert_eq!(params, vec![SqlParam::Str(r"^report_\d+".to_string())]);
+    }
+
+    #[test]
+    fn xattr_generates_json_extract_with_cmp() {
+        let p = Predicate::Xattr {
+            key: "user.tier".to_string(),
+            cmp: CmpOp::Eq,
+            value: Value::Str("hot".to_string()),
+        };
+        let (sql, params) = to_sql(&p);
+        assert!(sql.contains("JSON_UNQUOTE(JSON_EXTRACT(sm_status, ?))"), "sql={sql}");
+        assert!(sql.contains("= ?"), "sql={sql}");
+        assert_eq!(params[0], SqlParam::Str("$.xattr.user.tier".to_string()));
+        assert_eq!(params[1], SqlParam::Str("hot".to_string()));
+    }
+
+    #[test]
+    fn depth_field_in_cmp() {
+        let p = Predicate::Cmp {
+            field: Field::Depth,
+            cmp: CmpOp::Le,
+            value: Value::Num(3),
+        };
+        let (sql, params) = to_sql(&p);
+        assert_eq!(sql, "depth <= ?");
+        assert_eq!(params, vec![SqlParam::Num(3)]);
     }
 
     #[test]

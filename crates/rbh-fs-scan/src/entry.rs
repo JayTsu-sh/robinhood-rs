@@ -20,7 +20,9 @@ use crate::ScanError;
 ///
 /// `parent_fid` is passed in from the walk (parent directory's FID).
 #[tracing::instrument(skip(lustre, parent_fid), fields(path = %path.display()))]
-pub fn build_entry(lustre: &LustreApi, path: &Path, parent_fid: Option<LuFid>) -> Result<EntryRow, ScanError> {
+pub fn build_entry(
+    lustre: &LustreApi, path: &Path, parent_fid: Option<LuFid>, depth: u32,
+) -> Result<EntryRow, ScanError> {
     // 1. Stat
     let meta = std::fs::symlink_metadata(path).map_err(|e| ScanError::Io {
         path: path.display().to_string(),
@@ -71,6 +73,7 @@ pub fn build_entry(lustre: &LustreApi, path: &Path, parent_fid: Option<LuFid>) -
         pool_name,
         sm_status: serde_json::json!({}),
         last_seen: now,
+        depth,
     })
 }
 

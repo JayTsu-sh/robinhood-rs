@@ -516,6 +516,7 @@ async fn stat_entry_by_fid(
             pool_name,
             sm_status: serde_json::json!({}),
             last_seen: now_secs(),
+            depth: 0,
         })
     })
     .await??;

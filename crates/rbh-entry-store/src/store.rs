@@ -103,8 +103,8 @@ impl EntryStore {
         sqlx::query(
             r"INSERT INTO entries
                 (fid, parent_fid, name, kind, size, blocks, uid, gid, projid, mode, nlink,
-                 atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen, depth)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               ON DUPLICATE KEY UPDATE
                 parent_fid   = VALUES(parent_fid),
                 name         = VALUES(name),
@@ -123,7 +123,8 @@ impl EntryStore {
                 stripe_size  = VALUES(stripe_size),
                 pool_name    = VALUES(pool_name),
                 sm_status    = VALUES(sm_status),
-                last_seen    = VALUES(last_seen)",
+                last_seen    = VALUES(last_seen),
+                depth        = VALUES(depth)",
         )
         .bind(fid_bin.as_slice())
         .bind(parent_bin.as_ref().map(|b| b.as_slice()))
@@ -144,6 +145,7 @@ impl EntryStore {
         .bind(&entry.pool_name)
         .bind(&sm_json)
         .bind(entry.last_seen)
+        .bind(entry.depth)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -155,7 +157,7 @@ impl EntryStore {
         let fid_bin = fid_codec::encode(fid);
         let row = sqlx::query(
             "SELECT fid, parent_fid, name, kind, size, blocks, uid, gid, projid, mode, nlink,
-                    atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen
+                    atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen, depth
              FROM entries WHERE fid = ?",
         )
         .bind(fid_bin.as_slice())
@@ -224,8 +226,8 @@ impl EntryStore {
             sqlx::query(
                 r"INSERT INTO entries
                     (fid, parent_fid, name, kind, size, blocks, uid, gid, projid, mode, nlink,
-                     atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen, depth)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                   ON DUPLICATE KEY UPDATE
                     parent_fid   = VALUES(parent_fid),
                     name         = VALUES(name),
@@ -244,7 +246,8 @@ impl EntryStore {
                     stripe_size  = VALUES(stripe_size),
                     pool_name    = VALUES(pool_name),
                     sm_status    = VALUES(sm_status),
-                    last_seen    = VALUES(last_seen)",
+                    last_seen    = VALUES(last_seen),
+                    depth        = VALUES(depth)",
             )
             .bind(fid_bin.as_slice())
             .bind(parent_bin.as_ref().map(|b| b.as_slice()))
@@ -265,6 +268,7 @@ impl EntryStore {
             .bind(&entry.pool_name)
             .bind(&sm_json)
             .bind(entry.last_seen)
+            .bind(entry.depth)
             .execute(&mut *tx)
             .await?;
         }
@@ -326,7 +330,7 @@ impl EntryStore {
         let sql = format!(
             "SELECT fid, parent_fid, name, kind, size, blocks, uid, gid, projid, \
              mode, nlink, atime, mtime, ctime, stripe_count, stripe_size, \
-             pool_name, sm_status, last_seen \
+             pool_name, sm_status, last_seen, depth \
              FROM entries WHERE {where_clause}{order_clause} LIMIT ? OFFSET ?"
         );
         let mut query = sqlx::query(&sql);
@@ -658,7 +662,7 @@ impl EntryStore {
     pub async fn dump_page(&self, after: Option<LuFid>, limit: u64) -> Result<Vec<EntryRow>> {
         let sql = "SELECT fid, parent_fid, name, kind, size, blocks, uid, gid, projid, \
                    mode, nlink, atime, mtime, ctime, stripe_count, stripe_size, \
-                   pool_name, sm_status, last_seen \
+                   pool_name, sm_status, last_seen, depth \
                    FROM entries WHERE fid > ? ORDER BY fid LIMIT ?";
         let lo = after.unwrap_or(LuFid::ZERO);
         let lo_bin = crate::fid_codec::encode(&lo);
@@ -775,6 +779,7 @@ fn row_to_entry(row: &sqlx::mysql::MySqlRow) -> Result<EntryRow> {
         pool_name: row.try_get("pool_name")?,
         sm_status,
         last_seen: row.try_get("last_seen")?,
+        depth: row.try_get::<u32, _>("depth").unwrap_or(0),
     })
 }
 

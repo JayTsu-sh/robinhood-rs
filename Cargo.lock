@@ -1890,6 +1890,7 @@ dependencies = [
  "bytes",
  "lustre-api",
  "rbh-entry-store",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",

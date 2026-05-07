@@ -56,6 +56,10 @@ pub struct EntryRow {
     pub pool_name: Option<String>,
     pub sm_status: serde_json::Value,
     pub last_seen: i64,
+    /// Directory depth from filesystem root (0 = root, 1 = immediate child, …).
+    /// Set to 0 for entries ingested via changelog (depth unknown without path traversal);
+    /// populated correctly by the initial fs-scan.
+    pub depth: u32,
 }
 
 /// Round-trip `bytes::Bytes` through serde as either a UTF-8 string or
@@ -132,6 +136,7 @@ mod tests {
             pool_name: Some("pool1".into()),
             sm_status: serde_json::json!({"hsm_state": "archived"}),
             last_seen: 4,
+            depth: 0,
         }
     }
 

@@ -11,6 +11,7 @@ rbh-entry-store = { path = "../rbh-entry-store" }
 lustre-api = { path = "../lustre-api" }
 
 bytes = { workspace = true }
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

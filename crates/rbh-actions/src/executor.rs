@@ -685,6 +685,7 @@ mod tests {
             pool_name: None,
             sm_status: serde_json::json!({}),
             last_seen: 1_775_955_820,
+            depth: 3,
         }
     }
 

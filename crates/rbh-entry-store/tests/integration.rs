@@ -60,6 +60,7 @@ fn make_entry(seq: u64, oid: u32, name: &str) -> EntryRow {
         pool_name: None,
         sm_status: serde_json::json!({}),
         last_seen: 1_775_955_820,
+        depth: 1,
     }
 }
 

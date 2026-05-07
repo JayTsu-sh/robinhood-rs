@@ -33,10 +33,18 @@ pub enum Predicate {
     Not { inner: Box<Predicate> },
     /// Compare a field against a value.
     Cmp { field: Field, cmp: CmpOp, value: Value },
-    /// SQL LIKE on the entry name. Pattern uses `%` and `_` wildcards.
-    /// Callers must escape literal `%` / `_` in user-supplied input before
-    /// constructing this variant (this is a raw LIKE pattern, not a plain string).
+    /// Case-sensitive SQL LIKE on the entry name. Pattern uses `%` and `_` wildcards.
+    /// Callers must escape literal `%` / `_` in user-supplied input.
     NameLike { pattern: String },
+    /// Case-insensitive name match. Equivalent to `LOWER(name) LIKE LOWER(pattern)`.
+    /// Use for shell-style glob patterns where case should be ignored.
+    InameLike { pattern: String },
+    /// POSIX extended-regex match on the entry name (`name REGEXP pattern` in MariaDB).
+    /// In-memory evaluation uses the `regex` crate (same ERE syntax).
+    NameRegex { pattern: String },
+    /// Match an extended attribute stored under `sm_status.xattr.<key>`.
+    /// Assumes `sm_status` JSON has shape `{"xattr": {"user.tier": "hot", …}}`.
+    Xattr { key: String, cmp: CmpOp, value: Value },
     /// Match entries whose pool_name equals the given string.
     InPool { pool: String },
     /// Match entries with a stripe on any of the given OST indices.
@@ -72,6 +80,9 @@ pub enum Field {
     StripeCount,
     StripeSize,
     LastSeen,
+    /// Directory depth from filesystem root (0 = root, 1 = first level, …).
+    /// Populated by the initial fs-scan; changelog-ingested entries default to 0.
+    Depth,
 }
 
 impl Field {
@@ -92,6 +103,7 @@ impl Field {
             Self::StripeCount => "stripe_count",
             Self::StripeSize => "stripe_size",
             Self::LastSeen => "last_seen",
+            Self::Depth => "depth",
         }
     }
 }

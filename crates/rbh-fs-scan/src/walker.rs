@@ -241,7 +241,7 @@ async fn process_directory(state: &WalkState, dir_path: &Path, depth: usize, par
     state.progress.dirs_walked.fetch_add(1, Ordering::Relaxed);
 
     // First, build an entry for the directory itself.
-    let dir_fid = match build_entry_blocking(&state.lustre, dir_path, parent_fid).await {
+    let dir_fid = match build_entry_blocking(&state.lustre, dir_path, parent_fid, depth as u32).await {
         Ok(entry) => {
             let fid = entry.fid;
             state.progress.entries_scanned.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +313,7 @@ async fn process_directory(state: &WalkState, dir_path: &Path, depth: usize, par
             }
         } else {
             // Non-directory: stat, resolve FID, emit entry.
-            match build_entry_blocking(&state.lustre, &child_path, dir_fid).await {
+            match build_entry_blocking(&state.lustre, &child_path, dir_fid, depth as u32 + 1).await {
                 Ok(row) => {
                     // Incremental scan: drop entries older than the cutoff.
                     // Directories are kept (their children may be newer);
@@ -343,11 +343,11 @@ async fn process_directory(state: &WalkState, dir_path: &Path, depth: usize, par
 
 /// Run `build_entry` on a blocking thread (stat + FFI are sync).
 async fn build_entry_blocking(
-    lustre: &LustreApi, path: &Path, parent_fid: Option<LuFid>,
+    lustre: &LustreApi, path: &Path, parent_fid: Option<LuFid>, depth: u32,
 ) -> Result<EntryRow, ScanError> {
     let lustre = *lustre; // Copy (LustreApi is Copy)
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || build_entry(&lustre, &path, parent_fid))
+    tokio::task::spawn_blocking(move || build_entry(&lustre, &path, parent_fid, depth))
         .await
         .map_err(|e| ScanError::Io {
             path: String::new(),

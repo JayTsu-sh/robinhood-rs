@@ -4,6 +4,7 @@
 //! policy preview (dry-run) without hitting the database.
 
 use rbh_entry_store::model::EntryRow;
+use regex::Regex;
 
 use crate::{CmpOp, Field, Predicate, Value};
 
@@ -27,6 +28,39 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
             // Match directly on bytes — avoids UTF-8 lossy replacement artifacts
             // on filenames with raw bytes (valid on Lustre).
             like_match(&entry.name, pattern.as_bytes())
+        }
+
+        Predicate::InameLike { pattern } => {
+            // Case-insensitive: lowercase both sides (ASCII fold; Lustre filenames
+            // are almost always ASCII/UTF-8).
+            let name_lower = entry.name.to_ascii_lowercase();
+            let pat_lower = pattern.to_lowercase();
+            like_match(&name_lower, pat_lower.as_bytes())
+        }
+
+        Predicate::NameRegex { pattern } => {
+            // Compile on each call; patterns are typically short and evaluation
+            // is rare in in-memory paths (changelog ingest). If this becomes a
+            // hotspot, add a lazily-initialised cache.
+            let name = match std::str::from_utf8(&entry.name) {
+                Ok(s) => s,
+                Err(_) => return false, // non-UTF-8 filenames don't match regex
+            };
+            Regex::new(pattern).map(|r| r.is_match(name)).unwrap_or(false)
+        }
+
+        Predicate::Xattr { key, cmp, value } => {
+            let xattr_val = entry.sm_status.get("xattr").and_then(|x| x.get(key));
+            match (xattr_val, value) {
+                (Some(serde_json::Value::String(s)), Value::Str(rhs)) => {
+                    compare(&Value::Str(s.clone()), cmp, &Value::Str(rhs.clone()))
+                }
+                (Some(serde_json::Value::Number(n)), Value::Num(rhs)) => {
+                    let lhs = n.as_i64().unwrap_or(0);
+                    compare(&Value::Num(lhs), cmp, &Value::Num(*rhs))
+                }
+                _ => false,
+            }
         }
 
         Predicate::InPool { pool } => entry.pool_name.as_deref() == Some(pool.as_str()),
@@ -65,6 +99,7 @@ fn extract_field(field: &Field, entry: &EntryRow) -> Value {
         Field::StripeCount => Value::Num(entry.stripe_count.unwrap_or(0) as i64),
         Field::StripeSize => Value::Num(entry.stripe_size.unwrap_or(0) as i64),
         Field::LastSeen => Value::Num(entry.last_seen),
+        Field::Depth => Value::Num(entry.depth as i64),
     }
 }
 
@@ -151,6 +186,7 @@ mod tests {
             pool_name: Some("ssd".to_string()),
             sm_status: serde_json::json!({}),
             last_seen: 1_775_955_820,
+            depth: 2,
         }
     }
 
@@ -319,6 +355,102 @@ mod tests {
             value: Value::Num(1), // Directory
         };
         assert!(matches(&pred, &entry));
+    }
+
+    #[test]
+    fn matches_iname_like() {
+        let entry = test_entry(); // name = "report_2026.csv"
+        assert!(matches(
+            &Predicate::InameLike {
+                pattern: "REPORT_%.CSV".to_string()
+            },
+            &entry
+        ));
+        assert!(matches(
+            &Predicate::InameLike {
+                pattern: "%.CSV".to_string()
+            },
+            &entry
+        ));
+        assert!(!matches(
+            &Predicate::InameLike {
+                pattern: "%.TXT".to_string()
+            },
+            &entry
+        ));
+    }
+
+    #[test]
+    fn matches_name_regex() {
+        let entry = test_entry(); // name = "report_2026.csv"
+        assert!(matches(
+            &Predicate::NameRegex {
+                pattern: r"^report_\d+\.csv$".to_string()
+            },
+            &entry
+        ));
+        assert!(!matches(
+            &Predicate::NameRegex {
+                pattern: r"^backup_".to_string()
+            },
+            &entry
+        ));
+        // Invalid regex → false (no panic)
+        assert!(!matches(
+            &Predicate::NameRegex {
+                pattern: "[invalid".to_string()
+            },
+            &entry
+        ));
+    }
+
+    #[test]
+    fn matches_xattr_string() {
+        let mut entry = test_entry();
+        entry.sm_status = serde_json::json!({"xattr": {"user.tier": "hot"}});
+        assert!(matches(
+            &Predicate::Xattr {
+                key: "user.tier".to_string(),
+                cmp: CmpOp::Eq,
+                value: Value::Str("hot".to_string()),
+            },
+            &entry
+        ));
+        assert!(!matches(
+            &Predicate::Xattr {
+                key: "user.tier".to_string(),
+                cmp: CmpOp::Eq,
+                value: Value::Str("cold".to_string()),
+            },
+            &entry
+        ));
+        // Missing key → false
+        assert!(!matches(
+            &Predicate::Xattr {
+                key: "user.missing".to_string(),
+                cmp: CmpOp::Eq,
+                value: Value::Str("hot".to_string()),
+            },
+            &entry
+        ));
+    }
+
+    #[test]
+    fn matches_depth_field() {
+        let mut entry = test_entry();
+        entry.depth = 3;
+        let deep = Predicate::Cmp {
+            field: Field::Depth,
+            cmp: CmpOp::Gt,
+            value: Value::Num(2),
+        };
+        let shallow = Predicate::Cmp {
+            field: Field::Depth,
+            cmp: CmpOp::Le,
+            value: Value::Num(1),
+        };
+        assert!(matches(&deep, &entry));
+        assert!(!matches(&shallow, &entry));
     }
 
     #[test]

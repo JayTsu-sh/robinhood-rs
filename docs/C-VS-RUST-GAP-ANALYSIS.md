@@ -1,7 +1,8 @@
-# robinhood-rs vs robinhood (C) — 功能缺口分析与 P0 实施记录
+# robinhood-rs vs robinhood (C) — 功能缺口分析与实施记录
 
-> 最初分析日期：2026-04-23
-> 基础版本：C 版 `/root/lustre/robinhood`（74k 行）vs Rust 版 `/root/rust/github/robinhood-rs`（分析时 8.1k 行）
+> 最初分析日期：2026-04-23 | 最后更新：2026-04-28
+> 基础版本：C 版 `/root/lustre/robinhood`（74k 行）vs Rust 版 `/root/rust/github/robinhood-rs`
+> Rust 版规模：2026-04-23 约 8.1k 行 → 2026-04-28 约 17.5k 行（13 个 crate 全部真实实现）
 
 ## 目录
 
@@ -11,26 +12,32 @@
 4. [优先级分组](#优先级分组)
 5. [P0 详细说明](#p0-详细说明)
 6. [P0 实施结果](#p0-实施结果)
-7. [遗留与后续方向](#遗留与后续方向)
+7. [P1 实施结果](#p1-实施结果)
+8. [遗留与后续方向](#遗留与后续方向)
 
 ---
 
 ## 现状覆盖概览
 
-**Rust 已实现**：
+**Rust 已实现（2026-04-28 快照，13 个 crate，~17.5k 行）**：
 
 | 领域 | crate | 状态 |
 |---|---|---|
-| Lustre FFI（FID / stripe / HSM / MDT / changelog） | `lustre-api` | 基本完整 |
-| Changelog 监听 + 去重 + 批处理 | `lustre-changelog` | 核心完整（多 MDT 并行支持） |
-| 实体目录（FID→元数据、硬链接、removed_entries） | `rbh-entry-store` | MariaDB 实现完整 |
-| 谓词树（SQL pushdown + 内存 eval） | `rbh-predicate` | 完整，含 `OnOst` EXISTS JOIN |
-| 初始扫描 | `rbh-fs-scan` | 完整 |
-| REST API（policy CRUD / entries count / entries query / reports / scans） | `rbh-api` | ~10 端点 |
-| 策略模型 + scheduler-rs 触发（时间 + 阈值） | `rbh-policy` | 触发 / 调和 / LRU / TargetFilter / ignore_fileclass |
-| 基本动作执行器 | `rbh-actions` | Purge / HsmArchive / HsmRelease |
+| Lustre FFI（FID / stripe / HSM / MDT / changelog） | `lustre-api` | 完整 |
+| Changelog 监听 + 去重 + 批处理 + 游标持久化 | `lustre-changelog` | 完整（多 MDT / EventAck / CursorStore） |
+| 实体目录（FID→元数据、硬链接、stripe_items、removed_entries、changelog_cursor） | `rbh-entry-store` | 完整（MariaDB，3 次迁移） |
+| 谓词树（SQL pushdown + 内存 eval） | `rbh-predicate` | 完整（11 variants，含 OnOst EXISTS JOIN） |
+| 初始扫描（并发、.rbh_ignore、mtime 过滤） | `rbh-fs-scan` | 完整 |
+| REST API（policy CRUD / entries / reports / scans / health / metrics） | `rbh-api` | ~15 端点 |
+| 策略引擎（PolicyDef/TriggerSpec/reconcile/ThresholdChecker） | `rbh-policy` | 完整（触发 / LRU / TargetFilter / ignore_fileclass / FileClassDef） |
+| 动作执行器（7 类） | `rbh-actions` | Purge / HsmArchive / HsmRelease / HsmRestore / HsmRemove / Backup / Cmd / Alert |
+| 守护进程编排（changelog 摄入 / HSM 轮询 / 信号 / systemd） | `rbh-daemon` | 完整 |
+| CLI 客户端（find / report / policy-run / status / health / undelete） | `rbh-cli` | 完整（HTTP-only，无 DB 直连） |
+| 可观测性（JSON/pretty log + SIGHUP reload） | `rbh-observability` | 完整 |
+| 配置文件导入（C `.conf` → PolicyDef JSON） | `rbh-config-import` | 完整（常见 pattern，非完整 yacc） |
+| 外部备份适配器（rbhext_tool 协议） | `rbh-backup` | 完整（subprocess + timeout + template） |
 
-整体覆盖占 C 版 **15–20%**，核心"changelog → DB → 时间/阈值触发 → 动作"通道通了。
+整体覆盖占 C 版 **约 35–40%**，核心"changelog → DB → 时间/阈值触发 → 动作"通道已完整闭环。
 
 ---
 
@@ -40,17 +47,17 @@
 
 | C 模块 | 功能 | Rust 状态 |
 |---|---|---|
-| `backup.c` (2827 行) | 备份 policy + `rbhext` 外部工具集成 | ❌ |
-| `lhsm.c` (1142 行) | 完整 HSM（archive/release/remove/restore tracking/hints） | ⚠️ 仅 archive/release 简化版 |
-| `alerter.c` | 告警 policy（邮件/脚本） | ❌（`Alert` 枚举项存在、执行器未实现） |
+| `backup.c` (2827 行) | 备份 policy + `rbhext` 外部工具集成 | ✅ `rbh-backup`（rbhext_tool 协议 + subprocess） |
+| `lhsm.c` (1142 行) | 完整 HSM（archive/release/remove/restore tracking/hints） | ⚠️ archive/release/restore/remove executor 已做，**hints/archive_id/retry/状态跟踪**缺失 |
+| `alerter.c` | 告警 policy（邮件/脚本） | ⚠️ `AlertExecutor` 已实现（webhook+log），**邮件 / 脚本**未做 |
 | `checker.c` | 文件内容校验（checksum） | ❌ |
 | `modeguard.c` | 权限监控 / 自动修正 | ❌ |
-| `shook.c` | shook 绑定 | ❌ |
-| `common_actions.c` | copy/move/hardlink/sendmail/log/cmd 通用动作 | ❌ |
-| `common_sched.c` | 公共调度器 | ⚠️ 语义不对等 |
-| `sched_ratelimit.c` | 动作级速率限制 | ❌ |
+| `shook.c` | shook 绑定（POSIX HSM） | ❌ |
+| `common_actions.c` | copy/move/hardlink/sendmail/log 通用动作 | ❌（`CmdExecutor` 覆盖 cmd，其余未实现） |
+| `common_sched.c` | 公共调度器 | ⚠️ 语义不对等（scheduler-rs 替代） |
+| `sched_ratelimit.c` | 动作级速率限制（每秒 N 动作 / 总带宽） | ❌ |
 | `basic.c` | 基础 state manager | ❌ |
-| 自定义脚本/外部命令动作 | `action = cmd(...)` DSL | ❌ |
+| `rmdir` 策略 | 空目录清理 PolicyKind | ❌（`PolicyKind` 有枚举项但无 executor） |
 
 Rust `ActionParams` 已含 `max_count / max_volume / timeout / nb_threads / lru_sort`；C 版还支持 pre/post 命令、重试、软/硬阈值、post-sched hooks、预过滤、classes。
 
@@ -58,15 +65,15 @@ Rust `ActionParams` 已含 `max_count / max_volume / timeout / nb_threads / lru_
 
 | C 二进制 | 功能 | Rust 状态 |
 |---|---|---|
-| `rbh_find` (1797 行) + printf 扩展 | 扩展 find，Lustre 属性 / `-printf` | ⚠️ 已实现核心子集（`rbh find`） |
-| `rbh_report` (3192 行) | 报告（topdirs/topusers/topsize/dump/OST） | ⚠️ 已实现子集（`rbh report`） |
-| `rbh_du` | Lustre-aware du | ❌ |
-| `rbh_diff` | 扫描与 DB 差异 | ❌ |
-| `rbh_import` | CSV/备份目录导入 | ❌ |
-| `rbh_rebind` | FID 绑定变更 | ❌ |
-| `rbh_recov` | 灾难恢复 | ❌ |
-| `rbh_undelete` | 恢复 `removed_entries` | ❌ |
-| `cmd_helpers.c` (守护进程模式) | `--scan/--check-thresholds/--run=policy/--dry-run/--target=...` | ⚠️ 阈值已做，其他运行模式未实现 |
+| `rbh_find` (1797 行) + printf 扩展 | 扩展 find，Lustre 属性 / `-printf` | ✅ `rbh find`（核心谓词 + --sort/--limit/--json）；`--printf/--exec` ❌ |
+| `rbh_report` (3192 行) | 报告（topdirs/topusers/topsize/dump/OST） | ✅ `rbh report`（top-size/top-users/top-groups/fs-info/oldest）；size-profile/dump/OST 分布 ❌ |
+| `rbh_du` | Lustre-aware du（按目录递归统计） | ❌ |
+| `rbh_diff` | 扫描与 DB 差异检测 | ❌ |
+| `rbh_import` | CSV/备份目录批量导入元数据 | ❌ |
+| `rbh_rebind` | FID 绑定变更（HSM 恢复后重编号） | ❌ |
+| `rbh_recov` | 灾难恢复（start/reset/resume/complete/status） | ❌ |
+| `rbh_undelete` | 恢复 `removed_entries` 到 HSM | ⚠️ `rbh undelete` 子命令有，功能比 C 版简单 |
+| `cmd_helpers.c` (守护进程模式) | `--scan/--check-thresholds/--run=policy/--dry-run/--target=...` | ⚠️ 阈值/信号已做，`--diff` 运行模式未实现 |
 
 ### 3. 守护进程特性（C `rbh_daemon.c` 1934 行）
 
@@ -85,20 +92,46 @@ Rust `ActionParams` 已含 `max_count / max_volume / timeout / nb_threads / lru_
 
 | C 功能 | Rust 状态 |
 |---|---|
-| `policy_loader.c` — 文本 DSL + include / 继承 | ❌（Rust 改用 DB + JSON） |
-| `policy_matching.c` — fileclass 分类、multi-rule、`ignore`/`ignore_fileclass` | ✅（`ignore_fileclass` 内嵌 `FileClassDef`，SQL 层 `AND NOT (...)`） |
-| `policy_run.c` — 候选集、LRU 排序、并行分发、重试、进度追踪 | ⚠️ LRU + max_count 已做；并发 worker、软/硬阈值、重试未实现 |
-| `policy_triggers.c` — OST/pool/user/group 占用率触发 | ⚠️ 已做 count/volume 阈值；**OST statfs 实际占用率未接入**（现按 DB 聚合） |
+| `policy_loader.c` — 文本 DSL + include / 继承 | ❌（Rust 改用 DB + JSON；`rbh-config-import` 做迁移） |
+| `policy_matching.c` — fileclass 分类、multi-rule、`ignore`/`ignore_fileclass` | ✅（`FileClassDef` 内嵌于 `PolicyDef`，SQL `AND NOT (...)`） |
+| `policy_run.c` — 候选集、LRU 排序、并行分发、重试、进度追踪 | ⚠️ LRU + max_count 已做；**并发 worker、低水位闭环、重试**未实现 |
+| `policy_triggers.c` — OST/pool/user/group 占用率触发 | ⚠️ count/volume 阈值已做；**OST statfs 实际占用率未接入**（现按 DB SUM(size)） |
 | `status_manager.c` — 状态机抽象 | ❌ |
 | `policy_sched.c` — 策略级调度器插件 | ❌ |
+| **谓词扩展缺口**（`rbh-predicate`） | |
+| 正则匹配（`=~` / `!~`） | ❌ |
+| 路径深度（`depth`） | ❌ |
+| 目录内文件数（`dircount`） | ❌ |
+| 硬链接数（`nlink`） | ❌ |
+| Lustre project ID（`projid`） | ❌ |
+| 自定义 xattr 匹配 | ❌ |
+| 大小写不敏感名称（`iname`） | ❌ |
+| `fileclass` 名称引用（predicate 中引用已定义 fileclass） | ❌ |
+| 状态管理器状态字段（`status`） | ❌ |
+| `creation_time` / `last_mdchange` 时间字段 | ❌（DB 字段有但 predicate 未暴露） |
+| **FileClass 运行时系统** | |
+| 报告中按 fileclass 分组统计 | ❌ |
+| `whitelist` / `ignore` 表达式块（策略规则内） | ❌（仅有 `ignore_fileclass`） |
+| **触发器扩展缺口**（`rbh-policy TriggerSpec`） | |
+| 单个 OST 用量阈值（`trigger_on = ost_usage`） | ❌ |
+| Pool 用量阈值 | ❌ |
+| per-user / per-group 用量阈值 | ❌ |
+| inode 数量 / inode 百分比阈值 | ❌ |
+| 低水位停止条件在策略运行中闭环 | ❌ |
 
 ### 5. 报表 / 查询 / 统计
 
-- 按 user/group/class/ost/pool 聚合 — ✅ 基本子集
-- topdirs / topusers / topsize — ✅
-- OST 使用率、条带分布报表 — ❌
-- 增量差异 — ❌
-- size-profile / by-count/avgsize/szratio、split-user-groups — ❌
+| 报表类型 | C 版 | Rust 状态 |
+|---|---|---|
+| 按 user/group/class/ost/pool 聚合 | ✅ | ✅ 基本子集（`rbh report` + `/api/reports/*`） |
+| topdirs / topusers / topsize / oldest | ✅ | ✅ |
+| fs-info（挂载点用量概览） | ✅ | ✅ |
+| OST 使用率分布、条带分布报表 | ✅ | ❌ |
+| size-profile（按大小区间分布） | ✅ | ❌ |
+| `--dump-*`（全量 dump 按 user/group/ost/status） | ✅ | ❌ |
+| maintenance / 运维统计窗口 | ✅ | ❌ |
+| 增量差异报告（`rbh_diff`） | ✅ | ❌ |
+| fileclass 分布统计 | ✅ | ❌ |
 
 ### 6. 配置 & 兼容
 
@@ -127,18 +160,25 @@ Rust `ActionParams` 已含 `max_count / max_volume / timeout / nb_threads / lru_
 
 | C 功能 | Rust 状态 |
 |---|---|
-| 任务栈 / 任务树并发控制 | ⚠️ 有但更简单 |
-| 增量扫描（mtime 阈值跳过） | ❌ |
-| 扫描进度持久化 / 续扫 | ❌ |
-| 跳过 fileclass / 忽略路径规则、`.rbh_ignore` | ❌ |
+| 任务栈 / 任务树并发控制 | ⚠️ 有但更简单（async_channel + AtomicUsize） |
+| `.rbh_ignore` glob 忽略 | ✅（`load_rbh_ignore_file`） |
+| mtime 阈值过滤（跳过近期文件） | ✅（`ScanConfig.mtime_filter`） |
+| **增量扫描（diff pipeline）— 只扫变化** | ❌ |
+| 扫描进度持久化 / 断点续扫 | ❌ |
+| 指定子路径局部扫描 | ❌（当前从 root 开始） |
 
 ### 9. 可观测性 / 运维
 
 | C 功能 | Rust 状态 |
 |---|---|
-| `rbh_logs.c` — 分级日志 + 邮件告警 + 日志轮转 | ⚠️ tracing JSON + logrotate 片段 |
-| entry_proc_tools.c 管道统计 | ❌ |
-| Prometheus / metrics 导出 | ❌（OTLP v2 已预留） |
+| 分级日志 + 日志轮转 | ✅（tracing JSON/pretty + logrotate 配置） |
+| SIGHUP 热重载日志级别 | ✅ |
+| SIGUSR1 dump 运行时快照 | ✅（hook 可扩展） |
+| **邮件告警** | ❌ |
+| **动作错误率监控 + 自动挂起策略** | ❌ |
+| **维护窗口（指定时段不执行策略）** | ❌ |
+| Prometheus / metrics 导出 | ❌（OTLP v2 已预留，`/api/metrics` 端点存在但空） |
+| pipeline 吞吐统计（entry_proc_tools） | ❌ |
 
 ### 10. Web GUI
 
@@ -161,39 +201,53 @@ C 版 `web_gui/` 目录（PHP）。Rust 无前端。
 
 ### P0（让守护进程能替代 C 版基本场景）— ✅ 已完成
 
-- 动态阈值触发
-- OST / pool 级 targeted purge
-- `ignore_fileclass` 实现
-- `rbh_find`（子集）
-- `rbh_report`（子集）
-- 多 MDT
-- SIGHUP reload
-- systemd 单元
+- ✅ 动态阈值触发
+- ✅ OST / pool 级 targeted purge
+- ✅ `ignore_fileclass` 实现
+- ✅ `rbh find`（子集）
+- ✅ `rbh report`（子集）
+- ✅ 多 MDT
+- ✅ SIGHUP reload
+- ✅ systemd 单元
 
-### P1（HSM 生产可用）
+### P1（HSM 生产可用 + predicate 完善）— ⏳ 进行中
 
-- 完整 `lhsm.c` 语义（hints、restore 跟踪、archive/release 重试与统计）
-- `common_actions`（copy/move/sendmail/cmd）
-- 动作速率限制
-- 策略运行期软/硬水位（fire 后循环检查 low 停止）
+- [ ] 完整 `lhsm.c` 语义（archive_id / hints / restore 跟踪 / archive/release 重试与统计）
+- [ ] 策略运行期低水位闭环（fire 后 PolicyRunTask 周期检查 low threshold 提前退出）
+- [ ] OST statfs 实际占用率接入（`llapi_obd_statfs` 替换 DB SUM(size)）
+- [ ] 并发 worker（按 `nb_threads` 并行 execute candidates）
+- [ ] 动作速率限制（每秒 N 动作 / 总带宽上限，`sched_ratelimit.c` 语义）
+- [ ] Predicate 扩展：`depth` / `dircount` / `nlink` / `iname` / `last_mdchange` / `creation_time`
+- [ ] `fileclass` 名称引用（predicate 中引用已定义 fileclass 名）
+- [ ] 正则匹配谓词（`=~` / `!~`）
+- [ ] xattr 匹配谓词
+- [ ] OST/pool/user/group 细粒度触发器
 
-### P2（报表 & 运维）
+### P2（报表 & 运维 & 差分）
 
-- `listmgr_reports` 完整报表 API
-- `rbh_report` 剩余功能（size-profile / by-count/avgsize、status-info、maintenance）
-- Prometheus metrics
-- 配置 `.conf` → JSON 迁移工具
-- `rbh_undelete` / `rbh_diff`
-- 增量扫描 / 续扫 / `.rbh_ignore`
+- [ ] OST 使用率 / 条带分布报表
+- [ ] `rbh report --size-profile / --dump-* / --fileclass`
+- [ ] `rbh_du`（按目录递归磁盘用量）
+- [ ] `rbh_diff`（filesystem vs DB 差异检测 + 增量扫描 pipeline）
+- [ ] `rbh_undelete` 完整（restore from HSM + rebind）
+- [ ] Prometheus `/metrics` 端点（OTLP v2 预留已就位）
+- [ ] 维护窗口（指定时段不执行策略）
+- [ ] 动作错误率监控 + 自动挂起策略
+- [ ] `projid`（Lustre project quota）支持
 
 ### P3（扩展 / 灾难恢复）
 
-- `backup` 模块 + `rbhext_tool`
-- 灾难恢复（`listmgr_recov`）
-- SQLite 后端
-- Web GUI
-- 扩展检查器（checksum / modeguard / shook）
-- RPM spec
+- [ ] `rbh_recov` / `rbh_rebind`（FID 重绑 / 灾难恢复）
+- [ ] `rbh_import`（CSV/目录批量导入）
+- [ ] `backup` 模块策略类型（BackupExecutor 已有，策略侧未接入）
+- [ ] `listmgr_recov` — 灾难恢复元数据
+- [ ] `checker.c` — checksum 校验策略
+- [ ] `modeguard.c` — 权限监控策略
+- [ ] `rmdir` 空目录清理策略 executor
+- [ ] SQLite 后端
+- [ ] POSIX 文件系统支持（ext4/XFS）
+- [ ] Web GUI
+- [ ] RPM spec
 
 ---
 
@@ -321,12 +375,12 @@ POSIX `find(1)` + Lustre 扩展：`--ost/--pool/--projid/--class/--status/--lsos
 
 ### 其他 follow-ups
 
-- `rbh_find --printf` 格式符 / `--exec`。
-- `rbh_report --size-profile / --dump-* / --maintenance`。
-- `rbh_undelete` / `rbh_diff` CLI + 对应 REST。
-- `.rbh_ignore` + 增量扫描。
+- `rbh find --printf` 格式符 / `--exec`。
+- `rbh report --size-profile / --dump-* / --maintenance`。
+- `rbh undelete` / `rbh diff` CLI + 对应 REST。
+- 增量扫描（diff pipeline）。
 - Prometheus `/metrics` 端点。
-- 迁移工具：C 版 `.conf` → Rust JSON PolicyDef。
+- 迁移工具：C 版 `.conf` → Rust JSON PolicyDef（`rbh-config-import` 已做基础，需补全）。
 - 集成测试套件（挂载真 Lustre 或 testfs fixture）。
 
 ### 风险与注意事项
@@ -334,3 +388,29 @@ POSIX `find(1)` + Lustre 扩展：`--ost/--pool/--projid/--class/--status/--lsos
 - **阈值 SUM(size) 不等于 Lustre `df`**：对多条带文件，`SUM(size)` 低估实际 OST 占用（因为单文件跨多个 OST）。用户须知，必要时转向真 `statfs` 实现。
 - **OnOst 依赖 `stripe_items` 全量**：初始扫描和 changelog 必须完整记录所有条带，否则 targeted purge 会漏。
 - **单 `cl` 共享多 MDT**：`RBH_CHANGELOG_USER=cl3` + `RBH_MDTS=m1,m2` 会给每个 MDT 用同一 user id — Lustre 不接受同 user 在多 MDT 注册，需用 CSV 形式 `cl3,cl4`。
+
+---
+
+## P1 实施结果
+
+> 本节在 P1 任务完成时逐项填写，格式参照 P0 实施结果表。
+
+| # | 任务 | 交付 | 测试 |
+|---|---|---|---|
+| P1.1 | 完整 lhsm 语义（archive_id/hints/重试） | — | — |
+| P1.2 | 低水位闭环 | — | — |
+| P1.3 | OST statfs 实际占用率 | — | — |
+| P1.4 | 并发 worker（nb_threads） | — | — |
+| P1.5 | 动作速率限制 | — | — |
+| P1.6 | Predicate 扩展（depth/dircount/nlink/iname/xattr/正则） | — | — |
+| P1.7 | fileclass 名称引用谓词 | — | — |
+| P1.8 | OST/pool/user/group 细粒度触发器 | — | — |
+
+---
+
+## 更新日志
+
+| 日期 | 更新内容 |
+|---|---|
+| 2026-04-23 | 初始分析（~8.1k 行，P0 规划） |
+| 2026-04-28 | P0 全部完成；codebase 增至 ~17.5k 行（13 crate 全部真实实现）；更新覆盖概览、动作模块表、CLI 表、predicate/触发器缺口、报表/扫描/运维表；重写 P1/P2/P3 优先级列表；新增 P1 实施结果占位表 |
