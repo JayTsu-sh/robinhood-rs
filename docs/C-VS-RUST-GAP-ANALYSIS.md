@@ -218,7 +218,7 @@ C 版 `web_gui/` 目录（PHP）。Rust 无前端。
 - ✅ 动作速率限制（`RateLimit { max_per_sec, max_bytes_per_sec }` 在 `task.rs` 中实现）
 - ✅ OST/pool/user/group 细粒度触发器（`ThresholdOstPct` + `TargetFilter::User/Group/Projid/Pool` 已实现）
 - ✅ Predicate 扩展（2026-04-28）：`InameLike` / `NameRegex` / `Xattr` / `Field::Depth` — 含 DB 迁移 004、fs-scan depth 传递、39 个测试
-- [ ] OST statfs 实际占用率接入（`llapi_obd_statfs` 替换 DB SUM(size)，需 live Lustre）
+- ✅ 文件系统级聚合阈值（`ThresholdFsPct` — sum-used/sum-total × 100，等价 robinhood-C global_usage 触发）
 - [ ] `fileclass` 名称引用（predicate 中按名引用全局 fileclass，需全局注册表）
 - [ ] `dircount` 谓词（目录子文件数，需 schema 变更 + 维护计数器）
 
@@ -398,7 +398,7 @@ POSIX `find(1)` + Lustre 扩展：`--ost/--pool/--projid/--class/--status/--lsos
 |---|---|---|---|
 | P1.1 | 完整 lhsm 语义（archive_id/hints/重试） | `HsmParams` in `ActionParams`; `dispatch_workers` retry loop | task.rs tests |
 | P1.2 | 低水位闭环 | `maybe_spawn_low_watermark_monitor()` in task.rs | task.rs tests |
-| P1.3 | OST statfs 实际占用率 | — (需 live Lustre) | — |
+| P1.3 | OST statfs 实际占用率 / ThresholdFsPct | `ThresholdFsPct` + `fetch_ost_usage()` helper; migration 004 depth; 集成测试 | daemon threshold tests |
 | P1.4 | 并发 worker（nb_threads） | `dispatch_workers` JoinSet + semaphore | task.rs concurrency tests |
 | P1.5 | 动作速率限制 | `RateLimit` + token bucket in task.rs | task.rs rate limit tests |
 | P1.6 | Predicate 扩展（depth/iname/xattr/正则） | `InameLike`/`NameRegex`/`Xattr`/`Field::Depth`; migration 004 | 39 predicate tests |
