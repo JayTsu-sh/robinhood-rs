@@ -24,7 +24,7 @@ static RUNTIME: OnceLock<Arc<PolicyRuntime>> = OnceLock::new();
 
 pub fn init_runtime(rt: Arc<PolicyRuntime>) {
     if RUNTIME.set(rt).is_err() {
-        tracing::warn!("init_runtime called more than once — ignoring second call");
+        panic!("init_runtime called more than once — this is a startup bug");
     }
 }
 
