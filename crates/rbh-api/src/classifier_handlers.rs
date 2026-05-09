@@ -1,9 +1,9 @@
-//! HTTP handlers for the `/api/classifiers` CRUD endpoints.
+//! HTTP handlers for the `/api/classifiers` CRUD + run endpoints.
 
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use rbh_policy::{ClassifierDef, ClassifierRow, PolicyError};
+use rbh_policy::{ClassifierDef, ClassifierRow, PolicyError, evaluate_classifier};
 use serde::Serialize;
 
 use crate::AppState;
@@ -40,10 +40,22 @@ fn policy_err(e: PolicyError) -> (StatusCode, String) {
     }
 }
 
+/// Reload the in-process classifier cache from the DB.
+async fn reload_cache(state: &AppState) {
+    match state.classifier_store.list().await {
+        Ok(rows) => {
+            let mut cache = state.classifier_cache.write().await;
+            *cache = rows;
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to reload classifier cache"),
+    }
+}
+
 pub async fn create_classifier(
     State(state): State<AppState>, Json(body): Json<ClassifierDef>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let id = state.classifier_store.create(&body).await.map_err(policy_err)?;
+    reload_cache(&state).await;
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
@@ -65,6 +77,7 @@ pub async fn update_classifier(
     State(state): State<AppState>, Path(id): Path<u64>, Json(body): Json<ClassifierDef>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     state.classifier_store.update(id, &body).await.map_err(policy_err)?;
+    reload_cache(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -72,5 +85,45 @@ pub async fn delete_classifier(
     State(state): State<AppState>, Path(id): Path<u64>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     state.classifier_store.delete(id).await.map_err(policy_err)?;
+    reload_cache(&state).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Manually run a classifier against all entries in the catalog.
+///
+/// Loads all entries in pages, evaluates the classifier rules in-memory,
+/// and writes tags via `update_xattr`. Returns `{"classified": N}`.
+pub async fn run_classifier(
+    State(state): State<AppState>, Path(id): Path<u64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let row = state.classifier_store.get(id).await.map_err(policy_err)?;
+    let def = &row.definition;
+
+    if !def.enabled {
+        return Ok(Json(serde_json::json!({"classified": 0, "skipped": "disabled"})));
+    }
+
+    // Iterate all entries using dump_page (FID-ordered cursor, page size 10k).
+    let mut classified: u64 = 0;
+    let mut after: Option<lustre_api::LuFid> = None;
+    loop {
+        let batch = state
+            .entry_store
+            .dump_page(after, 10_000)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if batch.is_empty() {
+            break;
+        }
+        after = Some(batch.last().unwrap().fid);
+        for entry in &batch {
+            if let Some(tags) = evaluate_classifier(def, entry) {
+                let _ = state.entry_store.update_xattr(&entry.fid, tags, &def.manages).await;
+                classified += 1;
+            }
+        }
+    }
+
+    tracing::info!(classifier_id = id, classifier_name = %def.name, classified, "manual classifier run complete");
+    Ok(Json(serde_json::json!({ "classified": classified })))
 }

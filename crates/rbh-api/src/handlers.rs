@@ -29,6 +29,10 @@ pub fn api_routes() -> Router<AppState> {
                 .put(crate::classifier_handlers::update_classifier)
                 .delete(crate::classifier_handlers::delete_classifier),
         )
+        .route(
+            "/classifiers/{id}/run",
+            post(crate::classifier_handlers::run_classifier),
+        )
         .route("/policies", post(create_policy).get(list_policies))
         .route(
             "/policies/{id}",

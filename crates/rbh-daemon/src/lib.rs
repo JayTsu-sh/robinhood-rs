@@ -237,6 +237,7 @@ pub async fn run() -> anyhow::Result<()> {
     let state = rbh_api::AppState {
         policy_store,
         classifier_store,
+        classifier_cache: classifier_cache.clone(),
         entry_store,
         scheduler: Some(scheduler.clone()),
         scans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

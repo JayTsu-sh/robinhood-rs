@@ -89,7 +89,9 @@ pub async fn ingest_loop(
                     // Incremental classification: re-classify the affected entry.
                     let fid = envelope.event.fid();
                     let classifiers = classifier_cache.read().await;
-                    if !classifiers.is_empty() && let Ok(Some(row)) = entry_store.get_entry(&fid).await {
+                    if !classifiers.is_empty()
+                        && let Ok(Some(row)) = entry_store.get_entry(&fid).await
+                    {
                         apply_classifiers(&classifiers, &row, &entry_store).await;
                     }
                 }
@@ -309,10 +311,21 @@ async fn apply_event(
             restat_entry(store, mount, fid, parent_opt, name.clone()).await
         }
 
-        ChangelogEvent::Truncate { fid }
-        | ChangelogEvent::SetAttr { fid }
-        | ChangelogEvent::MTime { fid }
-        | ChangelogEvent::CTime { fid } => restat_entry(store, mount, fid, None, Bytes::new()).await,
+        ChangelogEvent::Truncate { fid } => {
+            // TRUNC is how HSM release manifests in the changelog on this
+            // Lustre version — a CL_HSM(RELEASE) event is NOT generated.
+            // After re-statting for size/mtime, check the live HSM state
+            // and refresh sm_status.hsm_state if the entry is HSM-managed.
+            let touched = restat_entry(store, mount, fid, None, Bytes::new()).await?;
+            if touched {
+                let _ = refresh_hsm_state_if_managed(store, mount, fid).await;
+            }
+            Ok(touched)
+        }
+
+        ChangelogEvent::SetAttr { fid } | ChangelogEvent::MTime { fid } | ChangelogEvent::CTime { fid } => {
+            restat_entry(store, mount, fid, None, Bytes::new()).await
+        }
 
         ChangelogEvent::Hsm {
             fid,
@@ -437,6 +450,63 @@ mod tests {
 }
 
 /// Re-stat an existing entry and update it in the store.
+/// Query the live HSM state via FFI and update sm_status.hsm_state in the catalog.
+/// Only called when the entry already has an hsm_state (meaning it's HSM-managed).
+/// This handles the case where TRUNC events are generated instead of CL_HSM(RELEASE).
+async fn refresh_hsm_state_if_managed(store: &EntryStore, mount: &Path, fid: &lustre_api::LuFid) -> anyhow::Result<()> {
+    // Check if entry has an existing hsm_state in the catalog.
+    let entry = match store.get_entry(fid).await? {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+    let current_state = entry.sm_status.get("hsm_state").and_then(|v| v.as_str()).unwrap_or("");
+    if current_state.is_empty() || current_state == "none" {
+        return Ok(()); // not HSM-managed, skip
+    }
+
+    // Query live HSM state via llapi_hsm_state_get.
+    let lustre = LustreApi;
+    let fid_copy = *fid;
+    let mount_owned = mount.to_owned();
+    let hsm_info = tokio::task::spawn_blocking(move || {
+        let mount_str = mount_owned.to_string_lossy();
+        lustre
+            .fid_to_path(&mount_str, &fid_copy)
+            .ok()
+            .map(|rel| mount_owned.join(rel))
+            .and_then(|p| lustre.hsm_state_get(&p).ok())
+    })
+    .await
+    .unwrap_or(None);
+
+    let Some(info) = hsm_info else {
+        return Ok(());
+    };
+
+    use lustre_api::HsmState;
+    let new_state = if info.states.contains(HsmState::RELEASED) {
+        "released"
+    } else if info.states.contains(HsmState::ARCHIVED) && !info.states.contains(HsmState::DIRTY) {
+        "archived"
+    } else if info.states.is_empty() {
+        "none"
+    } else {
+        return Ok(()); // dirty, exists-only, etc. — leave existing state
+    };
+
+    if new_state != current_state {
+        tracing::debug!(
+            %fid,
+            old_state = %current_state,
+            new_state,
+            "HSM state refreshed after TRUNC event"
+        );
+        let patch = serde_json::json!({ "hsm_state": new_state });
+        let _ = store.patch_sm_status(fid, &patch).await;
+    }
+    Ok(())
+}
+
 async fn restat_entry(
     store: &EntryStore, mount: &Path, fid: &lustre_api::LuFid, parent: Option<lustre_api::LuFid>, name: Bytes,
 ) -> anyhow::Result<bool> {
