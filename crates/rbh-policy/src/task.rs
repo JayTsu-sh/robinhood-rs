@@ -23,7 +23,9 @@ pub struct PolicyRuntime {
 static RUNTIME: OnceLock<Arc<PolicyRuntime>> = OnceLock::new();
 
 pub fn init_runtime(rt: Arc<PolicyRuntime>) {
-    RUNTIME.set(rt).ok();
+    if RUNTIME.set(rt).is_err() {
+        tracing::warn!("init_runtime called more than once — ignoring second call");
+    }
 }
 
 fn runtime() -> &'static Arc<PolicyRuntime> {
@@ -240,9 +242,6 @@ impl Task for PolicyRunTask {
         } else {
             "failed"
         };
-        rbh_observability::metrics::POLICY_RUNS
-            .with_label_values(&[pid_lbl.as_str(), outcome])
-            .inc();
         rbh_observability::metrics::ACTIONS
             .with_label_values(&[pid_lbl.as_str(), "success"])
             .inc_by(success);
@@ -360,7 +359,7 @@ fn maybe_spawn_low_watermark_monitor(
     let entry_store = rt.entry_store.clone();
     let where_clause = where_clause.to_string();
     let params: Vec<_> = query_params.to_vec();
-    let policy_id = def.name.clone();
+    let policy_name = def.name.clone();
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
 
     let handle = tokio::spawn(async move {
@@ -382,7 +381,7 @@ fn maybe_spawn_low_watermark_monitor(
                     .unwrap_or(false),
             };
             if hit {
-                tracing::info!(policy = %policy_id, "low watermark reached — stopping policy run");
+                tracing::info!(policy = %policy_name, "low watermark reached — stopping policy run");
                 stop_token.cancel();
                 return;
             }

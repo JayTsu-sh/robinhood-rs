@@ -140,8 +140,15 @@ fn try_parse_threshold(s: &str) -> Result<Option<TriggerSpec>, TriggerParseError
 
 fn parse_pct(s: &str, orig: &str) -> Result<u32, TriggerParseError> {
     let s = s.trim().trim_end_matches('%').trim();
-    s.parse::<u32>()
-        .map_err(|_| TriggerParseError::BadNumber(orig.to_string()))
+    let pct = s
+        .parse::<u32>()
+        .map_err(|_| TriggerParseError::BadNumber(orig.to_string()))?;
+    if pct == 0 || pct > 100 {
+        return Err(TriggerParseError::BadNumber(format!(
+            "{orig}: percentage must be 1..=100, got {pct}"
+        )));
+    }
+    Ok(pct)
 }
 
 fn parse_size(s: &str, orig: &str) -> Result<u64, TriggerParseError> {
@@ -232,6 +239,23 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn pct_zero_is_error() {
+        assert!(matches!(parse_trigger("fs > 0%"), Err(TriggerParseError::BadNumber(_))));
+    }
+
+    #[test]
+    fn pct_over_100_is_error() {
+        assert!(matches!(
+            parse_trigger("fs > 101%"),
+            Err(TriggerParseError::BadNumber(_))
+        ));
+        assert!(matches!(
+            parse_trigger("ost > 200%"),
+            Err(TriggerParseError::BadNumber(_))
+        ));
     }
 
     #[test]

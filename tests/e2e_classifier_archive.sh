@@ -506,7 +506,7 @@ lfs hsm_restore "$TEST_DIR/cls-file-1.bin" || die "lfs hsm_restore failed"
 # Wait for "released" flag to DISAPPEAR — the file starts as "released exists archived"
 # and should transition to "exists archived" once the restore is complete.
 _deadline=$((SECONDS + HSM_SETTLE))
-while [[ $SECONDS -lt _deadline ]]; do
+while [[ $SECONDS -lt $_deadline ]]; do
     s=$(lfs hsm_state "$TEST_DIR/cls-file-1.bin" 2>/dev/null)
     [[ "$s" != *"released"* ]] && break
     sleep 2

@@ -125,9 +125,16 @@ wait_hsm_state_absent() {
 }
 
 # Poll catalog until sm_status.hsm_state for files IN ($names_csv) equals $want.
+# $names_csv must be pre-quoted SQL literals (e.g. "'a','b'").
+# $want is validated to be a known HSM state word before interpolation.
 wait_catalog_hsm_all() {
     local names_csv="$1" want="$2" timeout="${3:-$SETTLE}"
-    local sql="SELECT COUNT(*) FROM entries WHERE name IN ($names_csv) AND JSON_UNQUOTE(JSON_EXTRACT(sm_status,'$.hsm_state'))='$want'"
+    # Validate $want against the known HSM state vocabulary to prevent injection.
+    case "$want" in
+        archived|released|none|dirty) ;;
+        *) die "wait_catalog_hsm_all: unexpected hsm_state value: $want" ;;
+    esac
+    local sql="SELECT COUNT(*) FROM entries WHERE name IN ($names_csv) AND JSON_UNQUOTE(JSON_EXTRACT(sm_status,'$.hsm_state'))='${want}'"
     local deadline=$((SECONDS + timeout)); local _n=0
     while [[ $SECONDS -lt $deadline ]]; do
         _n=$(mysql -u root -N -B "$DB" -e "$sql" 2>/dev/null || echo 0)

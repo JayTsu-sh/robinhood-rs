@@ -144,10 +144,17 @@ async fn apply_classifiers(
         if !classifier.enabled {
             continue;
         }
-        if let Some(tags) = rbh_policy::evaluate_classifier(&classifier.definition, entry) {
-            let _ = store
+        if let Some(tags) = rbh_policy::evaluate_classifier(&classifier.definition, entry)
+            && let Err(e) = store
                 .update_xattr(&entry.fid, tags, &classifier.definition.manages)
-                .await;
+                .await
+        {
+            tracing::warn!(
+                fid = %entry.fid,
+                classifier = %classifier.name,
+                error = %e,
+                "update_xattr failed during incremental classification"
+            );
         }
     }
 }

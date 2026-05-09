@@ -104,9 +104,22 @@ pub async fn run_classifier(
     }
 
     // Iterate all entries using dump_page (FID-ordered cursor, page size 10k).
+    // Guard against very large catalogs blocking the executor indefinitely.
+    const MAX_ENTRIES: u64 = 1_000_000;
     let mut classified: u64 = 0;
+    let mut errors: u64 = 0;
+    let mut scanned: u64 = 0;
     let mut after: Option<lustre_api::LuFid> = None;
     loop {
+        if scanned >= MAX_ENTRIES {
+            tracing::warn!(
+                classifier_id = id,
+                scanned,
+                MAX_ENTRIES,
+                "max_entries limit reached — run again to continue"
+            );
+            break;
+        }
         let batch = state
             .entry_store
             .dump_page(after, 10_000)
@@ -116,14 +129,29 @@ pub async fn run_classifier(
             break;
         }
         after = Some(batch.last().unwrap().fid);
+        scanned += batch.len() as u64;
         for entry in &batch {
             if let Some(tags) = evaluate_classifier(def, entry) {
-                let _ = state.entry_store.update_xattr(&entry.fid, tags, &def.manages).await;
-                classified += 1;
+                match state.entry_store.update_xattr(&entry.fid, tags, &def.manages).await {
+                    Ok(()) => classified += 1,
+                    Err(e) => {
+                        errors += 1;
+                        tracing::warn!(fid = %entry.fid, error = %e, "update_xattr failed during classifier run");
+                    }
+                }
             }
         }
     }
 
-    tracing::info!(classifier_id = id, classifier_name = %def.name, classified, "manual classifier run complete");
-    Ok(Json(serde_json::json!({ "classified": classified })))
+    tracing::info!(
+        classifier_id = id,
+        classifier_name = %def.name,
+        classified,
+        errors,
+        scanned,
+        "manual classifier run complete"
+    );
+    Ok(Json(
+        serde_json::json!({ "classified": classified, "errors": errors, "scanned": scanned }),
+    ))
 }
