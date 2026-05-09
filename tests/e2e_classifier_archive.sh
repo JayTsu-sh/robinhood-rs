@@ -130,22 +130,6 @@ wait_hsm_state() {
     die "wait_hsm_state: $file wanted '$want' within ${timeout}s, got: $final"
 }
 
-# Poll catalog until sm_status.hsm_state for filename $name equals $want.
-wait_catalog_hsm() {
-    local name="$1" want="$2" timeout="${3:-$SETTLE}"
-    local sql="SELECT JSON_UNQUOTE(JSON_EXTRACT(sm_status,'$.hsm_state')) FROM entries WHERE name='$name'"
-    local deadline=$((SECONDS + timeout))
-    while [[ $SECONDS -lt $deadline ]]; do
-        local v
-        v=$(mysql -u root -N -B "$DB" -e "$sql" 2>/dev/null || echo "NULL")
-        [[ "$v" == "$want" ]] && return 0
-        sleep 2
-    done
-    local final
-    final=$(mysql -u root -N -B "$DB" -e "$sql" 2>/dev/null || echo "NULL")
-    die "wait_catalog_hsm: $name wanted hsm_state='$want' within ${timeout}s, got: $final"
-}
-
 # Poll until COUNT(*) WHERE $condition > 0.
 wait_for_entry() {
     local cond="$1" timeout="${2:-$SETTLE}"

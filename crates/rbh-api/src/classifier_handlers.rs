@@ -110,6 +110,15 @@ pub async fn run_classifier(
     let mut scanned: u64 = 0;
     let mut after: Option<lustre_api::LuFid> = None;
     loop {
+        if scanned >= MAX_ENTRIES {
+            tracing::warn!(
+                classifier_id = id,
+                scanned,
+                max_entries = MAX_ENTRIES,
+                "max_entries limit reached — run again to continue"
+            );
+            break;
+        }
         let batch = state
             .entry_store
             .dump_page(after, 10_000)
@@ -120,14 +129,6 @@ pub async fn run_classifier(
         }
         after = Some(batch.last().unwrap().fid);
         scanned += batch.len() as u64;
-        if scanned >= MAX_ENTRIES {
-            tracing::warn!(
-                classifier_id = id,
-                scanned,
-                "max_entries limit reached — run again to continue"
-            );
-            break;
-        }
         for entry in &batch {
             if let Some(tags) = evaluate_classifier(def, entry) {
                 match state.entry_store.update_xattr(&entry.fid, tags, &def.manages).await {

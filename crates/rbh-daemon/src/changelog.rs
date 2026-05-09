@@ -509,7 +509,9 @@ async fn refresh_hsm_state_if_managed(store: &EntryStore, mount: &Path, fid: &lu
             "HSM state refreshed after TRUNC event"
         );
         let patch = serde_json::json!({ "hsm_state": new_state });
-        let _ = store.patch_sm_status(fid, &patch).await;
+        if let Err(e) = store.patch_sm_status(fid, &patch).await {
+            tracing::warn!(%fid, error = %e, new_state, "failed to patch hsm_state after TRUNC event");
+        }
     }
     Ok(())
 }
