@@ -16,6 +16,22 @@ pub enum StoreError {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("invalid persisted backend kind: {0}")]
+    InvalidBackendKind(#[from] crate::model::BackendKindParseError),
+
+    #[error("invalid persisted filesystem id: {0}")]
+    InvalidFileSystemId(#[from] crate::model::FileSystemIdError),
+
+    #[error("invalid persisted object identity: {0}")]
+    InvalidObjectIdentity(&'static str),
+
+    #[error("filesystem {filesystem} uses backend {configured:?}, but object id uses {object:?}")]
+    BackendMismatch {
+        filesystem: crate::model::FileSystemId,
+        configured: crate::model::BackendKind,
+        object: crate::model::BackendKind,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

@@ -11,7 +11,10 @@
 use bytes::Bytes;
 use lustre_api::LuFid;
 use lustre_changelog::CursorStore;
-use rbh_entry_store::model::{EntryKind, EntryRow};
+use rbh_entry_store::model::{
+    BackendCapabilities, BackendKind, EntryKey, EntryKind, EntryRow, FileSystemConfig, FileSystemId, ObjectId,
+    ScopedEntryRow,
+};
 use rbh_entry_store::store::{EntryStore, MariaDbCursorStore};
 use sqlx::MySql;
 use sqlx::mysql::MySqlPoolOptions;
@@ -26,6 +29,8 @@ fn integration_enabled() -> bool {
 async fn reset_db(pool: &sqlx::Pool<MySql>) {
     // Drop tables in reverse dependency order (policies has no FK deps).
     for table in &[
+        "scoped_entries",
+        "filesystems",
         "stripe_items",
         "names",
         "removed_entries",
@@ -39,6 +44,90 @@ async fn reset_db(pool: &sqlx::Pool<MySql>) {
             .execute(pool)
             .await;
     }
+}
+
+#[tokio::test]
+async fn scoped_identities_isolate_the_same_native_object_id() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+
+    let first_id = FileSystemId::new("juicefs-a").unwrap();
+    let second_id = FileSystemId::new("juicefs-b").unwrap();
+    for id in [first_id.clone(), second_id.clone()] {
+        store
+            .register_filesystem(&FileSystemConfig {
+                id,
+                backend: BackendKind::JuiceFs,
+                mount_path: "/mnt/juicefs".into(),
+                capabilities: BackendCapabilities {
+                    changelog: true,
+                    namespace: true,
+                    ..BackendCapabilities::default()
+                },
+            })
+            .await
+            .expect("register filesystem");
+    }
+
+    let first_key = EntryKey::new(first_id.clone(), ObjectId::JuiceFs(42));
+    let second_key = EntryKey::new(second_id, ObjectId::JuiceFs(42));
+    let scoped_entry = |key: EntryKey, name: &'static [u8]| ScopedEntryRow {
+        key,
+        parent: None,
+        name: Bytes::from_static(name),
+        kind: EntryKind::File,
+        size: 1024,
+        blocks: 8,
+        uid: 1000,
+        gid: 100,
+        projid: 0,
+        mode: 0o644,
+        nlink: 1,
+        atime: 1_775_955_820,
+        mtime: 1_775_955_820,
+        ctime: 1_775_955_820,
+        stripe_count: None,
+        stripe_size: None,
+        pool_name: None,
+        sm_status: serde_json::json!({}),
+        last_seen: 1_775_955_820,
+        depth: 1,
+    };
+    let first = scoped_entry(first_key.clone(), b"first.txt");
+    let second = scoped_entry(second_key.clone(), b"second.txt");
+    store
+        .upsert_scoped_entry(&first)
+        .await
+        .expect("upsert first scoped entry");
+    store
+        .upsert_scoped_entry(&second)
+        .await
+        .expect("upsert second scoped entry");
+
+    assert_eq!(store.get_scoped_entry(&first_key).await.unwrap(), Some(first));
+    assert_eq!(store.get_scoped_entry(&second_key).await.unwrap(), Some(second));
+    let config = store
+        .get_filesystem(&first_id)
+        .await
+        .unwrap()
+        .expect("registered filesystem");
+    assert_eq!(config.backend, BackendKind::JuiceFs);
+    assert!(config.capabilities.changelog);
+
+    // The expand migration must leave the legacy Lustre catalog path usable.
+    let legacy = make_entry(0x200000401, 0x42, "legacy-lustre.txt");
+    store.upsert_entry(&legacy).await.expect("upsert legacy entry");
+    assert_eq!(store.get_entry(&legacy.fid).await.unwrap().unwrap().name, legacy.name);
 }
 
 fn make_entry(seq: u64, oid: u32, name: &str) -> EntryRow {

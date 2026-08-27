@@ -5,6 +5,8 @@
 //! * `names` — hardlink support (Phase 2)
 //! * `removed_entries` — deleted files for HSM cleanup (Phase 2)
 //! * `changelog_cursor` — per-MDT cursor for `CursorStore` (Phase 2)
+//! * `filesystems` / `scoped_entries` — additive filesystem-scoped identity
+//!   used while legacy FID-keyed callers are migrated
 //!
 //! Policy tables (`policies`, `policy_trigger_state`, etc.) are added in Phase 6+.
 //!
@@ -17,5 +19,8 @@ pub mod model;
 pub mod store;
 
 pub use error::StoreError;
-pub use model::{EntryKind, EntryRow, RemovedEntry};
+pub use model::{
+    BackendCapabilities, BackendKind, BackendKindParseError, EntryKey, EntryKind, EntryRow, FileSystemConfig,
+    FileSystemId, FileSystemIdError, ObjectId, RemovedEntry, ScopedEntryRow,
+};
 pub use store::EntryStore;

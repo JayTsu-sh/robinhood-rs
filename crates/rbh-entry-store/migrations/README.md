@@ -34,3 +34,6 @@ NNN_short_description.sql
 | `001_initial_schema.sql` | entries, names, stripe_items, removed_entries, changelog_cursor |
 | `002_create_policies.sql` | policies table (JSON PolicyDef payload) |
 | `003_hsm_state_indexes.sql` | virtual column + index for `hsm_state`, index on `atime` / `mtime` |
+| `004_add_depth_column.sql` | directory depth for scan and subtree queries |
+| `005_create_classifiers.sql` | classifier definitions stored as JSON |
+| `006_add_filesystem_scoped_identity.sql` | filesystem registry and backend-native scoped catalog entries |

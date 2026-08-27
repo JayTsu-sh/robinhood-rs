@@ -3,6 +3,184 @@
 use bytes::Bytes;
 use lustre_api::LuFid;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Stable identifier for one configured filesystem.
+///
+/// Values are deliberately limited to a small, URL- and SQL-safe alphabet so
+/// the same identifier can be used in configuration, metrics, and catalog
+/// keys without separate escaping rules.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct FileSystemId(String);
+
+impl FileSystemId {
+    pub const MAX_LEN: usize = 64;
+
+    pub fn new(value: impl Into<String>) -> Result<Self, FileSystemIdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(FileSystemIdError::Empty);
+        }
+        if value.len() > Self::MAX_LEN {
+            return Err(FileSystemIdError::TooLong { len: value.len() });
+        }
+        if !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(FileSystemIdError::InvalidCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FileSystemId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for FileSystemId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FileSystemIdError {
+    #[error("filesystem id cannot be empty")]
+    Empty,
+    #[error("filesystem id is {len} bytes; maximum is 64")]
+    TooLong { len: usize },
+    #[error("filesystem id may contain only ASCII letters, digits, '-', '_', and '.'")]
+    InvalidCharacter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    Lustre,
+    JuiceFs,
+}
+
+impl BackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lustre => "lustre",
+            Self::JuiceFs => "juice_fs",
+        }
+    }
+
+    pub fn from_persisted(value: &str) -> Result<Self, BackendKindParseError> {
+        match value {
+            "lustre" => Ok(Self::Lustre),
+            "juice_fs" => Ok(Self::JuiceFs),
+            other => Err(BackendKindParseError(other.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown backend kind: {0}")]
+pub struct BackendKindParseError(String);
+
+/// Operations and metadata a backend can provide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCapabilities {
+    pub changelog: bool,
+    pub namespace: bool,
+    pub purge: bool,
+    pub hsm: bool,
+    pub stripe: bool,
+    pub ost: bool,
+}
+
+/// Configuration shared by all filesystem runtimes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSystemConfig {
+    pub id: FileSystemId,
+    pub backend: BackendKind,
+    pub mount_path: PathBuf,
+    pub capabilities: BackendCapabilities,
+}
+
+/// A backend-native object identity. Variants must never be converted into
+/// each other merely to fit an existing storage format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectId {
+    Lustre(LuFid),
+    JuiceFs(u64),
+}
+
+impl ObjectId {
+    pub fn backend(self) -> BackendKind {
+        match self {
+            Self::Lustre(_) => BackendKind::Lustre,
+            Self::JuiceFs(_) => BackendKind::JuiceFs,
+        }
+    }
+}
+
+/// Globally unambiguous catalog identity: filesystem plus native object id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EntryKey {
+    filesystem: FileSystemId,
+    object: ObjectId,
+}
+
+impl EntryKey {
+    pub fn new(filesystem: FileSystemId, object: ObjectId) -> Self {
+        Self { filesystem, object }
+    }
+
+    pub fn filesystem(&self) -> &FileSystemId {
+        &self.filesystem
+    }
+
+    pub fn object(&self) -> &ObjectId {
+        &self.object
+    }
+}
+
+/// An entry stored under the new filesystem-scoped identity model.
+///
+/// This intentionally lives beside [`EntryRow`] during the expand phase so
+/// existing Lustre callers keep compiling while new adapters avoid synthetic
+/// FIDs from their first persisted record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopedEntryRow {
+    pub key: EntryKey,
+    pub parent: Option<EntryKey>,
+    #[serde(with = "serde_bytes_compat")]
+    pub name: Bytes,
+    pub kind: EntryKind,
+    pub size: u64,
+    pub blocks: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub projid: u32,
+    pub mode: u32,
+    pub nlink: u32,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub stripe_count: Option<u16>,
+    pub stripe_size: Option<u32>,
+    pub pool_name: Option<String>,
+    pub sm_status: serde_json::Value,
+    pub last_seen: i64,
+    pub depth: u32,
+}
 
 /// Entry kind — matches the `kind` TINYINT column in `entries`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,5 +338,47 @@ mod tests {
         assert!(s.contains("\"base64\""), "expected base64 fallback, got: {s}");
         let back: EntryRow = serde_json::from_str(&s).unwrap();
         assert_eq!(back.name, r.name);
+    }
+
+    #[test]
+    fn entry_keys_keep_backend_native_object_ids_distinct() {
+        let filesystem = FileSystemId::new("production").unwrap();
+        let fid = LuFid::new(0x200000401, 0x42, 0);
+
+        let lustre = EntryKey::new(filesystem.clone(), ObjectId::Lustre(fid));
+        let juicefs = EntryKey::new(filesystem, ObjectId::JuiceFs(0x200000401));
+
+        assert_ne!(lustre, juicefs);
+        assert_eq!(lustre.object(), &ObjectId::Lustre(fid));
+        assert_eq!(juicefs.object(), &ObjectId::JuiceFs(0x200000401));
+    }
+
+    #[test]
+    fn filesystem_configuration_roundtrips_through_json() {
+        let config = FileSystemConfig {
+            id: FileSystemId::new("archive-jfs").unwrap(),
+            backend: BackendKind::JuiceFs,
+            mount_path: "/mnt/archive".into(),
+            capabilities: BackendCapabilities {
+                changelog: true,
+                namespace: true,
+                purge: true,
+                ..BackendCapabilities::default()
+            },
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let decoded: FileSystemConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, config);
+        assert!(json.contains("\"backend\":\"juice_fs\""));
+    }
+
+    #[test]
+    fn filesystem_id_rejects_values_unsafe_for_persistence() {
+        assert!(FileSystemId::new("").is_err());
+        assert!(FileSystemId::new("contains whitespace").is_err());
+        assert!(FileSystemId::new("a".repeat(65)).is_err());
+        assert_eq!(FileSystemId::new("prod-01.eu").unwrap().as_str(), "prod-01.eu");
     }
 }

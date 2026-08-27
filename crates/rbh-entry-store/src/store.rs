@@ -1,6 +1,10 @@
 //! `EntryStore` — the main interface to the `rbh_entries` MariaDB database.
 
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    ffi::OsString,
+    os::unix::ffi::{OsStrExt, OsStringExt},
+};
 
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{MySql, Pool, Row};
@@ -10,7 +14,7 @@ use lustre_api::LuFid;
 
 use crate::error::{Result, StoreError};
 use crate::fid_codec;
-use crate::model::{EntryKind, EntryRow};
+use crate::model::{EntryKey, EntryKind, EntryRow, FileSystemConfig, FileSystemId, ObjectId, ScopedEntryRow};
 
 /// A bind parameter for `query_where`. Avoids circular dependency on `rbh-predicate`.
 #[derive(Debug, Clone)]
@@ -89,6 +93,98 @@ impl EntryStore {
     /// Access the underlying pool (for advanced queries / testing).
     pub fn pool(&self) -> &Pool<MySql> {
         &self.pool
+    }
+
+    // ── Filesystem-scoped identity (expand phase) ──────────────────────
+
+    /// Register or update one filesystem and its advertised capabilities.
+    #[tracing::instrument(name = "store.register_filesystem", skip(self, config), fields(filesystem = %config.id, backend = ?config.backend))]
+    pub async fn register_filesystem(&self, config: &FileSystemConfig) -> Result<()> {
+        let capabilities = serde_json::to_string(&config.capabilities)?;
+
+        sqlx::query(
+            r"INSERT INTO filesystems (id, backend_kind, mount_path, capabilities)
+              VALUES (?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                backend_kind = VALUES(backend_kind),
+                mount_path = VALUES(mount_path),
+                capabilities = VALUES(capabilities)",
+        )
+        .bind(config.id.as_str())
+        .bind(config.backend.as_str())
+        .bind(config.mount_path.as_os_str().as_bytes())
+        .bind(capabilities)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load a registered filesystem by stable identifier.
+    #[tracing::instrument(name = "store.get_filesystem", skip(self), fields(filesystem = %id))]
+    pub async fn get_filesystem(&self, id: &FileSystemId) -> Result<Option<FileSystemConfig>> {
+        let row = sqlx::query("SELECT id, backend_kind, mount_path, capabilities FROM filesystems WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|row| row_to_filesystem(&row)).transpose()
+    }
+
+    /// Insert or update a complete filesystem-scoped catalog entry.
+    #[tracing::instrument(name = "store.upsert_scoped_entry", skip(self, entry), fields(filesystem = %entry.key.filesystem(), backend = ?entry.key.object().backend()))]
+    pub async fn upsert_scoped_entry(&self, entry: &ScopedEntryRow) -> Result<()> {
+        if let Some(config) = self.get_filesystem(entry.key.filesystem()).await?
+            && config.backend != entry.key.object().backend()
+        {
+            return Err(StoreError::BackendMismatch {
+                filesystem: entry.key.filesystem().clone(),
+                configured: config.backend,
+                object: entry.key.object().backend(),
+            });
+        }
+
+        let (kind, bytes) = encode_object_id(*entry.key.object());
+        let entry_data = serde_json::to_string(entry)?;
+        sqlx::query(
+            r"INSERT INTO scoped_entries (filesystem_id, object_kind, object_id, entry_data)
+              VALUES (?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data)",
+        )
+        .bind(entry.key.filesystem().as_str())
+        .bind(kind)
+        .bind(bytes.as_slice())
+        .bind(entry_data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load a complete catalog entry by filesystem-scoped identity.
+    #[tracing::instrument(name = "store.get_scoped_entry", skip(self), fields(filesystem = %key.filesystem(), backend = ?key.object().backend()))]
+    pub async fn get_scoped_entry(&self, key: &EntryKey) -> Result<Option<ScopedEntryRow>> {
+        let (kind, bytes) = encode_object_id(*key.object());
+        let row = sqlx::query(
+            r"SELECT entry_data
+              FROM scoped_entries
+              WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
+        )
+        .bind(key.filesystem().as_str())
+        .bind(kind)
+        .bind(bytes.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let entry_data: Vec<u8> = row.try_get("entry_data")?;
+        let entry: ScopedEntryRow = serde_json::from_slice(&entry_data)?;
+        if entry.key != *key {
+            return Err(StoreError::InvalidObjectIdentity(
+                "scoped entry key does not match its primary key",
+            ));
+        }
+        Ok(Some(entry))
     }
 
     // ── CRUD ────────────────────────────────────────────────────────────
@@ -830,6 +926,32 @@ fn row_to_entry(row: &sqlx::mysql::MySqlRow) -> Result<EntryRow> {
         sm_status,
         last_seen: row.try_get("last_seen")?,
         depth: row.try_get::<u32, _>("depth").unwrap_or(0),
+    })
+}
+
+fn encode_object_id(object: ObjectId) -> (u8, [u8; 16]) {
+    match object {
+        ObjectId::Lustre(fid) => (0, fid_codec::encode(&fid)),
+        ObjectId::JuiceFs(inode) => {
+            let mut bytes = [0; 16];
+            bytes[8..].copy_from_slice(&inode.to_be_bytes());
+            (1, bytes)
+        }
+    }
+}
+
+fn row_to_filesystem(row: &sqlx::mysql::MySqlRow) -> Result<FileSystemConfig> {
+    let id_text: String = row.try_get("id")?;
+    let id = FileSystemId::new(id_text)?;
+    let backend_text: String = row.try_get("backend_kind")?;
+    let mount_path: Vec<u8> = row.try_get("mount_path")?;
+    let capabilities: Vec<u8> = row.try_get("capabilities")?;
+
+    Ok(FileSystemConfig {
+        id,
+        backend: crate::model::BackendKind::from_persisted(&backend_text)?,
+        mount_path: OsString::from_vec(mount_path).into(),
+        capabilities: serde_json::from_slice(&capabilities)?,
     })
 }
 
