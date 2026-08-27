@@ -10,6 +10,7 @@ const DEFAULT_LUSTRE_MOUNT: &str = "/lustre";
 pub struct FileSystemRuntime {
     pub config: FileSystemConfig,
     pub changelog_agent: Option<JuiceFsAgentConfig>,
+    pub lustre_changelog: Vec<LustreChangelogConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -18,12 +19,20 @@ pub struct JuiceFsAgentConfig {
     pub volume: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LustreChangelogConfig {
+    pub mdt: String,
+    pub reader_id: String,
+}
+
 #[derive(Deserialize)]
 struct RuntimeInput {
     #[serde(flatten)]
     config: FileSystemConfig,
     #[serde(default)]
     changelog_agent: Option<JuiceFsAgentConfig>,
+    #[serde(default)]
+    lustre_changelog: Vec<LustreChangelogConfig>,
 }
 
 impl FileSystemRuntime {
@@ -35,7 +44,6 @@ impl FileSystemRuntime {
 #[derive(Debug, Clone)]
 pub struct RuntimeRegistry {
     runtimes: Vec<FileSystemRuntime>,
-    lustre_index: usize,
 }
 
 impl RuntimeRegistry {
@@ -56,38 +64,32 @@ impl RuntimeRegistry {
                 .map(|input| FileSystemRuntime {
                     config: input.config,
                     changelog_agent: input.changelog_agent,
+                    lustre_changelog: input.lustre_changelog,
                 })
                 .collect(),
             None => vec![FileSystemRuntime {
                 config: legacy_lustre_config(legacy_mount, legacy_id)?,
                 changelog_agent: None,
+                lustre_changelog: legacy_lustre_changelog(),
             }],
         };
 
-        let runtimes = configs;
-        let lustre: Vec<_> = runtimes
-            .iter()
-            .enumerate()
-            .filter(|(_, runtime)| runtime.config.backend == BackendKind::Lustre)
-            .map(|(index, _)| index)
-            .collect();
-        if lustre.len() != 1 {
-            return Err(RuntimeConfigError::ExpectedOneLustre { found: lustre.len() });
-        }
-
-        Ok(Self {
-            runtimes,
-            lustre_index: lustre[0],
-        })
-    }
-
-    pub fn lustre(&self) -> &FileSystemRuntime {
-        &self.runtimes[self.lustre_index]
+        Ok(Self { runtimes: configs })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &FileSystemRuntime> {
         self.runtimes.iter()
     }
+}
+
+fn legacy_lustre_changelog() -> Vec<LustreChangelogConfig> {
+    let mdts = std::env::var("RBH_MDTS").ok();
+    let legacy_mdt = std::env::var("RBH_MDT_NAME").ok();
+    let users = std::env::var("RBH_CHANGELOG_USER").unwrap_or_default();
+    super::pair_mdts_with_users(mdts.as_deref(), legacy_mdt.as_deref(), &users)
+        .into_iter()
+        .map(|(mdt, reader_id)| LustreChangelogConfig { mdt, reader_id })
+        .collect()
 }
 
 fn legacy_lustre_config(mount: Option<&str>, id: Option<&str>) -> Result<FileSystemConfig, RuntimeConfigError> {
@@ -112,8 +114,6 @@ pub enum RuntimeConfigError {
     InvalidFileSystemId(#[from] FileSystemIdError),
     #[error("RBH_FILESYSTEMS_JSON is invalid: {0}")]
     InvalidRegistryJson(serde_json::Error),
-    #[error("runtime registry must contain exactly one Lustre filesystem; found {found}")]
-    ExpectedOneLustre { found: usize },
 }
 
 #[cfg(test)]
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn legacy_mount_translates_to_a_capable_lustre_runtime() {
         let registry = RuntimeRegistry::resolve(None, Some("/mnt/legacy"), Some("archive-fs")).unwrap();
-        let runtime = registry.lustre();
+        let runtime = registry.iter().next().unwrap();
 
         assert_eq!(runtime.config.id.as_str(), "archive-fs");
         assert_eq!(runtime.config.mount_path, PathBuf::from("/mnt/legacy"));
@@ -146,9 +146,10 @@ mod tests {
         }]"#;
         let registry = RuntimeRegistry::resolve(Some(json), Some("/ignored"), None).unwrap();
 
-        assert_eq!(registry.lustre().config.id.as_str(), "lustre-no-hsm");
-        assert!(!registry.lustre().config.capabilities.hsm);
-        assert!(!registry.lustre().should_start_hsm_poller(30));
+        let runtime = registry.iter().next().unwrap();
+        assert_eq!(runtime.config.id.as_str(), "lustre-no-hsm");
+        assert!(!runtime.config.capabilities.hsm);
+        assert!(!runtime.should_start_hsm_poller(30));
     }
 
     #[test]
@@ -171,21 +172,34 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_ambiguous_lustre_selection() {
-        let config = legacy_lustre_config(None, None).unwrap();
-        let json = serde_json::to_string(&vec![config.clone(), config]).unwrap();
+    fn registry_accepts_multiple_lustre_runtimes_without_global_selection() {
+        let first = legacy_lustre_config(Some("/mnt/lustre-a"), Some("lustre-a")).unwrap();
+        let second = legacy_lustre_config(Some("/mnt/lustre-b"), Some("lustre-b")).unwrap();
+        let json = serde_json::to_string(&vec![first, second]).unwrap();
 
-        assert!(matches!(
-            RuntimeRegistry::resolve(Some(&json), None, None),
-            Err(RuntimeConfigError::ExpectedOneLustre { found: 2 })
-        ));
+        let registry = RuntimeRegistry::resolve(Some(&json), None, None).unwrap();
+        assert_eq!(registry.iter().count(), 2);
+    }
+
+    #[test]
+    fn registry_accepts_a_juicefs_only_deployment() {
+        let json = r#"[{
+          "id":"juice-only","backend":"juice_fs","mount_path":"/jfs",
+          "capabilities":{"changelog":true,"namespace":true,"purge":true,"hsm":false,"stripe":false,"ost":false},
+          "changelog_agent":{"endpoint":"http://agent:9443","volume":"juice-only"}
+        }]"#;
+
+        let registry = RuntimeRegistry::resolve(Some(json), None, None).unwrap();
+        assert_eq!(registry.iter().count(), 1);
+        assert_eq!(registry.iter().next().unwrap().config.backend, BackendKind::JuiceFs);
     }
 
     #[test]
     fn hsm_poller_requires_both_interval_and_capability() {
         let registry = RuntimeRegistry::resolve(None, None, None).unwrap();
 
-        assert!(!registry.lustre().should_start_hsm_poller(0));
-        assert!(registry.lustre().should_start_hsm_poller(30));
+        let runtime = registry.iter().next().unwrap();
+        assert!(!runtime.should_start_hsm_poller(0));
+        assert!(runtime.should_start_hsm_poller(30));
     }
 }

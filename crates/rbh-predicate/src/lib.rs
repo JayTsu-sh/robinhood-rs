@@ -14,7 +14,7 @@ mod sql;
 
 use serde::{Deserialize, Serialize};
 
-pub use eval::matches;
+pub use eval::{EntryView, matches};
 pub use sql::{OrderDir, SortKey, SqlParam, to_sql};
 
 /// A boolean predicate over entry attributes.

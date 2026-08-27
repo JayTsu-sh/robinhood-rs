@@ -3,14 +3,100 @@
 //! Used for fileclass classification at changelog-ingest time and for
 //! policy preview (dry-run) without hitting the database.
 
-use rbh_entry_store::model::EntryRow;
+use bytes::Bytes;
+use rbh_entry_store::model::{EntryKind, EntryRow, ScopedEntryRow};
 use regex::Regex;
 
 use crate::{CmpOp, Field, Predicate, Value};
 
 /// Evaluate `pred` against `entry` in-memory. Returns `true` if the entry
 /// matches the predicate.
-pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
+pub trait EntryView {
+    fn name(&self) -> &Bytes;
+    fn kind(&self) -> EntryKind;
+    fn size(&self) -> u64;
+    fn blocks(&self) -> u64;
+    fn uid(&self) -> u32;
+    fn gid(&self) -> u32;
+    fn projid(&self) -> u32;
+    fn mode(&self) -> u32;
+    fn nlink(&self) -> u32;
+    fn atime(&self) -> i64;
+    fn mtime(&self) -> i64;
+    fn ctime(&self) -> i64;
+    fn stripe_count(&self) -> Option<u16>;
+    fn stripe_size(&self) -> Option<u32>;
+    fn pool_name(&self) -> Option<&str>;
+    fn sm_status(&self) -> &serde_json::Value;
+    fn last_seen(&self) -> i64;
+    fn depth(&self) -> u32;
+}
+
+macro_rules! impl_entry_view {
+    ($ty:ty) => {
+        impl EntryView for $ty {
+            fn name(&self) -> &Bytes {
+                &self.name
+            }
+            fn kind(&self) -> EntryKind {
+                self.kind
+            }
+            fn size(&self) -> u64 {
+                self.size
+            }
+            fn blocks(&self) -> u64 {
+                self.blocks
+            }
+            fn uid(&self) -> u32 {
+                self.uid
+            }
+            fn gid(&self) -> u32 {
+                self.gid
+            }
+            fn projid(&self) -> u32 {
+                self.projid
+            }
+            fn mode(&self) -> u32 {
+                self.mode
+            }
+            fn nlink(&self) -> u32 {
+                self.nlink
+            }
+            fn atime(&self) -> i64 {
+                self.atime
+            }
+            fn mtime(&self) -> i64 {
+                self.mtime
+            }
+            fn ctime(&self) -> i64 {
+                self.ctime
+            }
+            fn stripe_count(&self) -> Option<u16> {
+                self.stripe_count
+            }
+            fn stripe_size(&self) -> Option<u32> {
+                self.stripe_size
+            }
+            fn pool_name(&self) -> Option<&str> {
+                self.pool_name.as_deref()
+            }
+            fn sm_status(&self) -> &serde_json::Value {
+                &self.sm_status
+            }
+            fn last_seen(&self) -> i64 {
+                self.last_seen
+            }
+            fn depth(&self) -> u32 {
+                self.depth
+            }
+        }
+    };
+}
+
+impl_entry_view!(EntryRow);
+impl_entry_view!(ScopedEntryRow);
+
+pub fn matches<E: EntryView + ?Sized>(pred: &Predicate, entry: &E) -> bool {
     match pred {
         Predicate::True => true,
         Predicate::False => false,
@@ -27,13 +113,13 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
         Predicate::NameLike { pattern } => {
             // Match directly on bytes — avoids UTF-8 lossy replacement artifacts
             // on filenames with raw bytes (valid on Lustre).
-            like_match(&entry.name, pattern.as_bytes())
+            like_match(entry.name(), pattern.as_bytes())
         }
 
         Predicate::InameLike { pattern } => {
             // Case-insensitive: lowercase both sides (ASCII fold; Lustre filenames
             // are almost always ASCII/UTF-8).
-            let name_lower = entry.name.to_ascii_lowercase();
+            let name_lower = entry.name().to_ascii_lowercase();
             let pat_lower = pattern.to_lowercase();
             like_match(&name_lower, pat_lower.as_bytes())
         }
@@ -42,7 +128,7 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
             // Compile on each call; patterns are typically short and evaluation
             // is rare in in-memory paths (changelog ingest). If this becomes a
             // hotspot, add a lazily-initialised cache.
-            let name = match std::str::from_utf8(&entry.name) {
+            let name = match std::str::from_utf8(entry.name()) {
                 Ok(s) => s,
                 Err(_) => return false, // non-UTF-8 filenames don't match regex
             };
@@ -50,7 +136,7 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
         }
 
         Predicate::Xattr { key, cmp, value } => {
-            let xattr_val = entry.sm_status.get("xattr").and_then(|x| x.get(key));
+            let xattr_val = entry.sm_status().get("xattr").and_then(|x| x.get(key));
             match (xattr_val, value) {
                 (Some(serde_json::Value::String(s)), Value::Str(rhs)) => {
                     compare(&Value::Str(s.clone()), cmp, &Value::Str(rhs.clone()))
@@ -63,10 +149,10 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
             }
         }
 
-        Predicate::InPool { pool } => entry.pool_name.as_deref() == Some(pool.as_str()),
+        Predicate::InPool { pool } => entry.pool_name() == Some(pool.as_str()),
 
         Predicate::HsmStateEq { state } => {
-            entry.sm_status.get("hsm_state").and_then(|v| v.as_str()) == Some(state.as_str())
+            entry.sm_status().get("hsm_state").and_then(|v| v.as_str()) == Some(state.as_str())
         }
 
         // OnOst is only meaningful with a DB-side JOIN against stripe_items.
@@ -79,7 +165,7 @@ pub fn matches(pred: &Predicate, entry: &EntryRow) -> bool {
             if match_tags.is_empty() {
                 return true;
             }
-            let xattr = entry.sm_status.get("xattr");
+            let xattr = entry.sm_status().get("xattr");
             match_tags
                 .iter()
                 .all(|(k, v)| xattr.and_then(|x| x.get(k)).and_then(|val| val.as_str()) == Some(v.as_str()))
@@ -93,23 +179,23 @@ fn clamp_u64(v: u64) -> i64 {
 }
 
 /// Extract a field value from the entry as a [`Value`] for comparison.
-fn extract_field(field: &Field, entry: &EntryRow) -> Value {
+fn extract_field<E: EntryView + ?Sized>(field: &Field, entry: &E) -> Value {
     match field {
-        Field::Size => Value::Num(clamp_u64(entry.size)),
-        Field::Blocks => Value::Num(clamp_u64(entry.blocks)),
-        Field::Uid => Value::Num(entry.uid as i64),
-        Field::Gid => Value::Num(entry.gid as i64),
-        Field::Projid => Value::Num(entry.projid as i64),
-        Field::Mode => Value::Num(entry.mode as i64),
-        Field::Nlink => Value::Num(entry.nlink as i64),
-        Field::Mtime => Value::Num(entry.mtime),
-        Field::Atime => Value::Num(entry.atime),
-        Field::Ctime => Value::Num(entry.ctime),
-        Field::Kind => Value::Num(entry.kind as i64),
-        Field::StripeCount => Value::Num(entry.stripe_count.unwrap_or(0) as i64),
-        Field::StripeSize => Value::Num(entry.stripe_size.unwrap_or(0) as i64),
-        Field::LastSeen => Value::Num(entry.last_seen),
-        Field::Depth => Value::Num(entry.depth as i64),
+        Field::Size => Value::Num(clamp_u64(entry.size())),
+        Field::Blocks => Value::Num(clamp_u64(entry.blocks())),
+        Field::Uid => Value::Num(entry.uid() as i64),
+        Field::Gid => Value::Num(entry.gid() as i64),
+        Field::Projid => Value::Num(entry.projid() as i64),
+        Field::Mode => Value::Num(entry.mode() as i64),
+        Field::Nlink => Value::Num(entry.nlink() as i64),
+        Field::Mtime => Value::Num(entry.mtime()),
+        Field::Atime => Value::Num(entry.atime()),
+        Field::Ctime => Value::Num(entry.ctime()),
+        Field::Kind => Value::Num(entry.kind() as i64),
+        Field::StripeCount => Value::Num(entry.stripe_count().unwrap_or(0) as i64),
+        Field::StripeSize => Value::Num(entry.stripe_size().unwrap_or(0) as i64),
+        Field::LastSeen => Value::Num(entry.last_seen()),
+        Field::Depth => Value::Num(entry.depth() as i64),
     }
 }
 

@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use lustre_api::LustreApi;
 use lustre_api::hsm::HsmState;
-use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId};
+use rbh_entry_store::model::{EntryKind, FileSystemId, ObjectId, ScopedEntryRow};
 use rbh_entry_store::store::{EntryStore, QueryParam};
 
 pub struct HsmPoller {
@@ -66,8 +66,12 @@ impl HsmPoller {
                         errors = stats.errors,
                         "hsm poller cycle complete"
                     );
-                    rbh_observability::metrics::HSM_POLL_RECONCILED.inc_by(stats.reconciled);
-                    rbh_observability::metrics::HSM_POLL_SCANNED.inc_by(stats.scanned);
+                    rbh_observability::metrics::HSM_POLL_RECONCILED
+                        .with_label_values(&[self.filesystem_id.as_str(), "lustre"])
+                        .inc_by(stats.reconciled);
+                    rbh_observability::metrics::HSM_POLL_SCANNED
+                        .with_label_values(&[self.filesystem_id.as_str(), "lustre"])
+                        .inc_by(stats.scanned);
                 }
                 Err(e) => tracing::warn!(filesystem = %self.filesystem_id, error = %e, "hsm poller cycle error"),
             }
@@ -102,20 +106,13 @@ impl HsmPoller {
                     offset,
                 )
                 .await?;
-            let rows: Vec<EntryRow> = scoped_rows
-                .into_iter()
-                .map(|row| {
-                    row.to_lustre_compat()
-                        .ok_or_else(|| anyhow::anyhow!("HSM poller received a non-Lustre object"))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            if rows.is_empty() {
+            if scoped_rows.is_empty() {
                 break;
             }
-            let row_count = rows.len() as u64;
+            let row_count = scoped_rows.len() as u64;
             offset += row_count;
 
-            for row in rows {
+            for row in scoped_rows {
                 stats.scanned += 1;
                 match self.reconcile_entry(row).await {
                     Ok(true) => stats.reconciled += 1,
@@ -141,10 +138,12 @@ impl HsmPoller {
         Ok(stats)
     }
 
-    async fn reconcile_entry(&self, entry: EntryRow) -> anyhow::Result<bool> {
+    async fn reconcile_entry(&self, entry: ScopedEntryRow) -> anyhow::Result<bool> {
         let lustre = self.lustre;
         let mount = self.mount_path.clone();
-        let fid = entry.fid;
+        let ObjectId::Lustre(fid) = *entry.key.object() else {
+            anyhow::bail!("HSM poller received a non-Lustre object");
+        };
 
         // Build .lustre/fid/<FID> — valid for stat/ioctl calls, which is
         // what llapi_hsm_state_get uses internally.
@@ -175,20 +174,10 @@ impl HsmPoller {
             "hsm_last_event_ts": now,
             "hsm_dirty": observed.states.contains(HsmState::DIRTY),
         });
-        self.entry_store
-            .legacy_lustre_patch_sm_status(&entry.fid, &patch)
-            .await?;
-        self.entry_store
-            .patch_scoped_sm_status(
-                &rbh_entry_store::EntryKey::new(
-                    self.filesystem_id.clone(),
-                    rbh_entry_store::ObjectId::Lustre(entry.fid),
-                ),
-                &patch,
-            )
-            .await?;
+        self.entry_store.patch_scoped_sm_status(&entry.key, &patch).await?;
         tracing::info!(
-            fid = %entry.fid,
+            filesystem = %self.filesystem_id,
+            fid = %fid,
             from = stored_label,
             to = observed_label,
             "hsm state reconciled from live state"

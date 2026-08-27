@@ -448,17 +448,14 @@ async fn lustre_scan_batch_populates_filesystem_scoped_baseline() {
     store.upsert_lustre_scan_batch(&filesystem, &rows).await.unwrap();
 
     for row in rows {
-        assert_eq!(
-            store.legacy_lustre_get_entry(&row.fid).await.unwrap().unwrap().name,
-            row.name
-        );
+        assert!(store.legacy_lustre_get_entry(&row.fid).await.unwrap().is_none());
         let entry = ScopedEntryRow::from_lustre(filesystem.clone(), &row);
         assert_eq!(store.get_scoped_entry(&entry.key).await.unwrap(), Some(entry));
     }
 }
 
 #[tokio::test]
-async fn lustre_compatibility_writes_keep_identical_fids_scoped() {
+async fn lustre_writes_keep_identical_fids_scoped_without_legacy_side_effects() {
     if !integration_enabled() {
         return;
     }
@@ -497,6 +494,7 @@ async fn lustre_compatibility_writes_keep_identical_fids_scoped() {
     second.stripe_items = vec![3];
     store.upsert_lustre_entry(&first_id, &first).await.unwrap();
     store.upsert_lustre_entry(&second_id, &second).await.unwrap();
+    assert!(store.legacy_lustre_get_entry(&first.fid).await.unwrap().is_none());
 
     assert_eq!(
         store
@@ -761,7 +759,27 @@ async fn cursor_store_mariadb_roundtrip() {
     // Run migrations so the changelog_cursor table exists.
     let _store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
 
-    let cursor = MariaDbCursorStore::new(pool);
+    // The migration is retry-safe, including after its DDL has fully applied.
+    let migration = include_str!("../migrations/010_scope_changelog_cursor.sql");
+    sqlx::raw_sql(migration).execute(&pool).await.expect("first retry");
+    sqlx::raw_sql(migration).execute(&pool).await.expect("second retry");
+
+    sqlx::query(
+        "INSERT INTO changelog_cursor (filesystem_id, mdt_name, last_rec, updated_at) VALUES ('__legacy_lustre__', 'legacy-MDT0000', 88, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    _store
+        .bind_legacy_lustre_cursors(&FileSystemId::new("lustre-a").unwrap())
+        .await
+        .unwrap();
+
+    let first_filesystem = FileSystemId::new("lustre-a").unwrap();
+    let second_filesystem = FileSystemId::new("lustre-b").unwrap();
+    let cursor = MariaDbCursorStore::new(pool.clone(), first_filesystem);
+    let second_cursor = MariaDbCursorStore::new(pool, second_filesystem);
+    assert_eq!(cursor.get("legacy-MDT0000").await.unwrap(), Some(88));
 
     // Initially empty.
     assert_eq!(cursor.get("testfs-MDT0000").await.unwrap(), None);
@@ -769,6 +787,9 @@ async fn cursor_store_mariadb_roundtrip() {
     // Commit and read back.
     cursor.commit("testfs-MDT0000", 42).await.unwrap();
     assert_eq!(cursor.get("testfs-MDT0000").await.unwrap(), Some(42));
+    assert_eq!(second_cursor.get("testfs-MDT0000").await.unwrap(), None);
+    second_cursor.commit("testfs-MDT0000", 7).await.unwrap();
+    assert_eq!(second_cursor.get("testfs-MDT0000").await.unwrap(), Some(7));
 
     // Monotonic advance.
     cursor.commit("testfs-MDT0000", 100).await.unwrap();

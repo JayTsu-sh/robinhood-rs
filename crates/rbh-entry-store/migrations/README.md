@@ -40,3 +40,4 @@ NNN_short_description.sql
 | `007_add_scoped_baselines.sql` | filesystem baseline state and parent/name namespace edges |
 | `008_scope_catalog_consumers.sql` | queryable filesystem-scoped metadata, removed entries, and stripe relationships |
 | `009_scope_policies.sql` | bind legacy policy definitions explicitly to the `lustre` filesystem |
+| `010_scope_changelog_cursor.sql` | scope Lustre changelog cursors by filesystem and MDT |

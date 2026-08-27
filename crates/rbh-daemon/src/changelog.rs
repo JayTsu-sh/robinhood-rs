@@ -5,7 +5,7 @@
 //!
 //! For creation events (Create, Mkdir, Mknod, Softlink), we stat the file
 //! via `fid_to_path` + `symlink_metadata` to populate the full [`EntryRow`].
-//! For deletion events (Unlink with last_link, Rmdir), we call `legacy_lustre_remove_entry`.
+//! Deletion events update only the originating filesystem's scoped catalog.
 //! For Rename, we update parent_fid + name and handle rename-overwrite.
 //! For metadata events (Close, SetAttr, Truncate, MTime, CTime), we re-stat
 //! the file to refresh changed fields.
@@ -69,11 +69,14 @@ async fn receive(source: &mut dyn ChangeSource, cancel: &CancellationToken, wait
 /// applies events to the entry store, and sends acks back.
 ///
 /// Exits when the listener channel closes or the cancel token fires.
-#[tracing::instrument(name = "changelog.ingest", skip_all, fields(filesystem = %filesystem_id))]
+#[tracing::instrument(name = "changelog.ingest", skip_all, fields(filesystem = %filesystem_id, backend = tracing::field::Empty))]
 pub async fn ingest_loop(
     mut source: Box<dyn ChangeSource>, entry_store: EntryStore, filesystem_id: FileSystemId, mount_path: PathBuf,
     cancel: CancellationToken, classifier_cache: std::sync::Arc<tokio::sync::RwLock<Vec<rbh_policy::ClassifierRow>>>,
 ) -> IngestExit {
+    if let Ok(Some(config)) = entry_store.get_filesystem(&filesystem_id).await {
+        tracing::Span::current().record("backend", config.backend.as_str());
+    }
     tracing::info!("changelog ingest loop started");
     let mut catching_up = entry_store
         .get_baseline(&filesystem_id)
@@ -179,7 +182,12 @@ pub async fn ingest_loop(
             }
             for (ty, n) in by_type {
                 rbh_observability::metrics::CHANGELOG_EVENTS
-                    .with_label_values(&[mdt.as_str(), ty])
+                    .with_label_values(&[
+                        filesystem_id.as_str(),
+                        change_backend_label(&batch.changes),
+                        mdt.as_str(),
+                        ty,
+                    ])
                     .inc_by(n);
             }
         }
@@ -268,6 +276,13 @@ pub async fn ingest_loop(
 
     tracing::info!("changelog ingest loop exiting");
     IngestExit::Stopped
+}
+
+fn change_backend_label(changes: &[Change]) -> &'static str {
+    changes
+        .first()
+        .map(|change| change_object(change).backend().as_str())
+        .unwrap_or("unknown")
 }
 
 async fn verify_juicefs_namespace(store: &EntryStore, filesystem: &FileSystemId, mount: &Path) -> anyhow::Result<()> {
@@ -492,9 +507,6 @@ async fn apply_classifiers(
             continue;
         }
         if let Some(tags) = rbh_policy::evaluate_classifier(&classifier.definition, entry) {
-            store
-                .legacy_lustre_update_xattr(&entry.fid, tags, &classifier.definition.manages)
-                .await?;
             store
                 .update_scoped_xattr(
                     &EntryKey::new(filesystem.clone(), ObjectId::Lustre(entry.fid)),
@@ -873,16 +885,15 @@ async fn apply_hsm_event(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let patch = build_hsm_patch(hsm_event, hsm_flags, hsm_error, now);
-    let touched = store.legacy_lustre_patch_sm_status(fid, &patch).await?;
-    let scoped_touched = store
+    let touched = store
         .patch_scoped_sm_status(&EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid)), &patch)
         .await?;
-    if !touched && !scoped_touched {
+    if !touched {
         tracing::debug!(%fid, event = hsm_event, "HSM event for entry not yet in catalog — skipped");
     } else {
         tracing::debug!(%fid, event = hsm_event, flags = hsm_flags, error = hsm_error, "HSM state patched");
     }
-    Ok(touched || scoped_touched)
+    Ok(touched)
 }
 
 #[cfg(test)]
@@ -1141,6 +1152,183 @@ mod tests {
         .await;
         assert!(commit_rx.await.is_err(), "failed catalog write must not commit or ACK");
     }
+
+    #[tokio::test]
+    async fn lustre_and_juicefs_runtimes_ingest_checkpoint_and_act_independently() {
+        if std::env::var("RBH_MULTI_FS_INTEGRATION").as_deref() != Ok("1") {
+            return;
+        }
+        use rbh_actions::{ActionBackend, BackendAction, BackendActionOutcome, BackendAlert};
+
+        let url =
+            std::env::var("RBH_ACTIONS_DB").unwrap_or_else(|_| "mysql://root@127.0.0.1/rbh_multi_runtime_test".into());
+        let lustre_mount =
+            PathBuf::from(std::env::var("RBH_LUSTRE_MOUNT").unwrap_or_else(|_| "/mnt/smartiq/lustre".into()));
+        let store = EntryStore::connect(&url).await.unwrap();
+        let lustre_id = FileSystemId::new(format!("multi-lustre-{}", std::process::id())).unwrap();
+        let juice_id = FileSystemId::new(format!("multi-juice-{}", std::process::id())).unwrap();
+        let lustre_dir = tempfile::Builder::new()
+            .prefix(".rbh-multi-")
+            .tempdir_in(&lustre_mount)
+            .unwrap();
+        let juice_dir = tempfile::tempdir().unwrap();
+        store
+            .register_filesystem(&FileSystemConfig {
+                id: lustre_id.clone(),
+                backend: BackendKind::Lustre,
+                mount_path: lustre_mount.clone(),
+                capabilities: BackendCapabilities {
+                    namespace: true,
+                    purge: true,
+                    changelog: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        store
+            .register_filesystem(&FileSystemConfig {
+                id: juice_id.clone(),
+                backend: BackendKind::JuiceFs,
+                mount_path: juice_dir.path().to_path_buf(),
+                capabilities: BackendCapabilities {
+                    namespace: true,
+                    purge: true,
+                    changelog: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+
+        std::fs::write(lustre_dir.path().join("scanned"), b"lustre scan").unwrap();
+        std::fs::write(juice_dir.path().join("scanned"), b"juice scan").unwrap();
+        crate::run_initial_scan(&store, &lustre_id, lustre_dir.path())
+            .await
+            .unwrap();
+        crate::run_juicefs_baseline(&store, &juice_id, juice_dir.path())
+            .await
+            .unwrap();
+        assert!(store.scoped_entry_count(&lustre_id).await.unwrap() >= 2);
+        assert!(store.scoped_entry_count(&juice_id).await.unwrap() >= 2);
+
+        let lustre_path = lustre_dir.path().join("ingested");
+        std::fs::write(&lustre_path, b"lustre ingest").unwrap();
+        let lustre = LustreApi;
+        let lustre_fid = lustre.path_to_fid(&lustre_path).unwrap();
+        let lustre_parent = lustre.path_to_fid(lustre_dir.path()).unwrap();
+        let juice_path = juice_dir.path().join("ingested");
+        std::fs::write(&juice_path, b"juice ingest").unwrap();
+        let juice_inode = std::fs::metadata(&juice_path).unwrap().ino();
+        let juice_parent = std::fs::metadata(juice_dir.path()).unwrap().ino();
+        let (lustre_tx, lustre_rx) = oneshot::channel();
+        let (juice_tx, juice_rx) = oneshot::channel();
+        let lustre_checkpoint = Checkpoint {
+            source: "lustre-MDT0000".into(),
+            position: 101,
+        };
+        let juice_checkpoint = Checkpoint {
+            source: "juice-volume".into(),
+            position: 202,
+        };
+        let lustre_run = ingest_loop(
+            Box::new(OneBatchSource {
+                batch: Some(ChangeBatch {
+                    filesystem: lustre_id.clone(),
+                    changes: vec![Change::Created {
+                        object: ObjectId::Lustre(lustre_fid),
+                        parent: ObjectId::Lustre(lustre_parent),
+                        name: Bytes::from_static(b"ingested"),
+                        kind: EntryKind::File,
+                        metadata: None,
+                        time: 1_700_000_100,
+                    }],
+                    checkpoint: lustre_checkpoint.clone(),
+                }),
+                committed: Some(lustre_tx),
+            }),
+            store.clone(),
+            lustre_id.clone(),
+            lustre_mount.clone(),
+            CancellationToken::new(),
+            Default::default(),
+        );
+        let juice_run = ingest_loop(
+            Box::new(OneBatchSource {
+                batch: Some(ChangeBatch {
+                    filesystem: juice_id.clone(),
+                    changes: vec![Change::Created {
+                        object: ObjectId::JuiceFs(juice_inode),
+                        parent: ObjectId::JuiceFs(juice_parent),
+                        name: Bytes::from_static(b"ingested"),
+                        kind: EntryKind::File,
+                        metadata: None,
+                        time: 1_700_000_200,
+                    }],
+                    checkpoint: juice_checkpoint.clone(),
+                }),
+                committed: Some(juice_tx),
+            }),
+            store.clone(),
+            juice_id.clone(),
+            juice_dir.path().to_path_buf(),
+            CancellationToken::new(),
+            Default::default(),
+        );
+        let failed_run = ingest_loop(
+            Box::new(RetentionGapSource),
+            store.clone(),
+            FileSystemId::new("isolated-failure").unwrap(),
+            "/missing".into(),
+            CancellationToken::new(),
+            Default::default(),
+        );
+        let (lustre_exit, juice_exit, failed_exit) = tokio::join!(lustre_run, juice_run, failed_run);
+        assert_eq!(lustre_exit, IngestExit::Stopped);
+        assert_eq!(juice_exit, IngestExit::Stopped);
+        assert!(matches!(failed_exit, IngestExit::RetentionGap(_)));
+        assert_eq!(lustre_rx.await.unwrap(), lustre_checkpoint);
+        assert_eq!(juice_rx.await.unwrap(), juice_checkpoint);
+
+        let lustre_key = EntryKey::new(lustre_id.clone(), ObjectId::Lustre(lustre_fid));
+        let juice_key = EntryKey::new(juice_id.clone(), ObjectId::JuiceFs(juice_inode));
+        let lustre_entry = store.get_scoped_entry(&lustre_key).await.unwrap().unwrap();
+        let juice_entry = store.get_scoped_entry(&juice_key).await.unwrap().unwrap();
+        for (filesystem, entry) in [(&lustre_id, &lustre_entry), (&juice_id, &juice_entry)] {
+            let backend = ActionBackend::new(store.clone(), filesystem.clone()).await.unwrap();
+            assert_eq!(
+                backend
+                    .alert(
+                        entry,
+                        &BackendAlert {
+                            webhook: None,
+                            log: false,
+                            message: Some("multi-runtime".into()),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                BackendActionOutcome::Success
+            );
+        }
+        for (filesystem, backend) in [(&lustre_id, BackendKind::Lustre), (&juice_id, BackendKind::JuiceFs)] {
+            let definition: rbh_policy::PolicyDef = serde_json::from_value(serde_json::json!({
+                "name": format!("alert-{filesystem}"),
+                "filesystem": filesystem,
+                "kind": "alert",
+                "trigger": "1h"
+            }))
+            .unwrap();
+            let config = store.get_filesystem(filesystem).await.unwrap().unwrap();
+            assert_eq!(config.backend, backend);
+            rbh_policy::validate_policy_for_filesystem(&definition, &config).unwrap();
+        }
+        let metrics = rbh_observability::metrics::render().unwrap();
+        assert!(metrics.contains(&format!("filesystem=\"{lustre_id}\"")));
+        assert!(metrics.contains(&format!("filesystem=\"{juice_id}\"")));
+        assert!(metrics.contains("backend=\"lustre\""));
+        assert!(metrics.contains("backend=\"juice_fs\""));
+    }
 }
 
 /// Re-stat an existing entry and update it in the store.
@@ -1198,9 +1386,6 @@ async fn refresh_hsm_state_if_managed(
             "HSM state refreshed after TRUNC event"
         );
         let patch = serde_json::json!({ "hsm_state": new_state });
-        if let Err(e) = store.legacy_lustre_patch_sm_status(fid, &patch).await {
-            tracing::warn!(%fid, error = %e, new_state, "failed to patch hsm_state after TRUNC event");
-        }
         store
             .patch_scoped_sm_status(&EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid)), &patch)
             .await?;

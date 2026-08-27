@@ -71,8 +71,14 @@ async fn health() -> impl IntoResponse {
 // scrape — the entries count is the only point-in-time metric that's
 // not updated on a hot path.
 async fn metrics_endpoint(State(state): State<AppState>) -> axum::response::Response {
-    if let Ok(count) = state.entry_store.legacy_lustre_entry_count().await {
-        rbh_observability::metrics::CATALOG_ENTRIES.set(count as i64);
+    if let Ok(filesystems) = state.entry_store.list_filesystems().await {
+        for filesystem in filesystems {
+            if let Ok(count) = state.entry_store.scoped_entry_count(&filesystem.id).await {
+                rbh_observability::metrics::CATALOG_ENTRIES
+                    .with_label_values(&[filesystem.id.as_str(), filesystem.backend.as_str()])
+                    .set(count as i64);
+            }
+        }
     }
     match rbh_observability::metrics::render() {
         Ok(body) => (

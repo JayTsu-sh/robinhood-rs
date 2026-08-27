@@ -133,6 +133,13 @@ impl EntryStore {
         row.map(|row| row_to_filesystem(&row)).transpose()
     }
 
+    pub async fn list_filesystems(&self) -> Result<Vec<FileSystemConfig>> {
+        let rows = sqlx::query("SELECT id, backend_kind, mount_path, capabilities FROM filesystems ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_filesystem).collect()
+    }
+
     /// Insert or update a complete filesystem-scoped catalog entry.
     #[tracing::instrument(name = "store.upsert_scoped_entry", skip(self, entry), fields(filesystem = %entry.key.filesystem(), backend = ?entry.key.object().backend()))]
     pub async fn upsert_scoped_entry(&self, entry: &ScopedEntryRow) -> Result<()> {
@@ -1122,8 +1129,7 @@ impl EntryStore {
         Ok(())
     }
 
-    /// Atomically persist one Lustre scan batch in both compatibility and
-    /// filesystem-scoped catalogs.
+    /// Atomically persist one Lustre scan batch in the filesystem-scoped catalog.
     #[tracing::instrument(name = "store.upsert_lustre_scan_batch", skip(self, entries), fields(filesystem = %filesystem, count = entries.len()))]
     pub async fn upsert_lustre_scan_batch(&self, filesystem: &FileSystemId, entries: &[EntryRow]) -> Result<()> {
         if entries.is_empty() {
@@ -1143,51 +1149,8 @@ impl EntryStore {
         let mut tx = self.pool.begin().await?;
         for entry in entries {
             let fid_bin = fid_codec::encode(&entry.fid);
-            let parent_bin = entry.parent_fid.as_ref().map(fid_codec::encode);
-            let sm_json = serde_json::to_string(&entry.sm_status)?;
-            sqlx::query(
-                r"INSERT INTO entries
-                    (fid, parent_fid, name, kind, size, blocks, uid, gid, projid, mode, nlink,
-                     atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen, depth)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                  ON DUPLICATE KEY UPDATE
-                    parent_fid = VALUES(parent_fid), name = VALUES(name), kind = VALUES(kind),
-                    size = VALUES(size), blocks = VALUES(blocks), uid = VALUES(uid), gid = VALUES(gid),
-                    projid = VALUES(projid), mode = VALUES(mode), nlink = VALUES(nlink),
-                    atime = VALUES(atime), mtime = VALUES(mtime), ctime = VALUES(ctime),
-                    stripe_count = VALUES(stripe_count), stripe_size = VALUES(stripe_size),
-                    pool_name = VALUES(pool_name), sm_status = VALUES(sm_status),
-                    last_seen = VALUES(last_seen), depth = VALUES(depth)",
-            )
-            .bind(fid_bin.as_slice())
-            .bind(parent_bin.as_ref().map(|value| value.as_slice()))
-            .bind(entry.name.as_ref())
-            .bind(entry.kind as u8)
-            .bind(entry.size)
-            .bind(entry.blocks)
-            .bind(entry.uid)
-            .bind(entry.gid)
-            .bind(entry.projid)
-            .bind(entry.mode)
-            .bind(entry.nlink)
-            .bind(entry.atime)
-            .bind(entry.mtime)
-            .bind(entry.ctime)
-            .bind(entry.stripe_count)
-            .bind(entry.stripe_size)
-            .bind(&entry.pool_name)
-            .bind(&sm_json)
-            .bind(entry.last_seen)
-            .bind(entry.depth)
-            .execute(&mut *tx)
-            .await?;
-
             let scoped = ScopedEntryRow::from_lustre(filesystem.clone(), entry);
             upsert_scoped_entry_tx(&mut tx, &scoped).await?;
-            sqlx::query("DELETE FROM stripe_items WHERE fid = ?")
-                .bind(fid_bin.as_slice())
-                .execute(&mut *tx)
-                .await?;
             sqlx::query(
                 "DELETE FROM scoped_stripe_items WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?",
             )
@@ -1196,12 +1159,6 @@ impl EntryStore {
             .execute(&mut *tx)
             .await?;
             for (stripe_index, ost_index) in entry.stripe_items.iter().copied().enumerate() {
-                sqlx::query("INSERT INTO stripe_items (fid, stripe_index, ost_index) VALUES (?, ?, ?)")
-                    .bind(fid_bin.as_slice())
-                    .bind(stripe_index as u16)
-                    .bind(ost_index)
-                    .execute(&mut *tx)
-                    .await?;
                 sqlx::query(
                     r"INSERT INTO scoped_stripe_items
                         (filesystem_id, object_kind, object_id, stripe_index, ost_index)
@@ -1234,8 +1191,7 @@ impl EntryStore {
         Ok(())
     }
 
-    /// Persist one Lustre observation into both the scoped catalog and the
-    /// temporary legacy compatibility table.
+    /// Persist one Lustre observation into the filesystem-scoped catalog.
     #[tracing::instrument(name = "store.upsert_lustre_entry", skip(self, entry), fields(filesystem = %filesystem, fid = %entry.fid))]
     pub async fn upsert_lustre_entry(&self, filesystem: &FileSystemId, entry: &EntryRow) -> Result<()> {
         self.upsert_lustre_scan_batch(filesystem, std::slice::from_ref(entry))
@@ -1253,14 +1209,10 @@ impl EntryStore {
     }
 
     /// Move a scoped Lustre object into the filesystem-scoped removed set.
-    /// The legacy table is updated first as a compatibility side effect; a
-    /// failed scoped transaction prevents checkpoint advancement and replay
-    /// converges both projections.
     #[tracing::instrument(name = "store.remove_lustre_entry", skip(self), fields(filesystem = %filesystem, fid = %fid))]
     pub async fn remove_lustre_entry(&self, filesystem: &FileSystemId, fid: &LuFid, rm_time: i64) -> Result<()> {
         let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
         let scoped = self.get_scoped_entry(&key).await?;
-        self.legacy_lustre_remove_entry(fid, rm_time).await?;
         let Some(entry) = scoped else {
             return Ok(());
         };
@@ -1300,8 +1252,7 @@ impl EntryStore {
         Ok(())
     }
 
-    /// Apply a Lustre rename to both projections while keeping namespace
-    /// edges inside the selected filesystem.
+    /// Apply a Lustre rename inside the selected filesystem.
     #[tracing::instrument(name = "store.rename_lustre_entry", skip(self, entry), fields(filesystem = %filesystem, fid = %entry.fid))]
     pub async fn rename_lustre_entry(&self, filesystem: &FileSystemId, entry: &EntryRow, rm_time: i64) -> Result<()> {
         let displaced = if let Some(parent) = entry.parent_fid {
@@ -1321,7 +1272,6 @@ impl EntryStore {
         } else {
             None
         };
-        self.legacy_lustre_rename_entry(entry, rm_time).await?;
         if let Some(fid) = displaced {
             self.remove_lustre_entry(filesystem, &fid, rm_time).await?;
         }
@@ -1880,22 +1830,63 @@ async fn upsert_scoped_entry_tx(tx: &mut sqlx::Transaction<'_, MySql>, entry: &S
 
 /// MariaDB-backed implementation of `lustre_changelog::CursorStore`.
 ///
-/// Stores the last committed record index per MDT in the `changelog_cursor`
-/// table. Uses `INSERT ... ON DUPLICATE KEY UPDATE` for atomicity.
+/// Stores the last committed record index per filesystem and MDT in the
+/// `changelog_cursor` table. Uses `INSERT ... ON DUPLICATE KEY UPDATE` for
+/// atomicity.
 pub struct MariaDbCursorStore {
     pool: Pool<MySql>,
+    filesystem: FileSystemId,
 }
 
 impl MariaDbCursorStore {
-    pub fn new(pool: Pool<MySql>) -> Self {
-        Self { pool }
+    pub fn new(pool: Pool<MySql>, filesystem: FileSystemId) -> Self {
+        Self { pool, filesystem }
+    }
+}
+
+impl EntryStore {
+    /// Bind pre-filesystem cursor rows to the sole configured Lustre runtime.
+    ///
+    /// Callers must only use this compatibility migration when the runtime
+    /// registry contains exactly one Lustre filesystem; otherwise the legacy
+    /// rows are intentionally left untouched rather than guessed.
+    pub async fn bind_legacy_lustre_cursors(&self, filesystem: &FileSystemId) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r"UPDATE changelog_cursor AS scoped
+              JOIN changelog_cursor AS legacy
+                ON legacy.filesystem_id = '__legacy_lustre__'
+               AND scoped.filesystem_id = ?
+               AND scoped.mdt_name = legacy.mdt_name
+              SET scoped.last_rec = GREATEST(scoped.last_rec, legacy.last_rec),
+                  scoped.updated_at = GREATEST(scoped.updated_at, legacy.updated_at),
+                  scoped.reader_id = COALESCE(scoped.reader_id, legacy.reader_id)",
+        )
+        .bind(filesystem.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            r"INSERT IGNORE INTO changelog_cursor
+                (filesystem_id, mdt_name, reader_id, last_rec, updated_at)
+              SELECT ?, mdt_name, reader_id, last_rec, updated_at
+              FROM changelog_cursor WHERE filesystem_id = '__legacy_lustre__'",
+        )
+        .bind(filesystem.as_str())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM changelog_cursor WHERE filesystem_id = '__legacy_lustre__'")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 }
 
 #[async_trait::async_trait]
 impl lustre_changelog::CursorStore for MariaDbCursorStore {
     async fn get(&self, mdt: &str) -> std::result::Result<Option<u64>, lustre_changelog::CursorError> {
-        let row = sqlx::query("SELECT last_rec FROM changelog_cursor WHERE mdt_name = ?")
+        let row = sqlx::query("SELECT last_rec FROM changelog_cursor WHERE filesystem_id = ? AND mdt_name = ?")
+            .bind(self.filesystem.as_str())
             .bind(mdt)
             .fetch_optional(&self.pool)
             .await
@@ -1920,9 +1911,10 @@ impl lustre_changelog::CursorStore for MariaDbCursorStore {
 
         // Use GREATEST to enforce monotonicity at the DB level.
         sqlx::query(
-            "INSERT INTO changelog_cursor (mdt_name, last_rec, updated_at) VALUES (?, ?, ?)
+            "INSERT INTO changelog_cursor (filesystem_id, mdt_name, last_rec, updated_at) VALUES (?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE last_rec = GREATEST(last_rec, VALUES(last_rec)), updated_at = VALUES(updated_at)",
         )
+        .bind(self.filesystem.as_str())
         .bind(mdt)
         .bind(rec_id)
         .bind(now)

@@ -6,13 +6,17 @@
 //! the `/metrics` endpoint.
 
 use once_cell::sync::Lazy;
-use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry};
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry};
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 /// Current catalog entry count. Refreshed by the `/metrics` handler.
-pub static CATALOG_ENTRIES: Lazy<IntGauge> = Lazy::new(|| {
-    let g = IntGauge::new("rbh_catalog_entries", "Entries currently in the catalog").expect("metric registration");
+pub static CATALOG_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new("rbh_catalog_entries", "Entries currently in the catalog"),
+        &["filesystem", "backend"],
+    )
+    .expect("metric registration");
     REGISTRY.register(Box::new(g.clone())).ok();
     g
 });
@@ -22,7 +26,7 @@ pub static CATALOG_ENTRIES: Lazy<IntGauge> = Lazy::new(|| {
 pub static POLICY_RUNS: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("rbh_policy_runs_total", "Policy runs completed"),
-        &["policy_id", "outcome"],
+        &["filesystem", "backend", "policy_id", "outcome"],
     )
     .expect("metric registration");
     REGISTRY.register(Box::new(c.clone())).ok();
@@ -34,7 +38,7 @@ pub static POLICY_RUN_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     let h = HistogramVec::new(
         HistogramOpts::new("rbh_policy_run_duration_seconds", "Policy run wall-clock duration")
             .buckets(vec![0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 3600.0]),
-        &["policy_id"],
+        &["filesystem", "backend", "policy_id"],
     )
     .expect("metric registration");
     REGISTRY.register(Box::new(h.clone())).ok();
@@ -45,7 +49,7 @@ pub static POLICY_RUN_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
 pub static THRESHOLD_FIRES: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("rbh_threshold_fires_total", "Threshold trigger fires"),
-        &["policy_id"],
+        &["filesystem", "backend", "policy_id"],
     )
     .expect("metric registration");
     REGISTRY.register(Box::new(c.clone())).ok();
@@ -59,7 +63,7 @@ pub static CHANGELOG_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
             "rbh_changelog_events_total",
             "Changelog events ingested per MDT per type",
         ),
-        &["mdt", "event_type"],
+        &["filesystem", "backend", "source", "event_type"],
     )
     .expect("metric registration");
     REGISTRY.register(Box::new(c.clone())).ok();
@@ -67,11 +71,14 @@ pub static CHANGELOG_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
 });
 
 /// Entries scanned by the active-HSM-state poller.
-pub static HSM_POLL_SCANNED: Lazy<prometheus::IntCounter> = Lazy::new(|| {
-    let c = prometheus::IntCounter::with_opts(Opts::new(
-        "rbh_hsm_poll_scanned_total",
-        "Entries inspected by the HSM state poller",
-    ))
+pub static HSM_POLL_SCANNED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "rbh_hsm_poll_scanned_total",
+            "Entries inspected by the HSM state poller",
+        ),
+        &["filesystem", "backend"],
+    )
     .expect("metric registration");
     REGISTRY.register(Box::new(c.clone())).ok();
     c
@@ -79,11 +86,14 @@ pub static HSM_POLL_SCANNED: Lazy<prometheus::IntCounter> = Lazy::new(|| {
 
 /// Entries whose catalog HSM state was patched to match the live MDS
 /// state during a poller cycle.
-pub static HSM_POLL_RECONCILED: Lazy<prometheus::IntCounter> = Lazy::new(|| {
-    let c = prometheus::IntCounter::with_opts(Opts::new(
-        "rbh_hsm_poll_reconciled_total",
-        "Entries whose HSM state was corrected by the poller",
-    ))
+pub static HSM_POLL_RECONCILED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "rbh_hsm_poll_reconciled_total",
+            "Entries whose HSM state was corrected by the poller",
+        ),
+        &["filesystem", "backend"],
+    )
     .expect("metric registration");
     REGISTRY.register(Box::new(c.clone())).ok();
     c
@@ -93,7 +103,7 @@ pub static HSM_POLL_RECONCILED: Lazy<prometheus::IntCounter> = Lazy::new(|| {
 pub static ACTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("rbh_actions_total", "Per-entry action outcomes"),
-        &["policy_id", "outcome"],
+        &["filesystem", "backend", "policy_id", "outcome"],
     )
     .expect("metric registration");
     REGISTRY.register(Box::new(c.clone())).ok();
@@ -115,13 +125,19 @@ mod tests {
 
     #[test]
     fn render_contains_registered_families() {
-        CATALOG_ENTRIES.set(42);
-        POLICY_RUNS.with_label_values(&["7", "success"]).inc();
-        THRESHOLD_FIRES.with_label_values(&["7"]).inc_by(3);
+        CATALOG_ENTRIES.with_label_values(&["lustre-a", "lustre"]).set(42);
+        POLICY_RUNS
+            .with_label_values(&["lustre-a", "lustre", "7", "success"])
+            .inc();
+        THRESHOLD_FIRES
+            .with_label_values(&["lustre-a", "lustre", "7"])
+            .inc_by(3);
         let out = render().unwrap();
         assert!(out.contains("rbh_catalog_entries"));
         assert!(out.contains("rbh_policy_runs_total"));
         assert!(out.contains("rbh_threshold_fires_total"));
         assert!(out.contains("42"));
+        assert!(out.contains("filesystem=\"lustre-a\""));
+        assert!(out.contains("backend=\"lustre\""));
     }
 }

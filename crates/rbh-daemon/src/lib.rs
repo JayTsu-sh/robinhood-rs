@@ -41,29 +41,43 @@ pub async fn run() -> anyhow::Result<()> {
     let runtime_registry = runtime::RuntimeRegistry::from_env()?;
     for filesystem in runtime_registry.iter() {
         entry_store.register_filesystem(&filesystem.config).await?;
+        tracing::info!(
+            filesystem = %filesystem.config.id,
+            backend = ?filesystem.config.backend,
+            mount = %filesystem.config.mount_path.display(),
+            capabilities = ?filesystem.config.capabilities,
+            "filesystem runtime registered"
+        );
     }
-    let lustre_runtime = runtime_registry.lustre().clone();
-    let filesystem_id = lustre_runtime.config.id.clone();
-    let mount_path = lustre_runtime.config.mount_path.clone();
-    let capabilities = lustre_runtime.config.capabilities;
-    tracing::info!(
-        filesystem = %filesystem_id,
-        backend = ?lustre_runtime.config.backend,
-        mount = %mount_path.display(),
-        ?capabilities,
-        "filesystem runtime selected"
-    );
     let policy_store = rbh_policy::PolicyStore::new(pool.clone());
     policy_store
         .check_schema()
         .await
         .context("policy schema check failed")?;
-    let rebound = policy_store
-        .bind_legacy_lustre_filesystem(&filesystem_id)
-        .await
-        .context("failed to bind legacy policies to the configured Lustre filesystem")?;
-    if rebound > 0 {
-        tracing::info!(filesystem = %filesystem_id, policies = rebound, "legacy policies bound to configured Lustre filesystem");
+    let lustre: Vec<_> = runtime_registry
+        .iter()
+        .filter(|runtime| runtime.config.backend == rbh_entry_store::BackendKind::Lustre)
+        .collect();
+    if let [runtime] = lustre.as_slice() {
+        let rebound_cursors = entry_store
+            .bind_legacy_lustre_cursors(&runtime.config.id)
+            .await
+            .context("failed to bind legacy changelog cursors to the sole configured Lustre filesystem")?;
+        if rebound_cursors > 0 {
+            tracing::info!(filesystem = %runtime.config.id, cursors = rebound_cursors, "legacy changelog cursors bound to sole Lustre filesystem");
+        }
+        let rebound = policy_store
+            .bind_legacy_lustre_filesystem(&runtime.config.id)
+            .await
+            .context("failed to bind legacy policies to the sole configured Lustre filesystem")?;
+        if rebound > 0 {
+            tracing::info!(filesystem = %runtime.config.id, policies = rebound, "legacy policies bound to sole Lustre filesystem");
+        }
+    } else if !lustre.is_empty() {
+        tracing::warn!(
+            lustre_filesystems = lustre.len(),
+            "legacy unscoped policies and changelog cursors are not rebound when multiple Lustre filesystems are configured"
+        );
     }
     let classifier_store = rbh_policy::ClassifierStore::new(pool.clone());
 
@@ -73,18 +87,7 @@ pub async fn run() -> anyhow::Result<()> {
     );
     tracing::info!("database migrations complete");
 
-    // 4. Initial fs-scan if catalog is empty.
-    let count = entry_store.scoped_entry_count(&filesystem_id).await.unwrap_or(0);
-    if count == 0 {
-        tracing::info!(filesystem = %filesystem_id, mount = %mount_path.display(), "catalog empty — running initial fs-scan");
-        run_initial_scan(&entry_store, &filesystem_id, &mount_path).await;
-        let new_count = entry_store.scoped_entry_count(&filesystem_id).await.unwrap_or(0);
-        tracing::info!(filesystem = %filesystem_id, entries = new_count, "initial scan complete");
-    } else {
-        tracing::info!(filesystem = %filesystem_id, entries = count, "catalog already populated");
-    }
-
-    // 5. Spawn one changelog listener per configured MDT.
+    // 4. Spawn one isolated scan/change-source supervisor per Lustre runtime.
     //
     // Env:
     //   RBH_MDTS             — comma-separated MDT names (e.g. "fs-MDT0000,fs-MDT0001")
@@ -92,62 +95,98 @@ pub async fn run() -> anyhow::Result<()> {
     //   RBH_CHANGELOG_USER   — either a single reader id reused on every MDT,
     //                          or a comma-separated list matching RBH_MDTS 1:1.
     let daemon_cancel = CancellationToken::new();
-    let cursor_store = Arc::new(rbh_entry_store::store::MariaDbCursorStore::new(pool.clone()));
-
-    let mdt_specs = resolve_changelog_mdts();
-    if mdt_specs.is_empty() {
-        tracing::info!("RBH_MDTS / RBH_CHANGELOG_USER not set — changelog listener disabled");
-    } else {
-        for (mdt_name, reader_id) in mdt_specs {
-            let listener_cfg = lustre_changelog::ListenerConfig {
-                mdt: mdt_name.clone(),
-                reader_id: reader_id.clone(),
-                follow: true,
-                channel_buffer: 32,
-                ..Default::default()
-            };
-
-            match lustre_changelog::ChangelogListener::spawn(listener_cfg, cursor_store.clone(), daemon_cancel.clone())
-                .await
-            {
-                Ok(handle) => {
-                    tracing::info!(
-                        filesystem = %filesystem_id,
-                        mdt = %mdt_name,
-                        reader_id = %reader_id,
-                        "changelog listener started"
-                    );
-                    let ingest_store = entry_store.clone();
-                    let ingest_mount = mount_path.clone();
-                    let ingest_filesystem = filesystem_id.clone();
-                    let ingest_cancel = daemon_cancel.clone();
-                    let classifier_cache_cl = classifier_cache.clone();
-                    let source = rbh_change_source::LustreChangeSource::new(ingest_filesystem.clone(), handle);
-                    tokio::spawn(async move {
-                        let _ = changelog::ingest_loop(
-                            Box::new(source),
-                            ingest_store,
-                            ingest_filesystem,
-                            ingest_mount,
-                            ingest_cancel,
-                            classifier_cache_cl.clone(),
-                        )
-                        .await;
-                    });
+    for runtime in runtime_registry
+        .iter()
+        .filter(|runtime| runtime.config.backend == rbh_entry_store::BackendKind::Lustre)
+        .cloned()
+    {
+        let runtime_store = entry_store.clone();
+        let runtime_cursor_store = Arc::new(rbh_entry_store::store::MariaDbCursorStore::new(
+            pool.clone(),
+            runtime.config.id.clone(),
+        ));
+        let runtime_cancel = daemon_cancel.clone();
+        let runtime_classifiers = classifier_cache.clone();
+        tokio::spawn(async move {
+            let count = runtime_store.scoped_entry_count(&runtime.config.id).await.unwrap_or(0);
+            if count == 0 {
+                loop {
+                    tracing::info!(filesystem = %runtime.config.id, backend = ?runtime.config.backend, mount = %runtime.config.mount_path.display(), "catalog empty — running isolated initial fs-scan");
+                    match run_initial_scan(&runtime_store, &runtime.config.id, &runtime.config.mount_path).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::warn!(filesystem = %runtime.config.id, backend = ?runtime.config.backend, %error, "initial fs-scan failed; retrying this filesystem");
+                            tokio::select! {
+                                () = runtime_cancel.cancelled() => return,
+                                () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    // Isolate per-MDT failures — other MDTs keep running.
-                    tracing::error!(
-                        filesystem = %filesystem_id,
-                        mdt = %mdt_name,
-                        reader_id = %reader_id,
-                        error = %e,
-                        "failed to start changelog listener for this MDT \
-                         — continuing without it"
-                    );
-                }
+                let new_count = runtime_store.scoped_entry_count(&runtime.config.id).await.unwrap_or(0);
+                tracing::info!(filesystem = %runtime.config.id, backend = ?runtime.config.backend, entries = new_count, "initial scan complete");
+            } else {
+                tracing::info!(filesystem = %runtime.config.id, backend = ?runtime.config.backend, entries = count, "catalog already populated");
             }
-        }
+            if runtime.lustre_changelog.is_empty() {
+                tracing::info!(filesystem = %runtime.config.id, backend = ?runtime.config.backend, "Lustre changelog listener disabled");
+            }
+            for changelog in &runtime.lustre_changelog {
+                let mdt_name = changelog.mdt.clone();
+                let reader_id = changelog.reader_id.clone();
+                let ingest_store = runtime_store.clone();
+                let ingest_mount = runtime.config.mount_path.clone();
+                let ingest_filesystem = runtime.config.id.clone();
+                let ingest_cancel = runtime_cancel.clone();
+                let classifier_cache = runtime_classifiers.clone();
+                let cursor_store = runtime_cursor_store.clone();
+                let backend = runtime.config.backend;
+                tokio::spawn(async move {
+                    loop {
+                        if ingest_cancel.is_cancelled() {
+                            return;
+                        }
+                        let listener_cfg = lustre_changelog::ListenerConfig {
+                            mdt: mdt_name.clone(),
+                            reader_id: reader_id.clone(),
+                            follow: true,
+                            channel_buffer: 32,
+                            ..Default::default()
+                        };
+                        match lustre_changelog::ChangelogListener::spawn(
+                            listener_cfg,
+                            cursor_store.clone(),
+                            ingest_cancel.clone(),
+                        )
+                        .await
+                        {
+                            Ok(handle) => {
+                                tracing::info!(filesystem = %ingest_filesystem, backend = ?backend, mdt = %mdt_name, reader_id = %reader_id, "changelog listener started");
+                                let source =
+                                    rbh_change_source::LustreChangeSource::new(ingest_filesystem.clone(), handle);
+                                let exit = changelog::ingest_loop(
+                                    Box::new(source),
+                                    ingest_store.clone(),
+                                    ingest_filesystem.clone(),
+                                    ingest_mount.clone(),
+                                    ingest_cancel.clone(),
+                                    classifier_cache.clone(),
+                                )
+                                .await;
+                                tracing::warn!(filesystem = %ingest_filesystem, backend = ?backend, mdt = %mdt_name, ?exit, "Lustre changelog runtime exited; restarting");
+                            }
+                            Err(error) => {
+                                tracing::error!(filesystem = %ingest_filesystem, backend = ?backend, mdt = %mdt_name, reader_id = %reader_id, %error, "failed to start Lustre changelog runtime; retrying")
+                            }
+                        }
+                        tokio::select! {
+                            _ = ingest_cancel.cancelled() => return,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
+                    }
+                });
+            }
+        });
     }
 
     for runtime in runtime_registry
@@ -158,15 +197,6 @@ pub async fn run() -> anyhow::Result<()> {
             tracing::warn!(filesystem = %runtime.config.id, "JuiceFS runtime has no changelog_agent configuration");
             continue;
         };
-        let baseline = entry_store.get_baseline(&runtime.config.id).await?;
-        if baseline.as_ref().is_none_or(|value| {
-            matches!(
-                value.state,
-                rbh_entry_store::model::BaselineState::Invalid | rbh_entry_store::model::BaselineState::Scanning
-            )
-        }) {
-            run_juicefs_baseline(&entry_store, &runtime.config.id, &runtime.config.mount_path).await?;
-        }
         let ingest_store = entry_store.clone();
         let ingest_filesystem = runtime.config.id.clone();
         let ingest_mount = runtime.config.mount_path.clone();
@@ -174,10 +204,31 @@ pub async fn run() -> anyhow::Result<()> {
         let classifier_cache = classifier_cache.clone();
         let endpoint = agent.endpoint.clone();
         let volume = agent.volume.clone();
+        let backend = runtime.config.backend;
         tokio::spawn(async move {
             loop {
                 if ingest_cancel.is_cancelled() {
                     break;
+                }
+                let baseline = match ingest_store.get_baseline(&ingest_filesystem).await {
+                    Ok(baseline) => baseline,
+                    Err(error) => {
+                        tracing::error!(filesystem = %ingest_filesystem, backend = ?backend, %error, "failed to read JuiceFS baseline; retrying runtime");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                if baseline.as_ref().is_none_or(|value| {
+                    matches!(
+                        value.state,
+                        rbh_entry_store::model::BaselineState::Invalid
+                            | rbh_entry_store::model::BaselineState::Scanning
+                    )
+                }) && let Err(error) = run_juicefs_baseline(&ingest_store, &ingest_filesystem, &ingest_mount).await
+                {
+                    tracing::error!(filesystem = %ingest_filesystem, backend = ?backend, %error, "JuiceFS baseline scan failed; retrying runtime");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
                 }
                 match rbh_change_source::JuiceFsChangeSource::connect(
                     ingest_filesystem.clone(),
@@ -200,8 +251,8 @@ pub async fn run() -> anyhow::Result<()> {
                             && let Err(error) =
                                 run_juicefs_baseline(&ingest_store, &ingest_filesystem, &ingest_mount).await
                         {
-                            tracing::error!(filesystem = %ingest_filesystem, %error, "JuiceFS catch-up scan failed");
-                            break;
+                            tracing::error!(filesystem = %ingest_filesystem, backend = ?backend, %error, "JuiceFS catch-up scan failed; restarting runtime");
+                            continue;
                         }
                         let exit = changelog::ingest_loop(
                             Box::new(source),
@@ -224,12 +275,12 @@ pub async fn run() -> anyhow::Result<()> {
                             {
                                 tracing::error!(filesystem = %ingest_filesystem, %error, "failed to invalidate JuiceFS baseline");
                             }
-                            tracing::error!(filesystem = %ingest_filesystem, %reason, "JuiceFS baseline invalid; rescan required");
-                            break;
+                            tracing::error!(filesystem = %ingest_filesystem, backend = ?backend, %reason, "JuiceFS baseline invalid; restarting with rescan");
+                            continue;
                         }
                         if let changelog::IngestExit::BaselineInvalid(reason) = exit {
-                            tracing::error!(filesystem = %ingest_filesystem, %reason, "JuiceFS baseline comparison failed; rescan required");
-                            break;
+                            tracing::error!(filesystem = %ingest_filesystem, backend = ?backend, %reason, "JuiceFS baseline comparison failed; restarting with rescan");
+                            continue;
                         }
                     }
                     Err(rbh_change_source::ChangeSourceError::RetentionGap(reason)) => {
@@ -244,11 +295,11 @@ pub async fn run() -> anyhow::Result<()> {
                         {
                             tracing::error!(filesystem = %ingest_filesystem, %error, "failed to invalidate JuiceFS baseline");
                         }
-                        tracing::error!(filesystem = %ingest_filesystem, %reason, "JuiceFS baseline invalid; rescan required");
-                        break;
+                        tracing::error!(filesystem = %ingest_filesystem, backend = ?backend, %reason, "JuiceFS baseline invalid; restarting with rescan");
+                        continue;
                     }
                     Err(error) => {
-                        tracing::error!(filesystem = %ingest_filesystem, %endpoint, %error, "JuiceFS Agent unavailable; retrying")
+                        tracing::error!(filesystem = %ingest_filesystem, backend = ?backend, %endpoint, %error, "JuiceFS Agent unavailable; retrying")
                     }
                 }
                 tokio::select! {
@@ -325,6 +376,7 @@ pub async fn run() -> anyhow::Result<()> {
             scheduler: scheduler.clone(),
             lustre: lustre_api::LustreApi,
             filesystem_id: runtime.config.id.clone(),
+            backend: runtime.config.backend,
             mount_path: runtime.config.mount_path.clone(),
             tick: std::time::Duration::from_secs(threshold_tick_secs),
             cancel: daemon_cancel.clone(),
@@ -340,38 +392,42 @@ pub async fn run() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    if lustre_runtime.should_start_hsm_poller(hsm_poll_secs) {
-        let hsm_batch = std::env::var("RBH_HSM_POLL_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(200);
-        let hsm_pause_ms = std::env::var("RBH_HSM_POLL_PAUSE_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(500);
-        let poller = hsm_poller::HsmPoller {
-            entry_store: entry_store.clone(),
-            lustre: lustre_api::LustreApi,
-            filesystem_id: filesystem_id.clone(),
-            mount_path: mount_path.clone(),
-            tick: std::time::Duration::from_secs(hsm_poll_secs),
-            batch: hsm_batch,
-            pause_between_batches: std::time::Duration::from_millis(hsm_pause_ms),
-            cancel: daemon_cancel.clone(),
-        };
-        tokio::spawn(poller.run());
-        tracing::info!(
-            filesystem = %filesystem_id,
-            tick_secs = hsm_poll_secs,
-            batch = hsm_batch,
-            pause_ms = hsm_pause_ms,
-            "hsm poller spawned"
-        );
-    } else if hsm_poll_secs == 0 {
+    let hsm_batch = std::env::var("RBH_HSM_POLL_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(200);
+    let hsm_pause_ms = std::env::var("RBH_HSM_POLL_PAUSE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(500);
+    if hsm_poll_secs == 0 {
         tracing::info!("hsm poller disabled (RBH_HSM_POLL_SECS=0)");
-    } else {
-        tracing::info!(filesystem = %filesystem_id, "hsm poller disabled by backend capabilities");
+    }
+    for runtime in runtime_registry.iter() {
+        if runtime.should_start_hsm_poller(hsm_poll_secs) {
+            let poller = hsm_poller::HsmPoller {
+                entry_store: entry_store.clone(),
+                lustre: lustre_api::LustreApi,
+                filesystem_id: runtime.config.id.clone(),
+                mount_path: runtime.config.mount_path.clone(),
+                tick: std::time::Duration::from_secs(hsm_poll_secs),
+                batch: hsm_batch,
+                pause_between_batches: std::time::Duration::from_millis(hsm_pause_ms),
+                cancel: daemon_cancel.clone(),
+            };
+            tokio::spawn(poller.run());
+            tracing::info!(
+                filesystem = %runtime.config.id,
+                backend = ?runtime.config.backend,
+                tick_secs = hsm_poll_secs,
+                batch = hsm_batch,
+                pause_ms = hsm_pause_ms,
+                "hsm poller spawned"
+            );
+        } else if hsm_poll_secs > 0 {
+            tracing::info!(filesystem = %runtime.config.id, backend = ?runtime.config.backend, "hsm poller disabled by backend capabilities");
+        }
     }
 
     // 7. Build router with scheduler for trigger reconciliation.
@@ -463,15 +519,7 @@ async fn prune_threshold_schedules(scheduler: &Scheduler) {
     }
 }
 
-/// Resolve the list of (MDT, changelog reader id) pairs from environment.
-fn resolve_changelog_mdts() -> Vec<(String, String)> {
-    let mdts_raw = std::env::var("RBH_MDTS").ok();
-    let legacy_mdt = std::env::var("RBH_MDT_NAME").ok();
-    let user_raw = std::env::var("RBH_CHANGELOG_USER").unwrap_or_default();
-    pair_mdts_with_users(mdts_raw.as_deref(), legacy_mdt.as_deref(), &user_raw)
-}
-
-/// Pure resolver used by [`resolve_changelog_mdts`]. Pulled out for testing.
+/// External legacy configuration compatibility for a sole Lustre runtime.
 fn pair_mdts_with_users(mdts_csv: Option<&str>, legacy_mdt: Option<&str>, user_csv: &str) -> Vec<(String, String)> {
     if user_csv.is_empty() {
         return Vec::new();
@@ -583,7 +631,7 @@ mod tests {
 async fn run_initial_scan(
     entry_store: &rbh_entry_store::store::EntryStore, filesystem_id: &rbh_entry_store::FileSystemId,
     mount_path: &std::path::Path,
-) {
+) -> anyhow::Result<()> {
     let config = rbh_fs_scan::ScanConfig {
         root: mount_path.to_path_buf(),
         concurrency: 4,
@@ -600,9 +648,7 @@ async fn run_initial_scan(
             rbh_fs_scan::ScanEvent::Entry(entry) => {
                 batch.push(*entry);
                 if batch.len() >= 100 {
-                    if let Err(e) = persist_scan_batch(entry_store, filesystem_id, &batch).await {
-                        tracing::warn!(error = %e, "batch upsert failed");
-                    }
+                    persist_scan_batch(entry_store, filesystem_id, &batch).await?;
                     batch.clear();
                 }
             }
@@ -612,14 +658,16 @@ async fn run_initial_scan(
         }
     }
     // Flush remaining.
-    if !batch.is_empty()
-        && let Err(e) = persist_scan_batch(entry_store, filesystem_id, &batch).await
-    {
-        tracing::warn!(error = %e, "final batch upsert failed");
+    if !batch.is_empty() {
+        persist_scan_batch(entry_store, filesystem_id, &batch).await?;
     }
 
     let (scanned, errors, dirs) = progress.snapshot();
     tracing::info!(filesystem = %filesystem_id, scanned, errors, dirs, "fs-scan complete");
+    if errors > 0 {
+        anyhow::bail!("filesystem scan reported {errors} errors");
+    }
+    Ok(())
 }
 
 async fn persist_scan_batch(

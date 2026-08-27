@@ -139,20 +139,28 @@ SIGHUP):
 | `RBH_DATABASE_URL` | MariaDB connection string |
 | `RBH_LUSTRE_MOUNT` | Legacy single-Lustre mount; translated to a filesystem runtime |
 | `RBH_FILESYSTEM_ID` | Stable id for the legacy single-Lustre runtime; default `lustre` |
-| `RBH_FILESYSTEMS_JSON` | Explicit filesystem registry as a JSON array; overrides the two legacy variables and currently requires exactly one Lustre entry |
-| `RBH_MDTS`         | Comma-separated MDT names (empty = no changelog) |
-| `RBH_CHANGELOG_USER` | Pre-registered reader id (`cl1` etc.); CSV for per-MDT |
+| `RBH_FILESYSTEMS_JSON` | Explicit filesystem registry as a JSON array; supports any mix of Lustre and JuiceFS runtimes |
+| `RBH_MDTS`         | Legacy single-Lustre MDT list (empty = no changelog) |
+| `RBH_CHANGELOG_USER` | Legacy single-Lustre reader id (`cl1` etc.); CSV for per-MDT |
 | `RBH_LISTEN_ADDR`  | REST bind, default `0.0.0.0:8080` |
 | `RBH_LOG`          | `tracing-subscriber` env-filter; **hot-reload via SIGHUP** |
 | `RBH_THRESHOLD_TICK_SECS` | Threshold poll cadence, default 30 |
 | `RBH_OTLP_ENDPOINT` | (Reserved; not yet wired) |
 
-For an explicit runtime, `RBH_FILESYSTEMS_JSON` contains serialized
-`FileSystemConfig` objects. Capabilities are declared per filesystem, so a
+For explicit runtimes, `RBH_FILESYSTEMS_JSON` contains filesystem configuration
+plus its change-source configuration. Capabilities are declared per filesystem, so a
 Lustre runtime with `"hsm": false` never starts the HSM poller even when
-`RBH_HSM_POLL_SECS` is non-zero. Existing deployments can keep using only
-`RBH_LUSTRE_MOUNT`; it is translated to a fully capable Lustre runtime with id
-`RBH_FILESYSTEM_ID` (or `lustre` when unset).
+`RBH_HSM_POLL_SECS` is non-zero. Each Lustre runtime declares its own
+`lustre_changelog` array of `{ "mdt", "reader_id" }` objects; JuiceFS runtimes
+declare `changelog_agent`. A failed source is restarted independently.
+
+`RBH_LUSTRE_MOUNT`, `RBH_FILESYSTEM_ID`, `RBH_MDTS`, and
+`RBH_CHANGELOG_USER` remain only as external configuration compatibility for a
+deployment that does not set `RBH_FILESYSTEMS_JSON`; they are translated into
+one fully scoped Lustre runtime. Likewise, global-FID catalog operations remain
+reachable only through the explicitly named `/api/compat/lustre/` migration
+surface. Internal scans, ingestion, classifiers, reports, policies, namespace
+lookups, and actions use filesystem-scoped native identities.
 
 ## Signals
 

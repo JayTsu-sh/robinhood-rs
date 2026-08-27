@@ -111,7 +111,7 @@ impl Task for PolicyRunTask {
         );
 
         if ctx.cancellation_token.is_cancelled() {
-            record_run(&pid_lbl, "cancelled", run_started);
+            record_run("unknown", "unknown", &pid_lbl, "cancelled", run_started);
             return Ok(());
         }
 
@@ -239,7 +239,7 @@ impl Task for PolicyRunTask {
                 )
                 .await
             };
-            finish_run(self.policy_id, &pid_lbl, candidate_count, outcome, run_started);
+            finish_run(self.policy_id, &config, &pid_lbl, candidate_count, outcome, run_started);
             return Ok(());
         }
         let candidates = scoped_candidates
@@ -261,7 +261,13 @@ impl Task for PolicyRunTask {
                 Ok(executor) => executor,
                 Err(reason) => {
                     tracing::warn!(policy_id = self.policy_id, reason, "skipping misconfigured policy");
-                    record_run(&pid_lbl, "misconfigured", run_started);
+                    record_run(
+                        config.id.as_str(),
+                        config.backend.as_str(),
+                        &pid_lbl,
+                        "misconfigured",
+                        run_started,
+                    );
                     return Ok(());
                 }
             }
@@ -284,6 +290,7 @@ impl Task for PolicyRunTask {
 
         finish_run(
             self.policy_id,
+            &config,
             &pid_lbl,
             candidate_count,
             (success, skipped, failed),
@@ -294,7 +301,8 @@ impl Task for PolicyRunTask {
 }
 
 fn finish_run(
-    policy_id: u64, pid_lbl: &str, candidate_count: usize, counts: (u64, u64, u64), run_started: std::time::Instant,
+    policy_id: u64, filesystem: &rbh_entry_store::FileSystemConfig, pid_lbl: &str, candidate_count: usize,
+    counts: (u64, u64, u64), run_started: std::time::Instant,
 ) {
     let (success, skipped, failed) = counts;
     tracing::info!(
@@ -315,23 +323,29 @@ fn finish_run(
         "failed"
     };
     rbh_observability::metrics::ACTIONS
-        .with_label_values(&[pid_lbl, "success"])
+        .with_label_values(&[filesystem.id.as_str(), filesystem.backend.as_str(), pid_lbl, "success"])
         .inc_by(success);
     rbh_observability::metrics::ACTIONS
-        .with_label_values(&[pid_lbl, "skipped"])
+        .with_label_values(&[filesystem.id.as_str(), filesystem.backend.as_str(), pid_lbl, "skipped"])
         .inc_by(skipped);
     rbh_observability::metrics::ACTIONS
-        .with_label_values(&[pid_lbl, "failed"])
+        .with_label_values(&[filesystem.id.as_str(), filesystem.backend.as_str(), pid_lbl, "failed"])
         .inc_by(failed);
-    record_run(pid_lbl, outcome, run_started);
+    record_run(
+        filesystem.id.as_str(),
+        filesystem.backend.as_str(),
+        pid_lbl,
+        outcome,
+        run_started,
+    );
 }
 
-fn record_run(pid: &str, outcome: &str, started: std::time::Instant) {
+fn record_run(filesystem: &str, backend: &str, pid: &str, outcome: &str, started: std::time::Instant) {
     rbh_observability::metrics::POLICY_RUN_DURATION
-        .with_label_values(&[pid])
+        .with_label_values(&[filesystem, backend, pid])
         .observe(started.elapsed().as_secs_f64());
     rbh_observability::metrics::POLICY_RUNS
-        .with_label_values(&[pid, outcome])
+        .with_label_values(&[filesystem, backend, pid, outcome])
         .inc();
 }
 

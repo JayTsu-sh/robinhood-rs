@@ -329,8 +329,8 @@ fn parse_numeric_value(s: &str, orig: &str) -> Result<i64, WhenParseError> {
 
 /// Evaluate classifier rules against an entry in-memory and return the
 /// first matching rule's tags, or `None` if no rule matches.
-pub fn evaluate_classifier<'a>(
-    def: &'a ClassifierDef, entry: &rbh_entry_store::model::EntryRow,
+pub fn evaluate_classifier<'a, E: rbh_predicate::EntryView + ?Sized>(
+    def: &'a ClassifierDef, entry: &E,
 ) -> Option<&'a HashMap<String, String>> {
     for rule in &def.rules {
         let matched = match &rule.when {

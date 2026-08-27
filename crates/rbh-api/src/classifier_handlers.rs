@@ -91,8 +91,7 @@ pub async fn delete_classifier(
 
 /// Manually run a classifier against all entries in the catalog.
 ///
-/// Loads all entries in pages, evaluates the classifier rules in-memory,
-/// and writes tags via `legacy_lustre_update_xattr`. Returns `{"classified": N}`.
+/// Loads every filesystem-scoped catalog in pages and writes tags by scoped key.
 pub async fn run_classifier(
     State(state): State<AppState>, Path(id): Path<u64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -103,47 +102,68 @@ pub async fn run_classifier(
         return Ok(Json(serde_json::json!({"classified": 0, "skipped": "disabled"})));
     }
 
-    // Iterate all entries using legacy_lustre_dump_page (FID-ordered cursor, page size 10k).
     const MAX_ENTRIES: u64 = 1_000_000;
     let mut classified: u64 = 0;
     let mut errors: u64 = 0;
     let mut scanned: u64 = 0;
-    let mut after: Option<lustre_api::LuFid> = None;
-    loop {
-        if scanned >= MAX_ENTRIES {
-            tracing::warn!(
-                classifier_id = id,
-                scanned,
-                max_entries = MAX_ENTRIES,
-                "max_entries limit reached — run again to continue"
-            );
-            break;
-        }
-        let batch = state
-            .entry_store
-            .legacy_lustre_dump_page(after, 10_000)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if batch.is_empty() {
-            break;
-        }
-        after = Some(batch.last().unwrap().fid);
-        scanned += batch.len() as u64;
-        for entry in &batch {
-            if let Some(tags) = evaluate_classifier(def, entry) {
-                match state
-                    .entry_store
-                    .legacy_lustre_update_xattr(&entry.fid, tags, &def.manages)
-                    .await
-                {
-                    Ok(()) => classified += 1,
-                    Err(e) => {
-                        errors += 1;
-                        if errors <= 10 || errors.is_multiple_of(1000) {
-                            tracing::warn!(fid = %entry.fid, error = %e, errors, "legacy_lustre_update_xattr failed during classifier run");
+    let filesystems = state
+        .entry_store
+        .list_filesystems()
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    for filesystem in filesystems {
+        let mut offset = 0;
+        let mut filesystem_scanned = 0;
+        loop {
+            if filesystem_scanned >= MAX_ENTRIES {
+                tracing::warn!(
+                    classifier_id = id,
+                    filesystem = %filesystem.id,
+                    scanned = filesystem_scanned,
+                    max_entries = MAX_ENTRIES,
+                    "per-filesystem max_entries limit reached"
+                );
+                break;
+            }
+            let limit = 10_000u64.min(MAX_ENTRIES - filesystem_scanned);
+            let batch = state
+                .entry_store
+                .query_scoped_page(
+                    &filesystem.id,
+                    "1 = 1",
+                    &[],
+                    Some("object_kind, object_id"),
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            if batch.is_empty() {
+                break;
+            }
+            offset += batch.len() as u64;
+            scanned += batch.len() as u64;
+            filesystem_scanned += batch.len() as u64;
+            for entry in &batch {
+                if let Some(tags) = evaluate_classifier(def, entry) {
+                    match state
+                        .entry_store
+                        .update_scoped_xattr(&entry.key, tags, &def.manages)
+                        .await
+                    {
+                        Ok(true) => classified += 1,
+                        Ok(false) => errors += 1,
+                        Err(error) => {
+                            errors += 1;
+                            if errors <= 10 || errors.is_multiple_of(1000) {
+                                tracing::warn!(filesystem = %filesystem.id, backend = ?filesystem.backend, object = ?entry.key.object(), %error, errors, "scoped xattr update failed during classifier run");
+                            }
                         }
                     }
                 }
+            }
+            if batch.len() < limit as usize {
+                break;
             }
         }
     }

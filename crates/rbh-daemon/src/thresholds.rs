@@ -36,6 +36,7 @@ pub struct ThresholdChecker {
     pub scheduler: Scheduler,
     pub lustre: lustre_api::LustreApi,
     pub filesystem_id: FileSystemId,
+    pub backend: rbh_entry_store::BackendKind,
     pub mount_path: std::path::PathBuf,
     /// Minimum sleep between cycles. Each trigger has its own
     /// `check_interval_secs`; the loop wakes at the shortest.
@@ -234,10 +235,12 @@ impl ThresholdChecker {
                         last_fired.lock().await.insert(key, now);
                         let pid_str = policy.id.to_string();
                         rbh_observability::metrics::THRESHOLD_FIRES
-                            .with_label_values(&[pid_str.as_str()])
+                            .with_label_values(&[self.filesystem_id.as_str(), self.backend.as_str(), pid_str.as_str()])
                             .inc();
                         tracing::info!(
                             policy_id = policy.id,
+                            filesystem = %self.filesystem_id,
+                            backend = ?self.backend,
                             trigger_idx = idx,
                             target = ?fire_target,
                             "threshold triggered — policy run scheduled"
