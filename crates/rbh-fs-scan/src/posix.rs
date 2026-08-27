@@ -21,6 +21,10 @@ pub struct PosixEntry {
     pub kind: EntryKind,
     pub device: u64,
     pub inode: u64,
+    /// Native inode of the containing directory.  Keeping this beside the
+    /// object's inode lets backend adapters build a namespace graph without
+    /// deriving identity from path text.
+    pub parent_inode: Option<u64>,
     pub size: u64,
     pub blocks: u64,
     pub uid: u32,
@@ -183,6 +187,14 @@ fn stat_entry(path: &Path, depth: u32) -> std::io::Result<PosixEntry> {
     } else {
         EntryKind::Socket
     };
+    let parent_inode = if depth == 0 {
+        None
+    } else {
+        path.parent()
+            .map(std::fs::symlink_metadata)
+            .transpose()?
+            .map(|parent| parent.ino())
+    };
     Ok(PosixEntry {
         path: path.to_path_buf(),
         parent_path: (depth > 0).then(|| path.parent().map(Path::to_path_buf)).flatten(),
@@ -193,6 +205,7 @@ fn stat_entry(path: &Path, depth: u32) -> std::io::Result<PosixEntry> {
         kind,
         device: metadata.dev(),
         inode: metadata.ino(),
+        parent_inode,
         size: metadata.size(),
         blocks: metadata.blocks(),
         uid: metadata.uid(),
@@ -228,6 +241,7 @@ mod tests {
                 files.push(*entry);
             }
         }
+        assert!(files.iter().all(|entry| entry.parent_inode.is_some()));
         assert_eq!(files.len(), 2);
         assert_eq!((files[0].device, files[0].inode), (files[1].device, files[1].inode));
     }

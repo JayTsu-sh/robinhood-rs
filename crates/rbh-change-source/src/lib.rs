@@ -166,6 +166,8 @@ pub enum ChangeSourceError {
     Transport(#[from] tonic::transport::Error),
     #[error("gRPC request failed: {0}")]
     Rpc(#[from] tonic::Status),
+    #[error("JuiceFS changelog retention gap: {0}")]
+    RetentionGap(String),
     #[error("malformed JuiceFS changelog record: {0}")]
     MalformedRecord(String),
     #[error("record belongs to volume {actual}, expected {expected}")]

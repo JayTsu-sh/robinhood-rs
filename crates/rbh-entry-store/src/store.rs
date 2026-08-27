@@ -14,7 +14,10 @@ use lustre_api::LuFid;
 
 use crate::error::{Result, StoreError};
 use crate::fid_codec;
-use crate::model::{EntryKey, EntryKind, EntryRow, FileSystemConfig, FileSystemId, ObjectId, ScopedEntryRow};
+use crate::model::{
+    BaselineState, EntryKey, EntryKind, EntryRow, FileSystemConfig, FileSystemId, FilesystemBaseline, ObjectId,
+    ScopedEntryRow, ScopedNamespaceEdge,
+};
 
 /// A bind parameter for `query_where`. Avoids circular dependency on `rbh-predicate`.
 #[derive(Debug, Clone)]
@@ -239,6 +242,272 @@ impl EntryStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Insert a namespace edge idempotently. This is independent of the
+    /// inode-keyed object row so all hard-link names are retained.
+    #[tracing::instrument(name = "store.upsert_scoped_namespace_edge", skip(self, edge), fields(filesystem = %edge.filesystem))]
+    pub async fn upsert_scoped_namespace_edge(&self, edge: &ScopedNamespaceEdge) -> Result<()> {
+        let (parent_kind, parent_id) = encode_object_id(edge.parent);
+        let (object_kind, object_id) = encode_object_id(edge.object);
+        sqlx::query(
+            r"INSERT INTO scoped_namespace_edges
+                (filesystem_id, parent_kind, parent_id, name, object_kind, object_id)
+              VALUES (?, ?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE object_kind = VALUES(object_kind), object_id = VALUES(object_id)",
+        )
+        .bind(edge.filesystem.as_str())
+        .bind(parent_kind)
+        .bind(parent_id.as_slice())
+        .bind(edge.name.as_ref())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove one path edge. Replays are harmless.
+    #[tracing::instrument(name = "store.remove_scoped_namespace_edge", skip(self, name), fields(filesystem = %filesystem))]
+    pub async fn remove_scoped_namespace_edge(
+        &self, filesystem: &FileSystemId, parent: ObjectId, name: &[u8],
+    ) -> Result<bool> {
+        let (parent_kind, parent_id) = encode_object_id(parent);
+        let result = sqlx::query(
+            "DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND parent_kind = ? AND parent_id = ? AND name = ?",
+        )
+        .bind(filesystem.as_str())
+        .bind(parent_kind)
+        .bind(parent_id.as_slice())
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Atomically add one hard-link edge and increment the inode link count.
+    /// An exact replay leaves both records unchanged.
+    #[tracing::instrument(name = "store.apply_scoped_hardlink", skip(self, edge), fields(filesystem = %edge.filesystem))]
+    pub async fn apply_scoped_hardlink(&self, edge: &ScopedNamespaceEdge, observed_at: i64) -> Result<()> {
+        let (parent_kind, parent_id) = encode_object_id(edge.parent);
+        let (object_kind, object_id) = encode_object_id(edge.object);
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            r"SELECT object_kind, object_id FROM scoped_namespace_edges
+              WHERE filesystem_id = ? AND parent_kind = ? AND parent_id = ? AND name = ? FOR UPDATE",
+        )
+        .bind(edge.filesystem.as_str())
+        .bind(parent_kind)
+        .bind(parent_id.as_slice())
+        .bind(edge.name.as_ref())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = existing {
+            let same_object = row.try_get::<u8, _>("object_kind")? == object_kind
+                && row.try_get::<Vec<u8>, _>("object_id")?.as_slice() == object_id;
+            if same_object {
+                tx.commit().await?;
+                return Ok(());
+            }
+            return Err(StoreError::InvalidObjectIdentity(
+                "namespace edge belongs to another object",
+            ));
+        }
+        let row = sqlx::query(
+            "SELECT entry_data FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
+        )
+        .bind(edge.filesystem.as_str())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::InvalidObjectIdentity("hard link object is not cataloged"))?;
+        let mut entry: ScopedEntryRow = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("entry_data")?)?;
+        entry.nlink = entry.nlink.saturating_add(1);
+        entry.last_seen = observed_at;
+        sqlx::query(
+            r"INSERT INTO scoped_namespace_edges
+                (filesystem_id, parent_kind, parent_id, name, object_kind, object_id)
+              VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(edge.filesystem.as_str())
+        .bind(parent_kind)
+        .bind(parent_id.as_slice())
+        .bind(edge.name.as_ref())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE scoped_entries SET entry_data = ? WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
+        )
+        .bind(serde_json::to_string(&entry)?)
+        .bind(edge.filesystem.as_str())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically remove one namespace edge and update or delete its inode.
+    /// An exact replay is a no-op.
+    #[tracing::instrument(name = "store.apply_scoped_unlink", skip(self, name), fields(filesystem = %key.filesystem()))]
+    pub async fn apply_scoped_unlink(
+        &self, key: &EntryKey, parent: ObjectId, name: &[u8], observed_at: i64, directory: bool,
+    ) -> Result<()> {
+        let (parent_kind, parent_id) = encode_object_id(parent);
+        let (object_kind, object_id) = encode_object_id(*key.object());
+        let mut tx = self.pool.begin().await?;
+        let deleted = sqlx::query(
+            "DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND parent_kind = ? AND parent_id = ? AND name = ? AND object_kind = ? AND object_id = ?",
+        )
+        .bind(key.filesystem().as_str())
+        .bind(parent_kind)
+        .bind(parent_id.as_slice())
+        .bind(name)
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        if deleted.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let row = sqlx::query(
+            "SELECT entry_data FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
+        )
+        .bind(key.filesystem().as_str())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = row {
+            let mut entry: ScopedEntryRow = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("entry_data")?)?;
+            if !directory && entry.nlink > 1 {
+                entry.nlink -= 1;
+                entry.last_seen = observed_at;
+                sqlx::query(
+                    "UPDATE scoped_entries SET entry_data = ? WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
+                )
+                .bind(serde_json::to_string(&entry)?)
+                .bind(key.filesystem().as_str())
+                .bind(object_kind)
+                .bind(object_id.as_slice())
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query("DELETE FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
+                    .bind(key.filesystem().as_str())
+                    .bind(object_kind)
+                    .bind(object_id.as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Clear only the new filesystem-scoped catalog for one filesystem before
+    /// installing a fresh baseline. Legacy Lustre tables are untouched.
+    #[tracing::instrument(name = "store.clear_scoped_catalog", skip(self), fields(filesystem = %filesystem))]
+    pub async fn clear_scoped_catalog(&self, filesystem: &FileSystemId) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM scoped_namespace_edges WHERE filesystem_id = ?")
+            .bind(filesystem.as_str())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM scoped_entries WHERE filesystem_id = ?")
+            .bind(filesystem.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "store.set_baseline_state", skip(self, reason), fields(filesystem = %filesystem, state = ?state))]
+    pub async fn set_baseline_state(
+        &self, filesystem: &FileSystemId, state: BaselineState, last_version: Option<u64>, reason: Option<&str>,
+    ) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let scan_started = (state == BaselineState::Scanning).then_some(now);
+        let completed = (state == BaselineState::Ready).then_some(now);
+        sqlx::query(
+            r"INSERT INTO filesystem_baselines
+                (filesystem_id, state, scan_started_at, completed_at, last_version, invalid_reason)
+              VALUES (?, ?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE state = VALUES(state),
+                scan_started_at = COALESCE(VALUES(scan_started_at), scan_started_at),
+                completed_at = VALUES(completed_at), last_version = VALUES(last_version),
+                invalid_reason = VALUES(invalid_reason)",
+        )
+        .bind(filesystem.as_str())
+        .bind(state.as_str())
+        .bind(scan_started)
+        .bind(completed)
+        .bind(last_version)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "store.get_baseline", skip(self), fields(filesystem = %filesystem))]
+    pub async fn get_baseline(&self, filesystem: &FileSystemId) -> Result<Option<FilesystemBaseline>> {
+        let row = sqlx::query(
+            "SELECT state, scan_started_at, completed_at, last_version, invalid_reason FROM filesystem_baselines WHERE filesystem_id = ?",
+        )
+        .bind(filesystem.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let state: String = row.try_get("state")?;
+            let state = match state.as_str() {
+                "scanning" => BaselineState::Scanning,
+                "catching_up" => BaselineState::CatchingUp,
+                "ready" => BaselineState::Ready,
+                "invalid" => BaselineState::Invalid,
+                _ => return Err(StoreError::InvalidObjectIdentity("unknown baseline state")),
+            };
+            Ok(FilesystemBaseline {
+                filesystem: filesystem.clone(),
+                state,
+                scan_started_at: row.try_get("scan_started_at")?,
+                completed_at: row.try_get("completed_at")?,
+                last_version: row.try_get("last_version")?,
+                invalid_reason: row.try_get("invalid_reason")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Return a deterministic namespace snapshot suitable for independent
+    /// comparison with a mounted POSIX walk.
+    #[tracing::instrument(name = "store.list_scoped_namespace_edges", skip(self), fields(filesystem = %filesystem))]
+    pub async fn list_scoped_namespace_edges(&self, filesystem: &FileSystemId) -> Result<Vec<ScopedNamespaceEdge>> {
+        let rows = sqlx::query(
+            r"SELECT parent_kind, parent_id, name, object_kind, object_id
+              FROM scoped_namespace_edges WHERE filesystem_id = ?
+              ORDER BY parent_kind, parent_id, name",
+        )
+        .bind(filesystem.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ScopedNamespaceEdge {
+                    filesystem: filesystem.clone(),
+                    parent: decode_object_id(row.try_get("parent_kind")?, &row.try_get::<Vec<u8>, _>("parent_id")?)?,
+                    name: bytes::Bytes::from(row.try_get::<Vec<u8>, _>("name")?),
+                    object: decode_object_id(row.try_get("object_kind")?, &row.try_get::<Vec<u8>, _>("object_id")?)?,
+                })
+            })
+            .collect()
     }
 
     // ── CRUD ────────────────────────────────────────────────────────────
@@ -1149,6 +1418,18 @@ fn encode_object_id(object: ObjectId) -> (u8, [u8; 16]) {
             bytes[8..].copy_from_slice(&inode.to_be_bytes());
             (1, bytes)
         }
+    }
+}
+
+fn decode_object_id(kind: u8, bytes: &[u8]) -> Result<ObjectId> {
+    match kind {
+        0 => fid_codec::decode(bytes)
+            .map(ObjectId::Lustre)
+            .ok_or(StoreError::InvalidObjectIdentity("invalid Lustre object id")),
+        1 if bytes.len() == 16 => Ok(ObjectId::JuiceFs(u64::from_be_bytes(
+            bytes[8..].try_into().expect("length checked"),
+        ))),
+        _ => Err(StoreError::InvalidObjectIdentity("invalid scoped object id")),
     }
 }
 

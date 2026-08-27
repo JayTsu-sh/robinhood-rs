@@ -117,7 +117,7 @@ pub async fn run() -> anyhow::Result<()> {
                     let classifier_cache_cl = classifier_cache.clone();
                     let source = rbh_change_source::LustreChangeSource::new(ingest_filesystem.clone(), handle);
                     tokio::spawn(async move {
-                        changelog::ingest_loop(
+                        let _ = changelog::ingest_loop(
                             Box::new(source),
                             ingest_store,
                             ingest_filesystem,
@@ -151,6 +151,15 @@ pub async fn run() -> anyhow::Result<()> {
             tracing::warn!(filesystem = %runtime.config.id, "JuiceFS runtime has no changelog_agent configuration");
             continue;
         };
+        let baseline = entry_store.get_baseline(&runtime.config.id).await?;
+        if baseline.as_ref().is_none_or(|value| {
+            matches!(
+                value.state,
+                rbh_entry_store::model::BaselineState::Invalid | rbh_entry_store::model::BaselineState::Scanning
+            )
+        }) {
+            run_juicefs_baseline(&entry_store, &runtime.config.id, &runtime.config.mount_path).await?;
+        }
         let ingest_store = entry_store.clone();
         let ingest_filesystem = runtime.config.id.clone();
         let ingest_mount = runtime.config.mount_path.clone();
@@ -171,7 +180,23 @@ pub async fn run() -> anyhow::Result<()> {
                 .await
                 {
                     Ok(source) => {
-                        changelog::ingest_loop(
+                        // Re-scan only after Watch is established. The first
+                        // scan makes an idle mount available; this second pass
+                        // closes its race window while the Agent buffers every
+                        // changelog record produced during traversal.
+                        if ingest_store
+                            .get_baseline(&ingest_filesystem)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|baseline| baseline.state == rbh_entry_store::model::BaselineState::CatchingUp)
+                            && let Err(error) =
+                                run_juicefs_baseline(&ingest_store, &ingest_filesystem, &ingest_mount).await
+                        {
+                            tracing::error!(filesystem = %ingest_filesystem, %error, "JuiceFS catch-up scan failed");
+                            break;
+                        }
+                        let exit = changelog::ingest_loop(
                             Box::new(source),
                             ingest_store.clone(),
                             ingest_filesystem.clone(),
@@ -180,6 +205,40 @@ pub async fn run() -> anyhow::Result<()> {
                             classifier_cache.clone(),
                         )
                         .await;
+                        if let changelog::IngestExit::RetentionGap(reason) = exit {
+                            if let Err(error) = ingest_store
+                                .set_baseline_state(
+                                    &ingest_filesystem,
+                                    rbh_entry_store::model::BaselineState::Invalid,
+                                    None,
+                                    Some(&reason),
+                                )
+                                .await
+                            {
+                                tracing::error!(filesystem = %ingest_filesystem, %error, "failed to invalidate JuiceFS baseline");
+                            }
+                            tracing::error!(filesystem = %ingest_filesystem, %reason, "JuiceFS baseline invalid; rescan required");
+                            break;
+                        }
+                        if let changelog::IngestExit::BaselineInvalid(reason) = exit {
+                            tracing::error!(filesystem = %ingest_filesystem, %reason, "JuiceFS baseline comparison failed; rescan required");
+                            break;
+                        }
+                    }
+                    Err(rbh_change_source::ChangeSourceError::RetentionGap(reason)) => {
+                        if let Err(error) = ingest_store
+                            .set_baseline_state(
+                                &ingest_filesystem,
+                                rbh_entry_store::model::BaselineState::Invalid,
+                                None,
+                                Some(&reason),
+                            )
+                            .await
+                        {
+                            tracing::error!(filesystem = %ingest_filesystem, %error, "failed to invalidate JuiceFS baseline");
+                        }
+                        tracing::error!(filesystem = %ingest_filesystem, %reason, "JuiceFS baseline invalid; rescan required");
+                        break;
                     }
                     Err(error) => {
                         tracing::error!(filesystem = %ingest_filesystem, %endpoint, %error, "JuiceFS Agent unavailable; retrying")
@@ -561,6 +620,59 @@ async fn persist_scan_batch(
     entries: &[rbh_entry_store::model::EntryRow],
 ) -> Result<(), rbh_entry_store::StoreError> {
     entry_store.upsert_lustre_scan_batch(filesystem_id, entries).await
+}
+
+async fn run_juicefs_baseline(
+    store: &rbh_entry_store::store::EntryStore, filesystem: &rbh_entry_store::FileSystemId, mount: &std::path::Path,
+) -> anyhow::Result<()> {
+    use rbh_entry_store::model::BaselineState;
+    store
+        .set_baseline_state(filesystem, BaselineState::Scanning, None, None)
+        .await?;
+    store.clear_scoped_catalog(filesystem).await?;
+    let config = rbh_fs_scan::ScanConfig {
+        root: mount.to_path_buf(),
+        concurrency: 4,
+        max_depth: None,
+        channel_size: 1024,
+        since_mtime: None,
+        ignore_globs: Vec::new(),
+    };
+    let (mut events, progress) = rbh_fs_scan::PosixWalker::run(config);
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    while let Some(event) = events.recv().await {
+        match event {
+            rbh_fs_scan::PosixWalkEvent::Entry(entry) => {
+                let (row, edge) =
+                    rbh_fs_scan::juicefs::adapt(filesystem, &entry, observed_at).map_err(anyhow::Error::msg)?;
+                store.upsert_scoped_entry(&row).await?;
+                if let Some(edge) = edge {
+                    store.upsert_scoped_namespace_edge(&edge).await?;
+                }
+            }
+            rbh_fs_scan::PosixWalkEvent::Error { path, error } => {
+                store
+                    .set_baseline_state(filesystem, BaselineState::Invalid, None, Some(&error))
+                    .await?;
+                anyhow::bail!("JuiceFS baseline scan failed at {path}: {error}");
+            }
+        }
+    }
+    let (scanned, errors, dirs) = progress.snapshot();
+    if errors != 0 {
+        store
+            .set_baseline_state(filesystem, BaselineState::Invalid, None, Some("POSIX scan errors"))
+            .await?;
+        anyhow::bail!("JuiceFS baseline scan completed with {errors} errors");
+    }
+    store
+        .set_baseline_state(filesystem, BaselineState::CatchingUp, None, None)
+        .await?;
+    tracing::info!(filesystem = %filesystem, scanned, dirs, "JuiceFS baseline scanned; changelog catch-up starting");
+    Ok(())
 }
 
 /// Reconcile all enabled policies to scheduler-rs schedules on startup.

@@ -37,3 +37,4 @@ NNN_short_description.sql
 | `004_add_depth_column.sql` | directory depth for scan and subtree queries |
 | `005_create_classifiers.sql` | classifier definitions stored as JSON |
 | `006_add_filesystem_scoped_identity.sql` | filesystem registry and backend-native scoped catalog entries |
+| `007_add_scoped_baselines.sql` | filesystem baseline state and parent/name namespace edges |

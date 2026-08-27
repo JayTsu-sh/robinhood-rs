@@ -14,6 +14,7 @@ mod walker;
 
 pub use entry::{build_entry, enrich_lustre};
 pub use posix::{PosixEntry, PosixWalkEvent, PosixWalker};
+pub mod juicefs;
 pub use walker::{FsScanner, ScanConfig, ScanEvent, ScanProgress, load_rbh_ignore_file};
 
 /// Errors produced by the filesystem scanner.

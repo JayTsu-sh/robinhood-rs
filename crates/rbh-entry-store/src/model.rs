@@ -182,6 +182,47 @@ pub struct ScopedEntryRow {
     pub depth: u32,
 }
 
+/// One namespace link. Objects and links are deliberately stored separately:
+/// a JuiceFS inode may have several parent/name pairs when it is hard-linked.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScopedNamespaceEdge {
+    pub filesystem: FileSystemId,
+    pub parent: ObjectId,
+    #[serde(with = "serde_bytes_compat")]
+    pub name: Bytes,
+    pub object: ObjectId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineState {
+    Scanning,
+    CatchingUp,
+    Ready,
+    Invalid,
+}
+
+impl BaselineState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scanning => "scanning",
+            Self::CatchingUp => "catching_up",
+            Self::Ready => "ready",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemBaseline {
+    pub filesystem: FileSystemId,
+    pub state: BaselineState,
+    pub scan_started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub last_version: Option<u64>,
+    pub invalid_reason: Option<String>,
+}
+
 impl ScopedEntryRow {
     /// Preserve a genuine Lustre FID while adding filesystem scope.
     pub fn from_lustre(filesystem: FileSystemId, entry: &EntryRow) -> Self {

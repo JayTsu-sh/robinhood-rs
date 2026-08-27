@@ -20,8 +20,50 @@ use tokio_util::sync::CancellationToken;
 use lustre_api::LustreApi;
 use lustre_changelog::ChangelogEvent;
 use rbh_change_source::{BackendChange, Change, ChangeSource, ContentChangeKind, MetadataChangeKind};
-use rbh_entry_store::model::{EntryKey, EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow};
+use rbh_entry_store::model::{
+    EntryKey, EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow, ScopedNamespaceEdge,
+};
 use rbh_entry_store::store::EntryStore;
+
+const CATCHUP_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestExit {
+    Stopped,
+    RetentionGap(String),
+    BaselineInvalid(String),
+}
+
+enum Receive {
+    Batch(rbh_change_source::ChangeBatch),
+    Closed,
+    Failed(rbh_change_source::ChangeSourceError),
+    Cancelled,
+    Quiescent,
+}
+
+async fn receive(source: &mut dyn ChangeSource, cancel: &CancellationToken, wait_for_catchup: bool) -> Receive {
+    let next = async {
+        match source.next_batch().await {
+            Ok(Some(batch)) => Receive::Batch(batch),
+            Ok(None) => Receive::Closed,
+            Err(error) => Receive::Failed(error),
+        }
+    };
+    if wait_for_catchup {
+        tokio::select! {
+            result = tokio::time::timeout(CATCHUP_QUIET_PERIOD, next) => {
+                result.unwrap_or(Receive::Quiescent)
+            }
+            _ = cancel.cancelled() => Receive::Cancelled,
+        }
+    } else {
+        tokio::select! {
+            result = next => result,
+            _ = cancel.cancelled() => Receive::Cancelled,
+        }
+    }
+}
 
 /// Run the changelog ingest loop. Consumes batches from the listener,
 /// applies events to the entry store, and sends acks back.
@@ -31,27 +73,74 @@ use rbh_entry_store::store::EntryStore;
 pub async fn ingest_loop(
     mut source: Box<dyn ChangeSource>, entry_store: EntryStore, filesystem_id: FileSystemId, mount_path: PathBuf,
     cancel: CancellationToken, classifier_cache: std::sync::Arc<tokio::sync::RwLock<Vec<rbh_policy::ClassifierRow>>>,
-) {
+) -> IngestExit {
     tracing::info!("changelog ingest loop started");
+    let mut catching_up = entry_store
+        .get_baseline(&filesystem_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|baseline| baseline.state == rbh_entry_store::model::BaselineState::CatchingUp);
+    let mut last_committed = None;
+    let mut verified_quiescent = false;
 
     loop {
-        let batch = tokio::select! {
-            batch = source.next_batch() => {
-                match batch {
-                    Ok(Some(b)) => b,
-                    Ok(None) => {
-                        tracing::info!("changelog event channel closed");
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "change source failed");
-                        break;
-                    }
-                }
+        let batch = match receive(source.as_mut(), &cancel, catching_up).await {
+            Receive::Batch(batch) => {
+                verified_quiescent = false;
+                batch
             }
-            _ = cancel.cancelled() => {
+            Receive::Closed => {
+                tracing::info!("changelog event channel closed");
+                break;
+            }
+            Receive::Failed(rbh_change_source::ChangeSourceError::RetentionGap(reason)) => {
+                tracing::error!(%reason, "change source retention gap");
+                return IngestExit::RetentionGap(reason);
+            }
+            Receive::Failed(error) => {
+                tracing::error!(%error, "change source failed");
+                break;
+            }
+            Receive::Cancelled => {
                 tracing::info!("changelog ingest cancelled");
                 break;
+            }
+            Receive::Quiescent => {
+                if !verified_quiescent {
+                    if let Err(reason) = verify_juicefs_namespace(&entry_store, &filesystem_id, &mount_path).await {
+                        let reason = reason.to_string();
+                        let _ = entry_store
+                            .set_baseline_state(
+                                &filesystem_id,
+                                rbh_entry_store::model::BaselineState::Invalid,
+                                last_committed,
+                                Some(&reason),
+                            )
+                            .await;
+                        return IngestExit::BaselineInvalid(reason);
+                    }
+                    // Require another quiet boundary after the independent
+                    // walk so changes that arrived during comparison are
+                    // drained before Ready is published.
+                    verified_quiescent = true;
+                    continue;
+                }
+                if let Err(error) = entry_store
+                    .set_baseline_state(
+                        &filesystem_id,
+                        rbh_entry_store::model::BaselineState::Ready,
+                        last_committed,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "failed to publish JuiceFS baseline completion");
+                    break;
+                }
+                catching_up = false;
+                tracing::info!(filesystem = %filesystem_id, ?last_committed, "JuiceFS baseline caught up");
+                continue;
             }
         };
 
@@ -172,9 +261,47 @@ pub async fn ingest_loop(
             tracing::warn!(%error, "checkpoint commit failed — batch will replay");
             break;
         }
+        last_committed = Some(max_index);
     }
 
     tracing::info!("changelog ingest loop exiting");
+    IngestExit::Stopped
+}
+
+async fn verify_juicefs_namespace(store: &EntryStore, filesystem: &FileSystemId, mount: &Path) -> anyhow::Result<()> {
+    let config = rbh_fs_scan::ScanConfig {
+        root: mount.to_path_buf(),
+        concurrency: 4,
+        max_depth: None,
+        channel_size: 1024,
+        since_mtime: None,
+        ignore_globs: Vec::new(),
+    };
+    let (mut events, _) = rbh_fs_scan::PosixWalker::run(config);
+    let mut mounted = Vec::new();
+    while let Some(event) = events.recv().await {
+        match event {
+            rbh_fs_scan::PosixWalkEvent::Entry(entry) => {
+                if let Some(edge) = rbh_fs_scan::juicefs::adapt(filesystem, &entry, 0)
+                    .map_err(anyhow::Error::msg)?
+                    .1
+                {
+                    mounted.push(edge);
+                }
+            }
+            rbh_fs_scan::PosixWalkEvent::Error { path, error } => {
+                anyhow::bail!("namespace verification failed at {path}: {error}")
+            }
+        }
+    }
+    let catalog = store.list_scoped_namespace_edges(filesystem).await?;
+    rbh_fs_scan::juicefs::compare_namespace(&mounted, &catalog).map_err(|difference| {
+        anyhow::anyhow!(
+            "namespace mismatch: {} missing from catalog, {} missing from mount",
+            difference.missing_from_catalog,
+            difference.missing_from_mount
+        )
+    })
 }
 
 fn change_object(change: &Change) -> ObjectId {
@@ -243,9 +370,24 @@ async fn apply_juicefs_change(
                         .map_or(0, |value| value.components().count() as u32),
                 })
                 .await?;
+            store
+                .upsert_scoped_namespace_edge(&ScopedNamespaceEdge {
+                    filesystem: filesystem.clone(),
+                    parent: *parent,
+                    name: name.clone(),
+                    object,
+                })
+                .await?;
             Ok(())
         }
-        Change::Renamed { parent, name, time, .. } => {
+        Change::Renamed {
+            source_parent,
+            source_name,
+            parent,
+            name,
+            time,
+            ..
+        } => {
             let mut entry = store
                 .get_scoped_entry(&key)
                 .await?
@@ -255,6 +397,17 @@ async fn apply_juicefs_change(
             entry.ctime = *time;
             entry.last_seen = *time;
             store.upsert_scoped_entry(&entry).await?;
+            store
+                .remove_scoped_namespace_edge(filesystem, *source_parent, source_name)
+                .await?;
+            store
+                .upsert_scoped_namespace_edge(&ScopedNamespaceEdge {
+                    filesystem: filesystem.clone(),
+                    parent: *parent,
+                    name: name.clone(),
+                    object,
+                })
+                .await?;
             Ok(())
         }
         Change::Removed {
@@ -263,24 +416,9 @@ async fn apply_juicefs_change(
             directory,
             ..
         } => {
-            if let Some(mut entry) = store.get_scoped_entry(&key).await? {
-                let removed_parent = EntryKey::new(filesystem.clone(), *parent);
-                let removes_cataloged_edge = entry.parent.as_ref() == Some(&removed_parent) && entry.name == *name;
-                if !directory && !removes_cataloged_edge {
-                    let path = juicefs_object_path(store, mount, &key).await?;
-                    let live = tokio::fs::symlink_metadata(&path).await?;
-                    if live.ino() != object_inode(object)? {
-                        anyhow::bail!("JuiceFS inode changed before UNLINK apply: {}", path.display());
-                    }
-                    entry.nlink = live.nlink() as u32;
-                    entry.last_seen = change.time();
-                    store.upsert_scoped_entry(&entry).await?;
-                } else if !directory && entry.nlink > 1 {
-                    anyhow::bail!("UNLINK removed the only cataloged path for a multiply linked inode");
-                } else {
-                    store.remove_scoped_entry(&key).await?;
-                }
-            }
+            store
+                .apply_scoped_unlink(&key, *parent, name, change.time(), *directory)
+                .await?;
             Ok(())
         }
         Change::MetadataChanged { .. } | Change::ContentChanged { .. } => {
@@ -306,7 +444,20 @@ async fn apply_juicefs_change(
             store.upsert_scoped_entry(&entry).await?;
             Ok(())
         }
-        Change::Hardlinked { .. } => anyhow::bail!("JuiceFS hard-link catalog edges are not implemented"),
+        Change::Hardlinked { parent, name, time, .. } => {
+            store
+                .apply_scoped_hardlink(
+                    &ScopedNamespaceEdge {
+                        filesystem: filesystem.clone(),
+                        parent: *parent,
+                        name: name.clone(),
+                        object,
+                    },
+                    *time,
+                )
+                .await?;
+            Ok(())
+        }
         Change::Backend(_) => anyhow::bail!("backend event cannot belong to JuiceFS"),
     }
 }
@@ -789,6 +940,58 @@ mod tests {
         committed: Option<oneshot::Sender<Checkpoint>>,
     }
 
+    struct RetentionGapSource;
+
+    #[async_trait]
+    impl ChangeSource for RetentionGapSource {
+        async fn next_batch(&mut self) -> Result<Option<ChangeBatch>, ChangeSourceError> {
+            Err(ChangeSourceError::RetentionGap("cursor expired".into()))
+        }
+
+        async fn commit(&mut self, _: Checkpoint) -> Result<(), ChangeSourceError> {
+            unreachable!()
+        }
+    }
+
+    struct IdleSource;
+
+    #[async_trait]
+    impl ChangeSource for IdleSource {
+        async fn next_batch(&mut self) -> Result<Option<ChangeBatch>, ChangeSourceError> {
+            std::future::pending().await
+        }
+
+        async fn commit(&mut self, _: Checkpoint) -> Result<(), ChangeSourceError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn catchup_reaches_a_quiescent_boundary_without_a_new_record() {
+        let mut source = IdleSource;
+        assert!(matches!(
+            receive(&mut source, &CancellationToken::new(), true).await,
+            Receive::Quiescent
+        ));
+    }
+
+    #[tokio::test]
+    async fn retention_gap_is_exposed_to_the_runtime_without_ack() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://root@localhost/unused")
+            .unwrap();
+        let exit = ingest_loop(
+            Box::new(RetentionGapSource),
+            EntryStore::with_pool(pool),
+            FileSystemId::new("juice").unwrap(),
+            "/jfs".into(),
+            CancellationToken::new(),
+            Default::default(),
+        )
+        .await;
+        assert_eq!(exit, IngestExit::RetentionGap("cursor expired".into()));
+    }
+
     #[async_trait]
     impl ChangeSource for OneBatchSource {
         async fn next_batch(&mut self) -> Result<Option<ChangeBatch>, ChangeSourceError> {
@@ -824,6 +1027,7 @@ mod tests {
             })
             .await
             .unwrap();
+        store.clear_scoped_catalog(&filesystem).await.unwrap();
         let checkpoint = Checkpoint {
             source: "jfs-nfs".into(),
             position: 77,
@@ -863,6 +1067,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(persisted.name, Bytes::from_static(b"durable-before-ack"));
+
+        let link = Change::Hardlinked {
+            object: ObjectId::JuiceFs(42),
+            parent: ObjectId::JuiceFs(1),
+            name: Bytes::from_static(b"alias"),
+            time: 1_700_000_002,
+        };
+        apply_juicefs_change(&store, persisted.key.filesystem(), Path::new("/mnt/jfs"), &link)
+            .await
+            .unwrap();
+        apply_juicefs_change(&store, persisted.key.filesystem(), Path::new("/mnt/jfs"), &link)
+            .await
+            .unwrap();
+        let replayed = store.get_scoped_entry(&persisted.key).await.unwrap().unwrap();
+        assert_eq!(replayed.nlink, 2, "replayed LINK must not increment nlink twice");
+        let unlink = Change::Removed {
+            object: ObjectId::JuiceFs(42),
+            parent: ObjectId::JuiceFs(1),
+            name: Bytes::from_static(b"alias"),
+            last_link: false,
+            directory: false,
+            time: 1_700_000_003,
+        };
+        apply_juicefs_change(&store, persisted.key.filesystem(), Path::new("/mnt/jfs"), &unlink)
+            .await
+            .unwrap();
+        apply_juicefs_change(&store, persisted.key.filesystem(), Path::new("/mnt/jfs"), &unlink)
+            .await
+            .unwrap();
+        let replayed = store.get_scoped_entry(&persisted.key).await.unwrap().unwrap();
+        assert_eq!(replayed.nlink, 1, "replayed UNLINK must not decrement nlink twice");
 
         let rejected_filesystem = FileSystemId::new("jfs-rejected-test").unwrap();
         store

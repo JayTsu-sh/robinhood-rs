@@ -23,7 +23,8 @@ impl JuiceFsChangeSource {
         let mut client = ChangelogClient::connect(endpoint).await?;
         let stream = client
             .watch(WatchRequest { volume: volume.clone() })
-            .await?
+            .await
+            .map_err(map_watch_status)?
             .into_inner();
         Ok(Self {
             filesystem,
@@ -41,9 +42,18 @@ impl JuiceFsChangeSource {
             .watch(WatchRequest {
                 volume: self.volume.clone(),
             })
-            .await?
+            .await
+            .map_err(map_watch_status)?
             .into_inner();
         Ok(())
+    }
+}
+
+fn map_watch_status(status: tonic::Status) -> ChangeSourceError {
+    if status.code() == tonic::Code::FailedPrecondition {
+        ChangeSourceError::RetentionGap(status.message().to_owned())
+    } else {
+        ChangeSourceError::Rpc(status)
     }
 }
 
@@ -63,6 +73,9 @@ impl ChangeSource for JuiceFsChangeSource {
                 Ok(Some(record)) => break record,
                 Ok(None) => self.reopen_watch().await?,
                 Err(status) if status.code() == tonic::Code::Unavailable => self.reopen_watch().await?,
+                Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                    return Err(ChangeSourceError::RetentionGap(status.message().to_owned()));
+                }
                 Err(status) => return Err(status.into()),
             }
         };
@@ -193,6 +206,15 @@ fn parse_record(entry: &str) -> Result<Option<Change>, ChangeSourceError> {
                 time: seconds,
             }))
         }
+        "LINK" => {
+            require_fields(entry, &fields, 4)?;
+            Ok(Some(Change::Hardlinked {
+                object: ObjectId::JuiceFs(parse_u64(entry, fields[0], "inode")?),
+                parent: ObjectId::JuiceFs(parse_u64(entry, fields[1], "parent inode")?),
+                name: Bytes::from(decode_name(entry, fields[2])?),
+                time: seconds,
+            }))
+        }
         "UNLINK" | "RMDIR" => {
             require_fields(entry, &fields, if name == "UNLINK" { 5 } else { 3 })?;
             Ok(Some(Change::Removed {
@@ -291,6 +313,14 @@ mod tests {
     use crate::{ContentChangeKind, MetadataChangeKind};
 
     #[test]
+    fn failed_precondition_is_a_retention_gap() {
+        assert!(matches!(
+            map_watch_status(tonic::Status::failed_precondition("changelog retention gap")),
+            ChangeSourceError::RetentionGap(_)
+        ));
+    }
+
+    #[test]
     fn normalizes_supported_juicefs_operations() {
         let cases = [
             (
@@ -331,6 +361,15 @@ mod tests {
                 },
             ),
             (
+                "3.0|LINK(42,2,alias,true):2|(1,4)",
+                Change::Hardlinked {
+                    object: ObjectId::JuiceFs(42),
+                    parent: ObjectId::JuiceFs(2),
+                    name: Bytes::from_static(b"alias"),
+                    time: 3,
+                },
+            ),
+            (
                 "4.0|UNLINK(2,new%25name,0,false,true):42|(1,5)",
                 Change::Removed {
                     object: ObjectId::JuiceFs(42),
@@ -363,7 +402,7 @@ mod tests {
         for record in [
             "bad",
             "1.0|SETATTR(1)|(1,2)",
-            "1.0|LINK(42,1,alias,true):2|(1,2)",
+            "1.0|LINK(42,1)|(1,2)",
             "1.0|CREATE(1,x,0,0,99,0,0,,,true):2|(1,2)",
         ] {
             assert!(matches!(

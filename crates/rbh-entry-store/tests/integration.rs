@@ -12,8 +12,8 @@ use bytes::Bytes;
 use lustre_api::LuFid;
 use lustre_changelog::CursorStore;
 use rbh_entry_store::model::{
-    BackendCapabilities, BackendKind, EntryKey, EntryKind, EntryRow, FileSystemConfig, FileSystemId, ObjectId,
-    ScopedEntryRow,
+    BackendCapabilities, BackendKind, BaselineState, EntryKey, EntryKind, EntryRow, FileSystemConfig, FileSystemId,
+    ObjectId, ScopedEntryRow, ScopedNamespaceEdge,
 };
 use rbh_entry_store::store::{EntryStore, MariaDbCursorStore};
 use sqlx::MySql;
@@ -29,6 +29,8 @@ fn integration_enabled() -> bool {
 async fn reset_db(pool: &sqlx::Pool<MySql>) {
     // Drop tables in reverse dependency order (policies has no FK deps).
     for table in &[
+        "filesystem_baselines",
+        "scoped_namespace_edges",
         "scoped_entries",
         "filesystems",
         "stripe_items",
@@ -44,6 +46,60 @@ async fn reset_db(pool: &sqlx::Pool<MySql>) {
             .execute(pool)
             .await;
     }
+}
+
+#[tokio::test]
+async fn juicefs_baseline_state_and_hardlink_edges_are_durable_and_idempotent() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let filesystem = FileSystemId::new("juice-baseline").unwrap();
+    store
+        .register_filesystem(&FileSystemConfig {
+            id: filesystem.clone(),
+            backend: BackendKind::JuiceFs,
+            mount_path: "/jfs".into(),
+            capabilities: BackendCapabilities {
+                changelog: true,
+                namespace: true,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    store
+        .set_baseline_state(&filesystem, BaselineState::Scanning, None, None)
+        .await
+        .unwrap();
+    let edge = ScopedNamespaceEdge {
+        filesystem: filesystem.clone(),
+        parent: ObjectId::JuiceFs(1),
+        name: Bytes::from_static(b"second-name"),
+        object: ObjectId::JuiceFs(42),
+    };
+    store.upsert_scoped_namespace_edge(&edge).await.unwrap();
+    store.upsert_scoped_namespace_edge(&edge).await.unwrap();
+    assert_eq!(
+        store.list_scoped_namespace_edges(&filesystem).await.unwrap(),
+        vec![edge]
+    );
+    store
+        .set_baseline_state(&filesystem, BaselineState::Ready, Some(9001), None)
+        .await
+        .unwrap();
+    let baseline = store.get_baseline(&filesystem).await.unwrap().unwrap();
+    assert_eq!(baseline.state, BaselineState::Ready);
+    assert_eq!(baseline.last_version, Some(9001));
+    assert!(baseline.scan_started_at.is_some());
+    assert!(baseline.completed_at.is_some());
 }
 
 #[tokio::test]
