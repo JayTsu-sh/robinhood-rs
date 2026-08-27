@@ -91,9 +91,10 @@ impl HsmPoller {
                 break;
             }
             // kind = 0 → files only. Other kinds don't have HSM state.
-            let rows: Vec<EntryRow> = self
+            let scoped_rows = self
                 .entry_store
-                .query_page(
+                .query_scoped_page(
+                    &self.filesystem_id,
                     "kind = ?",
                     &[QueryParam::Int(EntryKind::File as i64)],
                     Some("fid"),
@@ -101,6 +102,13 @@ impl HsmPoller {
                     offset,
                 )
                 .await?;
+            let rows: Vec<EntryRow> = scoped_rows
+                .into_iter()
+                .map(|row| {
+                    row.to_lustre_compat()
+                        .ok_or_else(|| anyhow::anyhow!("HSM poller received a non-Lustre object"))
+                })
+                .collect::<anyhow::Result<_>>()?;
             if rows.is_empty() {
                 break;
             }
@@ -167,7 +175,18 @@ impl HsmPoller {
             "hsm_last_event_ts": now,
             "hsm_dirty": observed.states.contains(HsmState::DIRTY),
         });
-        self.entry_store.patch_sm_status(&entry.fid, &patch).await?;
+        self.entry_store
+            .legacy_lustre_patch_sm_status(&entry.fid, &patch)
+            .await?;
+        self.entry_store
+            .patch_scoped_sm_status(
+                &rbh_entry_store::EntryKey::new(
+                    self.filesystem_id.clone(),
+                    rbh_entry_store::ObjectId::Lustre(entry.fid),
+                ),
+                &patch,
+            )
+            .await?;
         tracing::info!(
             fid = %entry.fid,
             from = stored_label,

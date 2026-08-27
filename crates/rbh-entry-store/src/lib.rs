@@ -21,6 +21,6 @@ pub mod store;
 pub use error::StoreError;
 pub use model::{
     BackendCapabilities, BackendKind, BackendKindParseError, EntryKey, EntryKind, EntryRow, FileSystemConfig,
-    FileSystemId, FileSystemIdError, ObjectId, RemovedEntry, ScopedEntryRow,
+    FileSystemId, FileSystemIdError, ObjectId, RemovedEntry, ScopedEntryRow, ScopedRemovedEntry,
 };
 pub use store::EntryStore;

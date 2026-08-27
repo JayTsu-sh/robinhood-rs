@@ -20,6 +20,10 @@ pub struct Cli {
     #[arg(long, env = "RBH_API_URL", default_value = "http://127.0.0.1:8080")]
     pub api_url: String,
 
+    /// Filesystem identity for catalog queries and reports.
+    #[arg(long, env = "RBH_FILESYSTEM")]
+    pub filesystem: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -261,6 +265,7 @@ pub async fn run() -> Result<()> {
 
     let cli = Cli::parse();
     let client = reqwest::Client::new();
+    let filesystem = cli.filesystem.clone();
 
     match cli.command {
         Command::PolicyList => {
@@ -356,7 +361,15 @@ pub async fn run() -> Result<()> {
             println!("classifier {id} deleted");
         }
         Command::Status => {
-            let resp = client.get(format!("{}/api/entries/count", cli.api_url)).send().await?;
+            let filesystem = require_filesystem(filesystem.as_deref())?;
+            let resp = client
+                .get(format!(
+                    "{}/api/entries/count?filesystem={}",
+                    cli.api_url,
+                    urlencoding::encode(filesystem)
+                ))
+                .send()
+                .await?;
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
@@ -365,10 +378,25 @@ pub async fn run() -> Result<()> {
             let body: serde_json::Value = resp.json().await?;
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
-        Command::Find(args) => run_find(&client, &cli.api_url, args).await?,
-        Command::Report(cmd) => run_report(&client, &cli.api_url, cmd).await?,
-        Command::Undelete(cmd) => run_undelete(&client, &cli.api_url, cmd).await?,
-        Command::Diff { mount, limit } => run_diff(&client, &cli.api_url, &mount, limit).await?,
+        Command::Find(args) => {
+            run_find(&client, &cli.api_url, require_filesystem(filesystem.as_deref())?, args).await?
+        }
+        Command::Report(cmd) => {
+            run_report(&client, &cli.api_url, require_filesystem(filesystem.as_deref())?, cmd).await?
+        }
+        Command::Undelete(cmd) => {
+            run_undelete(&client, &cli.api_url, require_filesystem(filesystem.as_deref())?, cmd).await?
+        }
+        Command::Diff { mount, limit } => {
+            run_diff(
+                &client,
+                &cli.api_url,
+                require_filesystem(filesystem.as_deref())?,
+                &mount,
+                limit,
+            )
+            .await?
+        }
         Command::Scan {
             root,
             since_mtime,
@@ -380,6 +408,7 @@ pub async fn run() -> Result<()> {
             run_scan(
                 &client,
                 &cli.api_url,
+                require_filesystem(filesystem.as_deref())?,
                 root,
                 since_mtime,
                 ignore,
@@ -396,16 +425,29 @@ pub async fn run() -> Result<()> {
                 run_admin_sweep(&client, &cli.api_url, before, limit, dry_run).await?
             }
         },
-        Command::Du { fid, path } => run_du(&client, &cli.api_url, fid, path).await?,
+        Command::Du { fid, path } => {
+            run_du(
+                &client,
+                &cli.api_url,
+                require_filesystem(filesystem.as_deref())?,
+                fid,
+                path,
+            )
+            .await?
+        }
     }
 
     Ok(())
 }
 
+fn require_filesystem(filesystem: Option<&str>) -> Result<&str> {
+    filesystem.ok_or_else(|| anyhow::anyhow!("--filesystem (or RBH_FILESYSTEM) is required for catalog operations"))
+}
+
 async fn run_admin_dump(client: &reqwest::Client, api_url: &str, out: Option<String>) -> Result<()> {
     use std::io::Write;
     let resp = client
-        .get(format!("{api_url}/api/admin/dump"))
+        .get(format!("{api_url}/api/compat/lustre/admin/dump"))
         .send()
         .await
         .context("GET /api/admin/dump")?;
@@ -443,7 +485,7 @@ async fn run_admin_restore(client: &reqwest::Client, api_url: &str, input: Optio
             std::io::stdin().read_to_end(&mut body).context("read stdin")?;
         }
     }
-    let url = format!("{api_url}/api/admin/restore?batch={batch}");
+    let url = format!("{api_url}/api/compat/lustre/admin/restore?batch={batch}");
     let resp = client
         .post(url)
         .header("content-type", "application/x-ndjson")
@@ -460,14 +502,23 @@ async fn run_admin_restore(client: &reqwest::Client, api_url: &str, input: Optio
     Ok(())
 }
 
-async fn run_du(client: &reqwest::Client, api_url: &str, fid: Option<String>, path: Option<String>) -> Result<()> {
+async fn run_du(
+    client: &reqwest::Client, api_url: &str, filesystem: &str, fid: Option<String>, path: Option<String>,
+) -> Result<()> {
+    let filesystem = urlencoding::encode(filesystem);
     let url = match (fid, path) {
-        (Some(f), None) => format!("{api_url}/api/reports/du?fid={}", urlencoding::encode(&f)),
-        (None, Some(p)) => format!("{api_url}/api/reports/du?path={}", urlencoding::encode(&p)),
+        (Some(f), None) => format!(
+            "{api_url}/api/reports/du?filesystem={filesystem}&fid={}",
+            urlencoding::encode(&f)
+        ),
+        (None, Some(p)) => format!(
+            "{api_url}/api/reports/du?filesystem={filesystem}&path={}",
+            urlencoding::encode(&p)
+        ),
         _ => anyhow::bail!("exactly one of --fid or --path must be given"),
     };
     let v = fetch_json(client, &url).await?;
-    let root = v.get("fid").and_then(|v| v.as_str()).unwrap_or("?");
+    let root = v.get("object_id").map(|v| v.to_string()).unwrap_or_else(|| "?".into());
     let count = v.get("file_count").and_then(|v| v.as_u64()).unwrap_or(0);
     let bytes = v.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
     println!("root:     {root}");
@@ -509,7 +560,8 @@ mod tests {
 async fn run_admin_sweep(
     client: &reqwest::Client, api_url: &str, before: i64, limit: u64, dry_run: bool,
 ) -> Result<()> {
-    let url = format!("{api_url}/api/admin/sweep-orphans?before={before}&limit={limit}&dry_run={dry_run}");
+    let url =
+        format!("{api_url}/api/compat/lustre/admin/sweep-orphans?before={before}&limit={limit}&dry_run={dry_run}");
     let resp = client.post(url).send().await.context("POST /api/admin/sweep-orphans")?;
     let status = resp.status();
     let v: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -522,10 +574,11 @@ async fn run_admin_sweep(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_scan(
-    client: &reqwest::Client, api_url: &str, root: Option<String>, since_mtime: Option<i64>, ignore: Vec<String>,
-    concurrency: Option<usize>, max_depth: Option<usize>, detach: bool,
+    client: &reqwest::Client, api_url: &str, filesystem: &str, root: Option<String>, since_mtime: Option<i64>,
+    ignore: Vec<String>, concurrency: Option<usize>, max_depth: Option<usize>, detach: bool,
 ) -> Result<()> {
     let body = serde_json::json!({
+        "filesystem": filesystem,
         "root": root,
         "since_mtime": since_mtime,
         "ignore_globs": ignore,
@@ -568,15 +621,16 @@ async fn run_scan(
     Ok(())
 }
 
-async fn run_undelete(client: &reqwest::Client, api_url: &str, cmd: UndeleteCmd) -> Result<()> {
+async fn run_undelete(client: &reqwest::Client, api_url: &str, filesystem: &str, cmd: UndeleteCmd) -> Result<()> {
+    let filesystem_param = urlencoding::encode(filesystem);
     match cmd {
         UndeleteCmd::List { n, since } => {
-            let mut url = format!("{api_url}/api/removed?limit={n}");
+            let mut url = format!("{api_url}/api/removed?filesystem={filesystem_param}&limit={n}");
             if let Some(s) = since {
                 url.push_str(&format!("&since={s}"));
             }
             let v = fetch_json(client, &url).await?;
-            let arr = v.as_array().cloned().unwrap_or_default();
+            let arr = response_rows(&v);
             println!("{:<14} {:>12} {:>10} {:<8} name  fid", "rm_time", "size", "uid", "kind");
             for e in arr {
                 let rm = e.get("rm_time").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -584,13 +638,13 @@ async fn run_undelete(client: &reqwest::Client, api_url: &str, cmd: UndeleteCmd)
                 let uid = e.get("uid").and_then(|v| v.as_u64()).unwrap_or(0);
                 let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
                 let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let fid = e.get("fid").map(|v| v.to_string()).unwrap_or_else(|| "?".into());
-                println!("{rm:<14} {size:>12} {uid:>10} {kind:<8} {name}  fid={fid}");
+                let object = e.get("object_id").map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+                println!("{rm:<14} {size:>12} {uid:>10} {kind:<8} {name}  object={object}");
             }
         }
         UndeleteCmd::Forget { fid } => {
             let resp = client
-                .delete(format!("{api_url}/api/removed/{fid}"))
+                .delete(format!("{api_url}/api/removed/{fid}?filesystem={filesystem_param}"))
                 .send()
                 .await
                 .context("request failed")?;
@@ -607,7 +661,7 @@ async fn run_undelete(client: &reqwest::Client, api_url: &str, cmd: UndeleteCmd)
     Ok(())
 }
 
-async fn run_diff(client: &reqwest::Client, api_url: &str, mount: &str, limit: usize) -> Result<()> {
+async fn run_diff(client: &reqwest::Client, api_url: &str, filesystem: &str, mount: &str, limit: usize) -> Result<()> {
     // Match by `(name, size)` tuples. Precise diff by parent_fid would
     // need an FS-side path_to_fid call per entry — that's an FFI a
     // pure-HTTP CLI client shouldn't own. `(name, size)` catches the
@@ -622,6 +676,7 @@ async fn run_diff(client: &reqwest::Client, api_url: &str, mount: &str, limit: u
     let page_size: u64 = 5000;
     loop {
         let body = serde_json::json!({
+            "filesystem": filesystem,
             "predicate": {"op": "true"},
             "limit": page_size,
             "offset": offset,
@@ -632,8 +687,8 @@ async fn run_diff(client: &reqwest::Client, api_url: &str, mount: &str, limit: u
         for e in entries {
             let name = e.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let size = e.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
-            let fid = e.get("fid").and_then(|x| x.as_str()).unwrap_or("?").to_string();
-            catalog.insert((name, size), fid);
+            let object = e.get("object_id").map(|x| x.to_string()).unwrap_or_else(|| "?".into());
+            catalog.insert((name, size), object);
         }
         offset += n;
         if n < page_size {
@@ -690,34 +745,47 @@ async fn run_diff(client: &reqwest::Client, api_url: &str, mount: &str, limit: u
     Ok(())
 }
 
-async fn run_report(client: &reqwest::Client, api_url: &str, cmd: ReportCmd) -> Result<()> {
+async fn run_report(client: &reqwest::Client, api_url: &str, filesystem: &str, cmd: ReportCmd) -> Result<()> {
+    let filesystem_param = urlencoding::encode(filesystem);
     match cmd {
         ReportCmd::TopSize { n } => {
-            let v = fetch_json(client, &format!("{api_url}/api/reports/top-size?n={n}")).await?;
+            let v = fetch_json(
+                client,
+                &format!("{api_url}/api/reports/top-size?filesystem={filesystem_param}&n={n}"),
+            )
+            .await?;
             print_entries_table(&v);
         }
         ReportCmd::Oldest { n } => {
-            let v = fetch_json(client, &format!("{api_url}/api/reports/oldest?n={n}")).await?;
+            let v = fetch_json(
+                client,
+                &format!("{api_url}/api/reports/oldest?filesystem={filesystem_param}&n={n}"),
+            )
+            .await?;
             print_entries_table(&v);
         }
         ReportCmd::TopUsers { n, by } => {
-            let body = agg_body("uid", by, n);
+            let body = agg_body(filesystem, "uid", by, n);
             let v = post_json(client, &format!("{api_url}/api/reports/aggregate"), &body).await?;
             print_aggregate_table(&v, "uid");
         }
         ReportCmd::TopGroups { n, by } => {
-            let body = agg_body("gid", by, n);
+            let body = agg_body(filesystem, "gid", by, n);
             let v = post_json(client, &format!("{api_url}/api/reports/aggregate"), &body).await?;
             print_aggregate_table(&v, "gid");
         }
         ReportCmd::FsInfo => {
-            let body = agg_body("kind", ReportBy::Count, 20);
+            let body = agg_body(filesystem, "kind", ReportBy::Count, 20);
             let v = post_json(client, &format!("{api_url}/api/reports/aggregate"), &body).await?;
             print_aggregate_table(&v, "kind");
         }
         ReportCmd::SizeProfile => {
-            let v = fetch_json(client, &format!("{api_url}/api/reports/size-profile")).await?;
-            let arr = v.as_array().cloned().unwrap_or_default();
+            let v = fetch_json(
+                client,
+                &format!("{api_url}/api/reports/size-profile?filesystem={filesystem_param}"),
+            )
+            .await?;
+            let arr = response_rows(&v);
             println!("{:<12} {:>10} {:>18}", "bucket", "count", "total_size");
             for row in arr {
                 let b = row.get("bucket").and_then(|v| v.as_str()).unwrap_or("?");
@@ -727,8 +795,12 @@ async fn run_report(client: &reqwest::Client, api_url: &str, cmd: ReportCmd) -> 
             }
         }
         ReportCmd::StripeDist => {
-            let v = fetch_json(client, &format!("{api_url}/api/reports/stripe-distribution")).await?;
-            let arr = v.as_array().cloned().unwrap_or_default();
+            let v = fetch_json(
+                client,
+                &format!("{api_url}/api/reports/stripe-distribution?filesystem={filesystem_param}"),
+            )
+            .await?;
+            let arr = response_rows(&v);
             println!("{:>4} {:>10} {:>18}", "ost", "files", "approx_bytes");
             for row in arr {
                 let o = row.get("ost_index").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -765,6 +837,7 @@ async fn run_report(client: &reqwest::Client, api_url: &str, cmd: ReportCmd) -> 
                 _ => serde_json::json!({"op": "and", "children": children}),
             };
             let body = serde_json::json!({
+                "filesystem": filesystem,
                 "predicate": predicate,
                 "limit": limit,
             });
@@ -782,12 +855,12 @@ async fn run_report(client: &reqwest::Client, api_url: &str, cmd: ReportCmd) -> 
     Ok(())
 }
 
-fn agg_body(key: &str, by: ReportBy, n: u64) -> serde_json::Value {
+fn agg_body(filesystem: &str, key: &str, by: ReportBy, n: u64) -> serde_json::Value {
     let sort = match by {
         ReportBy::Count => "count",
         ReportBy::Size => "size",
     };
-    serde_json::json!({ "key": key, "sort": sort, "limit": n })
+    serde_json::json!({ "filesystem": filesystem, "key": key, "sort": sort, "limit": n })
 }
 
 async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
@@ -811,7 +884,7 @@ async fn post_json(client: &reqwest::Client, url: &str, body: &serde_json::Value
 }
 
 fn print_entries_table(v: &serde_json::Value) {
-    let arr = v.as_array().cloned().unwrap_or_default();
+    let arr = response_rows(v);
     for e in arr {
         let size = e.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
         let uid = e.get("uid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -822,7 +895,7 @@ fn print_entries_table(v: &serde_json::Value) {
 }
 
 fn print_aggregate_table(v: &serde_json::Value, key_label: &str) {
-    let arr = v.as_array().cloned().unwrap_or_default();
+    let arr = response_rows(v);
     println!("{:<16}  {:>10}  {:>18}", key_label, "count", "total_size");
     for row in arr {
         let raw = row.get("key").and_then(|v| v.as_str()).unwrap_or("?");
@@ -842,6 +915,14 @@ fn print_aggregate_table(v: &serde_json::Value, key_label: &str) {
     }
 }
 
+fn response_rows(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    value
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn kind_code_to_label(code: &str) -> String {
     match code {
         "0" => "file".into(),
@@ -855,11 +936,12 @@ fn kind_code_to_label(code: &str) -> String {
     }
 }
 
-async fn run_find(client: &reqwest::Client, api_url: &str, args: FindArgs) -> Result<()> {
+async fn run_find(client: &reqwest::Client, api_url: &str, filesystem: &str, args: FindArgs) -> Result<()> {
     let json_output = args.json;
     let (predicate, order_by) = build_query(&args, find::now_secs())?;
 
     let body = serde_json::json!({
+        "filesystem": filesystem,
         "predicate": predicate,
         "order_by": order_by,
         "limit": args.limit,

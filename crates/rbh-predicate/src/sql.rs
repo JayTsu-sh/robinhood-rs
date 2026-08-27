@@ -122,8 +122,11 @@ fn build(pred: &Predicate, params: &mut Vec<SqlParam>) -> String {
                 params.push(SqlParam::Num(*idx as i64));
             }
             format!(
-                "EXISTS (SELECT 1 FROM stripe_items s \
-                 WHERE s.fid = entries.fid AND s.ost_index IN ({placeholders}))"
+                "EXISTS (SELECT 1 FROM scoped_stripe_items s \
+                 WHERE s.filesystem_id = entries.filesystem_id \
+                 AND s.object_kind = entries.object_kind \
+                 AND s.object_id = entries.object_id \
+                 AND s.ost_index IN ({placeholders}))"
             )
         }
 
@@ -325,7 +328,7 @@ mod tests {
         let pred = Predicate::OnOst { osts: vec![3] };
         let (sql, params) = to_sql(&pred);
         assert!(
-            sql.contains("EXISTS (SELECT 1 FROM stripe_items s"),
+            sql.contains("EXISTS (SELECT 1 FROM scoped_stripe_items s"),
             "missing EXISTS: {sql}"
         );
         assert!(sql.contains("IN (?)"), "unexpected SQL: {sql}");

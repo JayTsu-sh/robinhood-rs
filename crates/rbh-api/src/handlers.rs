@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use rbh_entry_store::model::{EntryKind, EntryRow};
+use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow};
 use rbh_entry_store::store::{AggregateKey, AggregateSort, QueryParam};
 use rbh_policy::{PolicyDef, PolicyError};
 use rbh_predicate::{Predicate, SortKey, SqlParam, to_sql};
@@ -30,7 +30,7 @@ pub fn api_routes() -> Router<AppState> {
                 .delete(crate::classifier_handlers::delete_classifier),
         )
         .route(
-            "/classifiers/{id}/run",
+            "/compat/lustre/classifiers/{id}/run",
             post(crate::classifier_handlers::run_classifier),
         )
         .route("/policies", post(create_policy).get(list_policies))
@@ -52,9 +52,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/removed/{fid}", axum::routing::delete(forget_removed))
         .route("/scans", post(start_scan).get(list_scans))
         .route("/scans/{id}", get(get_scan))
-        .route("/admin/dump", get(admin_dump))
-        .route("/admin/restore", post(admin_restore))
-        .route("/admin/sweep-orphans", post(admin_sweep_orphans))
+        .route("/compat/lustre/admin/dump", get(admin_dump))
+        .route("/compat/lustre/admin/restore", post(admin_restore))
+        .route("/compat/lustre/admin/sweep-orphans", post(admin_sweep_orphans))
         .route("/health", get(health))
 }
 
@@ -71,7 +71,7 @@ async fn health() -> impl IntoResponse {
 // scrape — the entries count is the only point-in-time metric that's
 // not updated on a hot path.
 async fn metrics_endpoint(State(state): State<AppState>) -> axum::response::Response {
-    if let Ok(count) = state.entry_store.entry_count().await {
+    if let Ok(count) = state.entry_store.legacy_lustre_entry_count().await {
         rbh_observability::metrics::CATALOG_ENTRIES.set(count as i64);
     }
     match rbh_observability::metrics::render() {
@@ -236,14 +236,27 @@ async fn delete_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Re
 // Entries
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Deserialize)]
+struct FilesystemQuery {
+    filesystem: FileSystemId,
+}
+
+#[derive(Debug, Serialize)]
+struct ScopedRows<T> {
+    filesystem: FileSystemId,
+    rows: Vec<T>,
+}
+
 #[tracing::instrument(skip(state))]
-async fn entry_count(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn entry_count(
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<FilesystemQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let count = state
         .entry_store
-        .entry_count()
+        .scoped_entry_count(&q.filesystem)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "count": count })))
+    Ok(Json(serde_json::json!({ "filesystem": q.filesystem, "count": count })))
 }
 
 // ---- /api/entries/query ----
@@ -251,6 +264,8 @@ async fn entry_count(State(state): State<AppState>) -> Result<Json<serde_json::V
 /// POST body for `/api/entries/query`.
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
+    /// Stable filesystem identity. Queries never implicitly span filesystems.
+    pub filesystem: FileSystemId,
     /// Filter predicate. Omit / null = match all (`1=1`).
     #[serde(default)]
     pub predicate: Option<Predicate>,
@@ -273,6 +288,7 @@ fn default_limit() -> u64 {
 
 #[derive(Debug, Serialize)]
 pub struct QueryResponse {
+    pub filesystem: FileSystemId,
     pub entries: Vec<EntryDto>,
     pub limit: u64,
     pub offset: u64,
@@ -286,8 +302,9 @@ pub struct QueryResponse {
 /// the byte layer does not enforce this).
 #[derive(Debug, Serialize)]
 pub struct EntryDto {
-    pub fid: lustre_api::LuFid,
-    pub parent_fid: Option<lustre_api::LuFid>,
+    pub filesystem: FileSystemId,
+    pub object_id: ObjectId,
+    pub parent_object_id: Option<ObjectId>,
     pub name: String,
     pub kind: &'static str,
     pub size: u64,
@@ -307,11 +324,12 @@ pub struct EntryDto {
     pub last_seen: i64,
 }
 
-impl From<EntryRow> for EntryDto {
-    fn from(r: EntryRow) -> Self {
+impl From<ScopedEntryRow> for EntryDto {
+    fn from(r: ScopedEntryRow) -> Self {
         Self {
-            fid: r.fid,
-            parent_fid: r.parent_fid,
+            filesystem: r.key.filesystem().clone(),
+            object_id: *r.key.object(),
+            parent_object_id: r.parent.as_ref().map(|key| *key.object()),
             name: String::from_utf8_lossy(&r.name).into_owned(),
             kind: entry_kind_str(r.kind),
             size: r.size,
@@ -373,7 +391,14 @@ async fn query_entries(
 
     let rows = state
         .entry_store
-        .query_page(&where_clause, &store_params, order_by.as_deref(), limit, req.offset)
+        .query_scoped_page(
+            &req.filesystem,
+            &where_clause,
+            &store_params,
+            order_by.as_deref(),
+            limit,
+            req.offset,
+        )
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -381,7 +406,7 @@ async fn query_entries(
         Some(
             state
                 .entry_store
-                .count_where(&where_clause, &store_params)
+                .count_scoped_where(&req.filesystem, &where_clause, &store_params)
                 .await
                 .map_err(|e| ApiError::Internal(e.to_string()))?,
         )
@@ -390,6 +415,7 @@ async fn query_entries(
     };
 
     Ok(Json(QueryResponse {
+        filesystem: req.filesystem,
         entries: rows.into_iter().map(EntryDto::from).collect(),
         limit,
         offset: req.offset,
@@ -401,6 +427,7 @@ async fn query_entries(
 
 #[derive(Debug, Deserialize)]
 pub struct RemovedQuery {
+    pub filesystem: FileSystemId,
     #[serde(default = "default_removed_limit")]
     pub limit: u64,
     #[serde(default)]
@@ -416,8 +443,9 @@ fn default_removed_limit() -> u64 {
 
 #[derive(Debug, Serialize)]
 pub struct RemovedDto {
-    pub fid: lustre_api::LuFid,
-    pub parent_fid: Option<lustre_api::LuFid>,
+    pub filesystem: FileSystemId,
+    pub object_id: ObjectId,
+    pub parent_object_id: Option<ObjectId>,
     pub name: String,
     pub kind: &'static str,
     pub size: u64,
@@ -427,17 +455,19 @@ pub struct RemovedDto {
     pub rm_time: i64,
 }
 
-impl From<rbh_entry_store::model::RemovedEntry> for RemovedDto {
-    fn from(r: rbh_entry_store::model::RemovedEntry) -> Self {
+impl From<rbh_entry_store::model::ScopedRemovedEntry> for RemovedDto {
+    fn from(r: rbh_entry_store::model::ScopedRemovedEntry) -> Self {
+        let entry = r.entry;
         Self {
-            fid: r.fid,
-            parent_fid: r.parent_fid,
-            name: String::from_utf8_lossy(&r.name).into_owned(),
-            kind: entry_kind_str(r.kind),
-            size: r.size,
-            uid: r.uid,
-            gid: r.gid,
-            sm_status: r.sm_status,
+            filesystem: entry.key.filesystem().clone(),
+            object_id: *entry.key.object(),
+            parent_object_id: entry.parent.as_ref().map(|key| *key.object()),
+            name: String::from_utf8_lossy(&entry.name).into_owned(),
+            kind: entry_kind_str(entry.kind),
+            size: entry.size,
+            uid: entry.uid,
+            gid: entry.gid,
+            sm_status: entry.sm_status,
             rm_time: r.rm_time,
         }
     }
@@ -446,23 +476,28 @@ impl From<rbh_entry_store::model::RemovedEntry> for RemovedDto {
 #[tracing::instrument(skip(state))]
 async fn list_removed(
     State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<RemovedQuery>,
-) -> Result<Json<Vec<RemovedDto>>, ApiError> {
+) -> Result<Json<ScopedRows<RemovedDto>>, ApiError> {
     let limit = q.limit.clamp(1, 10_000);
     let rows = state
         .entry_store
-        .list_removed(q.since, limit, q.offset)
+        .list_scoped_removed(&q.filesystem, q.since, limit, q.offset)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(rows.into_iter().map(RemovedDto::from).collect()))
+    Ok(Json(ScopedRows {
+        filesystem: q.filesystem,
+        rows: rows.into_iter().map(RemovedDto::from).collect(),
+    }))
 }
 
 #[tracing::instrument(skip(state))]
-async fn forget_removed(State(state): State<AppState>, Path(fid_str): Path<String>) -> Result<StatusCode, ApiError> {
-    use std::str::FromStr;
-    let fid = lustre_api::LuFid::from_str(&fid_str).map_err(|e| ApiError::Internal(format!("invalid fid: {e}")))?;
+async fn forget_removed(
+    State(state): State<AppState>, Path(object_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<FilesystemQuery>,
+) -> Result<StatusCode, ApiError> {
+    let key = scoped_key_from_text(&state, q.filesystem, &object_id).await?;
     let removed = state
         .entry_store
-        .forget_removed(&fid)
+        .forget_scoped_removed(&key)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(if removed {
@@ -472,10 +507,35 @@ async fn forget_removed(State(state): State<AppState>, Path(fid_str): Path<Strin
     })
 }
 
+async fn scoped_key_from_text(
+    state: &AppState, filesystem: FileSystemId, value: &str,
+) -> Result<rbh_entry_store::EntryKey, ApiError> {
+    use std::str::FromStr;
+    let config = state
+        .entry_store
+        .get_filesystem(&filesystem)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown filesystem: {filesystem}")))?;
+    let object = match config.backend {
+        rbh_entry_store::BackendKind::Lustre => ObjectId::Lustre(
+            lustre_api::LuFid::from_str(value.trim_matches(|c| c == '[' || c == ']'))
+                .map_err(|e| ApiError::BadRequest(format!("invalid Lustre FID: {e}")))?,
+        ),
+        rbh_entry_store::BackendKind::JuiceFs => ObjectId::JuiceFs(
+            value
+                .parse()
+                .map_err(|e| ApiError::BadRequest(format!("invalid JuiceFS inode: {e}")))?,
+        ),
+    };
+    Ok(rbh_entry_store::EntryKey::new(filesystem, object))
+}
+
 // ---- /api/reports/* ----
 
 #[derive(Debug, Deserialize)]
 pub struct AggregateRequest {
+    pub filesystem: FileSystemId,
     pub key: AggregateKey,
     #[serde(default = "default_agg_sort")]
     pub sort: AggSort,
@@ -532,19 +592,21 @@ fn resolve_label(key: AggregateKey, numeric: &str) -> Option<String> {
 #[tracing::instrument(skip(state, req))]
 async fn report_aggregate(
     State(state): State<AppState>, Json(req): Json<AggregateRequest>,
-) -> Result<Json<Vec<AggregateRow>>, ApiError> {
+) -> Result<Json<ScopedRows<AggregateRow>>, ApiError> {
     let sort = match req.sort {
         AggSort::Count => AggregateSort::Count,
         AggSort::Size => AggregateSort::Size,
     };
     let rows = state
         .entry_store
-        .aggregate_by(req.key.as_column(), sort, req.limit.clamp(1, 1_000))
+        .aggregate_scoped_by(&req.filesystem, req.key, sort, req.limit.clamp(1, 1_000))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let key_kind = req.key;
-    Ok(Json(
-        rows.into_iter()
+    Ok(Json(ScopedRows {
+        filesystem: req.filesystem,
+        rows: rows
+            .into_iter()
             .map(|(key, count, total_size)| {
                 let label = resolve_label(key_kind, &key);
                 AggregateRow {
@@ -555,11 +617,12 @@ async fn report_aggregate(
                 }
             })
             .collect(),
-    ))
+    }))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
+    pub filesystem: FileSystemId,
     #[serde(default = "default_top_n")]
     pub n: u64,
 }
@@ -571,13 +634,16 @@ fn default_top_n() -> u64 {
 #[tracing::instrument(skip(state))]
 async fn top_size(
     State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<ListQuery>,
-) -> Result<Json<Vec<EntryDto>>, ApiError> {
+) -> Result<Json<ScopedRows<EntryDto>>, ApiError> {
     let rows = state
         .entry_store
-        .query_page("1=1", &[], Some("size DESC"), q.n.clamp(1, 1_000), 0)
+        .query_scoped_page(&q.filesystem, "1=1", &[], Some("size DESC"), q.n.clamp(1, 1_000), 0)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(rows.into_iter().map(EntryDto::from).collect()))
+    Ok(Json(ScopedRows {
+        filesystem: q.filesystem,
+        rows: rows.into_iter().map(EntryDto::from).collect(),
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -588,25 +654,30 @@ pub struct SizeBucket {
 }
 
 #[tracing::instrument(skip(state))]
-async fn size_profile(State(state): State<AppState>) -> Result<Json<Vec<SizeBucket>>, ApiError> {
+async fn size_profile(
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<FilesystemQuery>,
+) -> Result<Json<ScopedRows<SizeBucket>>, ApiError> {
     let rows = state
         .entry_store
-        .size_profile()
+        .scoped_size_profile(&q.filesystem)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(
-        rows.into_iter()
+    Ok(Json(ScopedRows {
+        filesystem: q.filesystem,
+        rows: rows
+            .into_iter()
             .map(|(bucket, count, total_size)| SizeBucket {
                 bucket,
                 count,
                 total_size,
             })
             .collect(),
-    ))
+    }))
 }
 
 #[derive(Debug, Deserialize)]
 struct DuQuery {
+    filesystem: FileSystemId,
     /// FID (literal, with or without surrounding brackets) to aggregate
     /// under. Mutually exclusive with `path`.
     #[serde(default)]
@@ -619,7 +690,8 @@ struct DuQuery {
 
 #[derive(Debug, Serialize)]
 struct DuResponse {
-    fid: String,
+    filesystem: FileSystemId,
+    object_id: ObjectId,
     file_count: u64,
     total_bytes: u64,
 }
@@ -632,17 +704,26 @@ async fn du_report(
     State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<DuQuery>,
 ) -> Result<Json<DuResponse>, ApiError> {
     let root = match (q.fid.as_deref(), q.path.as_deref()) {
-        (Some(f), None) => f
-            .trim_matches(|c| c == '[' || c == ']')
-            .parse::<lustre_api::LuFid>()
-            .map_err(|e| ApiError::Internal(format!("bad fid: {e}")))?,
+        (Some(value), None) => scoped_key_from_text(&state, q.filesystem.clone(), value).await?,
         (None, Some(p)) => {
+            let config = state
+                .entry_store
+                .get_filesystem(&q.filesystem)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+                .ok_or_else(|| ApiError::BadRequest(format!("unknown filesystem: {}", q.filesystem)))?;
+            if config.backend != rbh_entry_store::BackendKind::Lustre {
+                return Err(ApiError::BadRequest(
+                    "path lookup is only available for Lustre until Namespace adapters land".into(),
+                ));
+            }
             let lustre = lustre_api::LustreApi;
             let path = std::path::PathBuf::from(p);
-            tokio::task::spawn_blocking(move || lustre.path_to_fid(&path))
+            let fid = tokio::task::spawn_blocking(move || lustre.path_to_fid(&path))
                 .await
                 .map_err(|e| ApiError::Internal(format!("join: {e}")))?
-                .map_err(|e| ApiError::Internal(format!("path_to_fid: {e}")))?
+                .map_err(|e| ApiError::Internal(format!("path_to_fid: {e}")))?;
+            rbh_entry_store::EntryKey::new(q.filesystem.clone(), ObjectId::Lustre(fid))
         }
         _ => {
             return Err(ApiError::Internal("exactly one of fid / path must be provided".into()));
@@ -650,11 +731,12 @@ async fn du_report(
     };
     let (file_count, total_bytes) = state
         .entry_store
-        .subtree_totals(&root)
+        .scoped_subtree_totals(&root)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(DuResponse {
-        fid: root.to_string(),
+        filesystem: q.filesystem,
+        object_id: *root.object(),
         file_count,
         total_bytes,
     }))
@@ -662,32 +744,39 @@ async fn du_report(
 
 #[tracing::instrument(skip(state))]
 async fn stripe_distribution_report(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<rbh_entry_store::store::StripeDistRow>>, ApiError> {
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<FilesystemQuery>,
+) -> Result<Json<ScopedRows<rbh_entry_store::store::StripeDistRow>>, ApiError> {
     let rows = state
         .entry_store
-        .stripe_distribution()
+        .scoped_stripe_distribution(&q.filesystem)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(rows))
+    Ok(Json(ScopedRows {
+        filesystem: q.filesystem,
+        rows,
+    }))
 }
 
 #[tracing::instrument(skip(state))]
 async fn oldest_entries(
     State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<ListQuery>,
-) -> Result<Json<Vec<EntryDto>>, ApiError> {
+) -> Result<Json<ScopedRows<EntryDto>>, ApiError> {
     let rows = state
         .entry_store
-        .query_page("1=1", &[], Some("atime ASC"), q.n.clamp(1, 1_000), 0)
+        .query_scoped_page(&q.filesystem, "1=1", &[], Some("atime ASC"), q.n.clamp(1, 1_000), 0)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(rows.into_iter().map(EntryDto::from).collect()))
+    Ok(Json(ScopedRows {
+        filesystem: q.filesystem,
+        rows: rows.into_iter().map(EntryDto::from).collect(),
+    }))
 }
 
 // ---- /api/scans ----
 
 #[derive(Debug, Deserialize)]
 pub struct StartScanRequest {
+    pub filesystem: FileSystemId,
     /// Root directory to scan. Defaults to the daemon's configured mount.
     pub root: Option<String>,
     /// Incremental scan: only emit entries with mtime >= this unix time.
@@ -715,7 +804,21 @@ fn now_epoch() -> i64 {
 async fn start_scan(
     State(state): State<AppState>, Json(req): Json<StartScanRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let root = req.root.unwrap_or_else(|| "/lustre".to_string());
+    let config = state
+        .entry_store
+        .get_filesystem(&req.filesystem)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown filesystem: {}", req.filesystem)))?;
+    if config.backend != rbh_entry_store::BackendKind::Lustre {
+        return Err(ApiError::BadRequest(
+            "JuiceFS scans are coordinated by its baseline runtime".into(),
+        ));
+    }
+    let root = req
+        .root
+        .clone()
+        .unwrap_or_else(|| config.mount_path.to_string_lossy().into_owned());
     let id = uuid::Uuid::new_v4().to_string();
 
     // Record the full glob list visible to the walker so operators can
@@ -725,6 +828,7 @@ async fn start_scan(
 
     let rec = ScanRecord {
         id: id.clone(),
+        filesystem: req.filesystem.clone(),
         root: root.clone(),
         since_mtime: req.since_mtime,
         ignore_globs: merged_globs,
@@ -742,6 +846,7 @@ async fn start_scan(
     let scans = state.scans.clone();
     let entry_store = state.entry_store.clone();
     let scan_id = id.clone();
+    let filesystem = req.filesystem.clone();
     tokio::spawn(async move {
         let cfg = rbh_fs_scan::ScanConfig {
             root: std::path::PathBuf::from(&root),
@@ -760,7 +865,7 @@ async fn start_scan(
                 rbh_fs_scan::ScanEvent::Entry(entry) => {
                     batch.push(*entry);
                     if batch.len() >= 100 {
-                        if let Err(e) = entry_store.upsert_batch(&batch).await {
+                        if let Err(e) = entry_store.upsert_lustre_scan_batch(&filesystem, &batch).await {
                             tracing::warn!(scan_id, error = %e, "batch upsert failed");
                             errors += 1;
                         }
@@ -773,7 +878,7 @@ async fn start_scan(
             }
         }
         if !batch.is_empty()
-            && let Err(e) = entry_store.upsert_batch(&batch).await
+            && let Err(e) = entry_store.upsert_lustre_scan_batch(&filesystem, &batch).await
         {
             tracing::warn!(scan_id, error = %e, "final batch upsert failed");
             errors += 1;
@@ -799,9 +904,15 @@ async fn start_scan(
 }
 
 #[tracing::instrument(skip(state))]
-async fn list_scans(State(state): State<AppState>) -> Json<Vec<ScanRecord>> {
+async fn list_scans(
+    State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<FilesystemQuery>,
+) -> Json<Vec<ScanRecord>> {
     let map = state.scans.lock().await;
-    let mut v: Vec<ScanRecord> = map.values().cloned().collect();
+    let mut v: Vec<ScanRecord> = map
+        .values()
+        .filter(|record| record.filesystem == q.filesystem)
+        .cloned()
+        .collect();
     v.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     Json(v)
 }
@@ -843,9 +954,9 @@ async fn admin_dump(State(state): State<AppState>) -> axum::response::Response {
                 return Ok::<_, std::io::Error>(None);
             };
             let rows = store
-                .dump_page(after, PAGE)
+                .legacy_lustre_dump_page(after, PAGE)
                 .await
-                .map_err(|e| std::io::Error::other(format!("dump_page: {e}")))?;
+                .map_err(|e| std::io::Error::other(format!("legacy_lustre_dump_page: {e}")))?;
             if rows.is_empty() {
                 return Ok(None);
             }
@@ -916,7 +1027,7 @@ async fn admin_restore(
             }
         }
         if batch.len() >= batch_size {
-            match state.entry_store.upsert_batch(&batch).await {
+            match state.entry_store.legacy_lustre_upsert_batch(&batch).await {
                 Ok(()) => restored += batch.len() as u64,
                 Err(e) => {
                     failed += batch.len() as u64;
@@ -927,7 +1038,7 @@ async fn admin_restore(
         }
     }
     if !batch.is_empty() {
-        match state.entry_store.upsert_batch(&batch).await {
+        match state.entry_store.legacy_lustre_upsert_batch(&batch).await {
             Ok(()) => restored += batch.len() as u64,
             Err(e) => {
                 failed += batch.len() as u64;
@@ -970,7 +1081,7 @@ async fn admin_sweep_orphans(
 ) -> Result<Json<SweepOrphansResponse>, ApiError> {
     let swept = state
         .entry_store
-        .sweep_orphans(q.before, q.limit.clamp(1, 100_000), q.dry_run)
+        .legacy_lustre_sweep_orphans(q.before, q.limit.clamp(1, 100_000), q.dry_run)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(SweepOrphansResponse {
@@ -986,6 +1097,7 @@ async fn admin_sweep_orphans(
 #[derive(Debug)]
 enum ApiError {
     Policy(PolicyError),
+    BadRequest(String),
     Internal(String),
 }
 
@@ -1005,6 +1117,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::NOT_FOUND, format!("policy not found: name={name}"))
             }
             ApiError::Policy(PolicyError::InvalidTrigger(msg)) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Policy(e) => {
                 tracing::error!(error = %e, "policy error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
@@ -1015,5 +1128,167 @@ impl IntoResponse for ApiError {
             }
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod scoped_api_tests {
+    use super::*;
+    use axum_test::TestServer;
+    use bytes::Bytes;
+    use rbh_entry_store::{EntryKey, ScopedEntryRow};
+    use sqlx::mysql::MySqlPoolOptions;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    fn state_without_database_connection() -> AppState {
+        let pool = MySqlPoolOptions::new()
+            .connect_lazy("mysql://root@127.0.0.1/rbh_entries_test")
+            .unwrap();
+        AppState {
+            policy_store: rbh_policy::PolicyStore::new(pool.clone()),
+            classifier_store: rbh_policy::ClassifierStore::new(pool.clone()),
+            classifier_cache: Arc::new(RwLock::new(Vec::new())),
+            entry_store: rbh_entry_store::EntryStore::with_pool(pool),
+            scheduler: None,
+            scans: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn integration_enabled() -> bool {
+        matches!(std::env::var("RBH_INTEGRATION"), Ok(value) if !value.is_empty() && value != "0")
+    }
+
+    #[tokio::test]
+    async fn catalog_endpoints_reject_an_implicit_global_scope() {
+        let server = TestServer::new(crate::router(state_without_database_connection())).unwrap();
+        server.get("/api/entries/count").await.assert_status_bad_request();
+        server.get("/api/reports/top-size").await.assert_status_bad_request();
+        server.get("/api/removed").await.assert_status_bad_request();
+        server
+            .post("/api/entries/query")
+            .json(&serde_json::json!({"predicate": null}))
+            .await
+            .assert_status_unprocessable_entity();
+    }
+
+    #[test]
+    fn public_entry_identity_contains_filesystem_and_backend_native_object() {
+        let filesystem = FileSystemId::new("juice-a").unwrap();
+        let row = ScopedEntryRow {
+            key: EntryKey::new(filesystem.clone(), ObjectId::JuiceFs(42)),
+            parent: Some(EntryKey::new(filesystem, ObjectId::JuiceFs(1))),
+            name: Bytes::from_static(b"report.txt"),
+            kind: EntryKind::File,
+            size: 7,
+            blocks: 8,
+            uid: 1,
+            gid: 2,
+            projid: 3,
+            mode: 0o644,
+            nlink: 1,
+            atime: 4,
+            mtime: 5,
+            ctime: 6,
+            stripe_count: None,
+            stripe_size: None,
+            stripe_items: Vec::new(),
+            pool_name: None,
+            sm_status: serde_json::json!({}),
+            last_seen: 7,
+            depth: 1,
+        };
+        let value = serde_json::to_value(EntryDto::from(row)).unwrap();
+        assert_eq!(value["filesystem"], "juice-a");
+        assert_eq!(value["object_id"], serde_json::json!({"juice_fs": 42}));
+        assert_eq!(value["parent_object_id"], serde_json::json!({"juice_fs": 1}));
+        assert!(value.get("fid").is_none());
+    }
+
+    #[tokio::test]
+    async fn query_api_returns_same_inode_independently_per_filesystem() {
+        if !integration_enabled() {
+            return;
+        }
+        let store = rbh_entry_store::EntryStore::connect("mysql://root@localhost/rbh_entries_test")
+            .await
+            .unwrap();
+        let first = FileSystemId::new("api-scope-a").unwrap();
+        let second = FileSystemId::new("api-scope-b").unwrap();
+        for filesystem in [&first, &second] {
+            store
+                .register_filesystem(&rbh_entry_store::FileSystemConfig {
+                    id: filesystem.clone(),
+                    backend: rbh_entry_store::BackendKind::JuiceFs,
+                    mount_path: format!("/mnt/{filesystem}").into(),
+                    capabilities: rbh_entry_store::BackendCapabilities {
+                        namespace: true,
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        for (filesystem, name, size) in [(&first, b"api-a".as_slice(), 11), (&second, b"api-b".as_slice(), 22)] {
+            store
+                .upsert_scoped_entry(&ScopedEntryRow {
+                    key: EntryKey::new(filesystem.clone(), ObjectId::JuiceFs(42)),
+                    parent: None,
+                    name: Bytes::copy_from_slice(name),
+                    kind: EntryKind::File,
+                    size,
+                    blocks: 1,
+                    uid: 1,
+                    gid: 2,
+                    projid: 3,
+                    mode: 0o644,
+                    nlink: 1,
+                    atime: 4,
+                    mtime: 5,
+                    ctime: 6,
+                    stripe_count: None,
+                    stripe_size: None,
+                    stripe_items: Vec::new(),
+                    pool_name: None,
+                    sm_status: serde_json::json!({}),
+                    last_seen: 7,
+                    depth: 1,
+                })
+                .await
+                .unwrap();
+        }
+        let pool = store.pool().clone();
+        let state = AppState {
+            policy_store: rbh_policy::PolicyStore::new(pool.clone()),
+            classifier_store: rbh_policy::ClassifierStore::new(pool),
+            classifier_cache: Arc::new(RwLock::new(Vec::new())),
+            entry_store: store,
+            scheduler: None,
+            scans: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let server = TestServer::new(crate::router(state)).unwrap();
+        for (filesystem, expected_name, expected_size) in [(&first, "api-a", 11_u64), (&second, "api-b", 22_u64)] {
+            let response = server
+                .post("/api/entries/query")
+                .json(&serde_json::json!({"filesystem": filesystem, "limit": 10}))
+                .await;
+            response.assert_status_ok();
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["filesystem"], filesystem.as_str());
+            assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+            assert_eq!(body["entries"][0]["name"], expected_name);
+            assert_eq!(body["entries"][0]["size"], expected_size);
+            assert_eq!(body["entries"][0]["object_id"], serde_json::json!({"juice_fs": 42}));
+
+            let report = server
+                .get(&format!("/api/reports/top-size?filesystem={filesystem}&n=10"))
+                .await;
+            report.assert_status_ok();
+            let report_body: serde_json::Value = report.json();
+            assert_eq!(report_body["filesystem"], filesystem.as_str());
+            assert_eq!(report_body["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(report_body["rows"][0]["name"], expected_name);
+        }
     }
 }

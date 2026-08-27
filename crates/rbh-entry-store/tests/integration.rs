@@ -30,6 +30,8 @@ async fn reset_db(pool: &sqlx::Pool<MySql>) {
     // Drop tables in reverse dependency order (policies has no FK deps).
     for table in &[
         "filesystem_baselines",
+        "scoped_removed_entries",
+        "scoped_stripe_items",
         "scoped_namespace_edges",
         "scoped_entries",
         "filesystems",
@@ -46,6 +48,29 @@ async fn reset_db(pool: &sqlx::Pool<MySql>) {
             .execute(pool)
             .await;
     }
+}
+
+#[tokio::test]
+async fn scope_catalog_migration_is_retry_safe() {
+    if !integration_enabled() {
+        return;
+    }
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let migration = include_str!("../migrations/008_scope_catalog_consumers.sql");
+    sqlx::raw_sql(migration)
+        .execute(store.pool())
+        .await
+        .expect("first retry");
+    sqlx::raw_sql(migration)
+        .execute(store.pool())
+        .await
+        .expect("second retry");
 }
 
 #[tokio::test]
@@ -154,6 +179,7 @@ async fn scoped_identities_isolate_the_same_native_object_id() {
         ctime: 1_775_955_820,
         stripe_count: None,
         stripe_size: None,
+        stripe_items: Vec::new(),
         pool_name: None,
         sm_status: serde_json::json!({}),
         last_seen: 1_775_955_820,
@@ -182,8 +208,173 @@ async fn scoped_identities_isolate_the_same_native_object_id() {
 
     // The expand migration must leave the legacy Lustre catalog path usable.
     let legacy = make_entry(0x200000401, 0x42, "legacy-lustre.txt");
-    store.upsert_entry(&legacy).await.expect("upsert legacy entry");
-    assert_eq!(store.get_entry(&legacy.fid).await.unwrap().unwrap().name, legacy.name);
+    store
+        .legacy_lustre_upsert_entry(&legacy)
+        .await
+        .expect("upsert legacy entry");
+    assert_eq!(
+        store.legacy_lustre_get_entry(&legacy.fid).await.unwrap().unwrap().name,
+        legacy.name
+    );
+}
+
+#[tokio::test]
+async fn scoped_queries_and_removed_entries_isolate_the_same_native_object_id() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let first_id = FileSystemId::new("query-a").unwrap();
+    let second_id = FileSystemId::new("query-b").unwrap();
+    for id in [&first_id, &second_id] {
+        store
+            .register_filesystem(&FileSystemConfig {
+                id: id.clone(),
+                backend: BackendKind::JuiceFs,
+                mount_path: format!("/mnt/{id}").into(),
+                capabilities: BackendCapabilities {
+                    changelog: true,
+                    namespace: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let make_scoped = |filesystem: FileSystemId, name: &'static [u8], size| ScopedEntryRow {
+        key: EntryKey::new(filesystem.clone(), ObjectId::JuiceFs(42)),
+        parent: Some(EntryKey::new(filesystem, ObjectId::JuiceFs(1))),
+        name: Bytes::from_static(name),
+        kind: EntryKind::File,
+        size,
+        blocks: 8,
+        uid: 1000,
+        gid: 100,
+        projid: 0,
+        mode: 0o644,
+        nlink: 1,
+        atime: 10,
+        mtime: 20,
+        ctime: 30,
+        stripe_count: None,
+        stripe_size: None,
+        stripe_items: Vec::new(),
+        pool_name: None,
+        sm_status: serde_json::json!({}),
+        last_seen: 40,
+        depth: 1,
+    };
+    let first = make_scoped(first_id.clone(), b"first", 111);
+    let second = make_scoped(second_id.clone(), b"second", 222);
+    store.upsert_scoped_entry(&first).await.unwrap();
+    store.upsert_scoped_entry(&second).await.unwrap();
+    store
+        .upsert_scoped_namespace_edge(&ScopedNamespaceEdge {
+            filesystem: first_id.clone(),
+            parent: ObjectId::JuiceFs(1),
+            name: Bytes::from_static(b"first"),
+            object: ObjectId::JuiceFs(42),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(store.scoped_entry_count(&first_id).await.unwrap(), 1);
+    assert_eq!(
+        store
+            .query_scoped_page(&first_id, "1=1", &[], Some("size DESC"), 10, 0)
+            .await
+            .unwrap(),
+        vec![first.clone()]
+    );
+    assert_eq!(
+        store
+            .query_scoped_page(&second_id, "1=1", &[], Some("size DESC"), 10, 0)
+            .await
+            .unwrap(),
+        vec![second.clone()]
+    );
+    assert_eq!(
+        store
+            .count_scoped_where(&first_id, "size = ?", &[rbh_entry_store::store::QueryParam::Int(111)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_scoped_where(&second_id, "size = ?", &[rbh_entry_store::store::QueryParam::Int(111)])
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.sum_scoped_size_where(&first_id, "1=1", &[]).await.unwrap(), 111);
+    assert_eq!(store.sum_scoped_size_where(&second_id, "1=1", &[]).await.unwrap(), 222);
+    assert_eq!(
+        store
+            .aggregate_scoped_by(
+                &first_id,
+                rbh_entry_store::store::AggregateKey::Uid,
+                rbh_entry_store::store::AggregateSort::Size,
+                10,
+            )
+            .await
+            .unwrap(),
+        vec![("1000".to_string(), 1, 111)]
+    );
+    let parent_rows = store
+        .aggregate_scoped_by(
+            &first_id,
+            rbh_entry_store::store::AggregateKey::ParentFid,
+            rbh_entry_store::store::AggregateSort::Size,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(parent_rows.len(), 1);
+    assert_eq!((parent_rows[0].1, parent_rows[0].2), (1, 111));
+    assert_eq!(
+        store.scoped_size_profile(&second_id).await.unwrap(),
+        vec![("<1K".to_string(), 1, 222)]
+    );
+    assert!(store.list_scoped_namespace_edges(&second_id).await.unwrap().is_empty());
+    store
+        .patch_scoped_sm_status(&first.key, &serde_json::json!({"tier": "cold"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_scoped_entry(&first.key).await.unwrap().unwrap().sm_status,
+        serde_json::json!({"tier": "cold"})
+    );
+    assert_eq!(
+        store.get_scoped_entry(&second.key).await.unwrap().unwrap().sm_status,
+        serde_json::json!({})
+    );
+
+    store
+        .apply_scoped_unlink(&first.key, ObjectId::JuiceFs(1), b"first", 50, false)
+        .await
+        .unwrap();
+    let removed = store.list_scoped_removed(&first_id, None, 10, 0).await.unwrap();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].entry.key, first.key);
+    assert_eq!(removed[0].rm_time, 50);
+    assert!(
+        store
+            .list_scoped_removed(&second_id, None, 10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.forget_scoped_removed(&first.key).await.unwrap());
+    assert!(!store.forget_scoped_removed(&first.key).await.unwrap());
 }
 
 #[tokio::test]
@@ -217,10 +408,135 @@ async fn lustre_scan_batch_populates_filesystem_scoped_baseline() {
     store.upsert_lustre_scan_batch(&filesystem, &rows).await.unwrap();
 
     for row in rows {
-        assert_eq!(store.get_entry(&row.fid).await.unwrap().unwrap().name, row.name);
+        assert_eq!(
+            store.legacy_lustre_get_entry(&row.fid).await.unwrap().unwrap().name,
+            row.name
+        );
         let entry = ScopedEntryRow::from_lustre(filesystem.clone(), &row);
         assert_eq!(store.get_scoped_entry(&entry.key).await.unwrap(), Some(entry));
     }
+}
+
+#[tokio::test]
+async fn lustre_compatibility_writes_keep_identical_fids_scoped() {
+    if !integration_enabled() {
+        return;
+    }
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.unwrap();
+    let first_id = FileSystemId::new("lustre-a").unwrap();
+    let second_id = FileSystemId::new("lustre-b").unwrap();
+    for id in [&first_id, &second_id] {
+        store
+            .register_filesystem(&FileSystemConfig {
+                id: id.clone(),
+                backend: BackendKind::Lustre,
+                mount_path: format!("/mnt/{id}").into(),
+                capabilities: BackendCapabilities {
+                    changelog: true,
+                    namespace: true,
+                    stripe: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let mut first = make_entry(0x200000401, 42, "first-lustre");
+    first.size = 100;
+    first.stripe_count = Some(2);
+    first.stripe_items = vec![1, 2];
+    let mut second = make_entry(0x200000401, 42, "second-lustre");
+    second.size = 200;
+    second.stripe_count = Some(1);
+    second.stripe_items = vec![3];
+    store.upsert_lustre_entry(&first_id, &first).await.unwrap();
+    store.upsert_lustre_entry(&second_id, &second).await.unwrap();
+
+    assert_eq!(
+        store
+            .get_lustre_entry(&first_id, &first.fid)
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        first.name
+    );
+    assert_eq!(
+        store
+            .get_lustre_entry(&second_id, &second.fid)
+            .await
+            .unwrap()
+            .unwrap()
+            .name,
+        second.name
+    );
+    assert_eq!(store.sum_scoped_size_where(&first_id, "1=1", &[]).await.unwrap(), 100);
+    assert_eq!(store.sum_scoped_size_where(&second_id, "1=1", &[]).await.unwrap(), 200);
+    let mut first_osts = store
+        .scoped_stripe_distribution(&first_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.ost_index)
+        .collect::<Vec<_>>();
+    first_osts.sort_unstable();
+    assert_eq!(first_osts, vec![1, 2]);
+    assert_eq!(
+        store
+            .scoped_stripe_distribution(&second_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.ost_index)
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+    let scoped_ost_predicate = "EXISTS (SELECT 1 FROM scoped_stripe_items s WHERE \
+        s.filesystem_id = entries.filesystem_id AND s.object_kind = entries.object_kind \
+        AND s.object_id = entries.object_id AND s.ost_index IN (?))";
+    assert_eq!(
+        store
+            .count_scoped_where(
+                &first_id,
+                scoped_ost_predicate,
+                &[rbh_entry_store::store::QueryParam::Int(1)],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_scoped_where(
+                &second_id,
+                scoped_ost_predicate,
+                &[rbh_entry_store::store::QueryParam::Int(1)],
+            )
+            .await
+            .unwrap(),
+        0
+    );
+
+    store.remove_lustre_entry(&first_id, &first.fid, 99).await.unwrap();
+    assert!(store.get_lustre_entry(&first_id, &first.fid).await.unwrap().is_none());
+    assert!(store.get_lustre_entry(&second_id, &second.fid).await.unwrap().is_some());
+    assert_eq!(
+        store.list_scoped_removed(&first_id, None, 10, 0).await.unwrap().len(),
+        1
+    );
+    assert!(
+        store
+            .list_scoped_removed(&second_id, None, 10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn make_entry(seq: u64, oid: u32, name: &str) -> EntryRow {
@@ -241,6 +557,7 @@ fn make_entry(seq: u64, oid: u32, name: &str) -> EntryRow {
         ctime: 1_775_955_820,
         stripe_count: Some(2),
         stripe_size: Some(4_194_304),
+        stripe_items: vec![0, 1],
         pool_name: None,
         sm_status: serde_json::json!({}),
         last_seen: 1_775_955_820,
@@ -264,9 +581,13 @@ async fn upsert_and_get_roundtrip() {
     let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
 
     let entry = make_entry(0x200000401, 0x42, "test_file.txt");
-    store.upsert_entry(&entry).await.expect("upsert");
+    store.legacy_lustre_upsert_entry(&entry).await.expect("upsert");
 
-    let back = store.get_entry(&entry.fid).await.expect("get").expect("not found");
+    let back = store
+        .legacy_lustre_get_entry(&entry.fid)
+        .await
+        .expect("get")
+        .expect("not found");
     assert_eq!(back.fid, entry.fid);
     assert_eq!(back.name.as_ref(), b"test_file.txt");
     assert_eq!(back.size, 1024);
@@ -295,8 +616,11 @@ async fn upsert_batch_and_count() {
         .map(|i| make_entry(0x200000401, i + 100, &format!("batch_{i}.dat")))
         .collect();
 
-    store.upsert_batch(&entries).await.expect("upsert_batch");
-    let count = store.entry_count().await.expect("count");
+    store
+        .legacy_lustre_upsert_batch(&entries)
+        .await
+        .expect("legacy_lustre_upsert_batch");
+    let count = store.legacy_lustre_entry_count().await.expect("count");
     assert_eq!(count, 100, "expected 100 entries after batch upsert");
     println!("batch upsert: 100 entries inserted");
 }
@@ -317,14 +641,17 @@ async fn remove_entry_moves_to_removed_entries() {
     let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
 
     let entry = make_entry(0x200000401, 0x99, "doomed.txt");
-    store.upsert_entry(&entry).await.expect("upsert");
+    store.legacy_lustre_upsert_entry(&entry).await.expect("upsert");
 
     let rm_time = 1_775_960_000i64;
-    store.remove_entry(&entry.fid, rm_time).await.expect("remove");
+    store
+        .legacy_lustre_remove_entry(&entry.fid, rm_time)
+        .await
+        .expect("remove");
 
     // Should be gone from entries.
     assert!(
-        store.get_entry(&entry.fid).await.expect("get").is_none(),
+        store.legacy_lustre_get_entry(&entry.fid).await.expect("get").is_none(),
         "entry should be gone"
     );
 
@@ -336,7 +663,7 @@ async fn remove_entry_moves_to_removed_entries() {
         .expect("query removed_entries");
     let stored_rm: i64 = sqlx::Row::try_get(&row, "rm_time").unwrap();
     assert_eq!(stored_rm, rm_time);
-    println!("remove_entry: moved to removed_entries with rm_time={rm_time}");
+    println!("legacy_lustre_remove_entry: moved to removed_entries with rm_time={rm_time}");
 }
 
 #[tokio::test]
@@ -358,18 +685,24 @@ async fn rename_entry_atomically_replaces_destination() {
     source.parent_fid = Some(parent);
     let mut destination = make_entry(0x200000401, 3, "destination");
     destination.parent_fid = Some(parent);
-    store.upsert_entry(&source).await.unwrap();
-    store.upsert_entry(&destination).await.unwrap();
+    store.legacy_lustre_upsert_entry(&source).await.unwrap();
+    store.legacy_lustre_upsert_entry(&destination).await.unwrap();
 
     source.name = destination.name.clone();
-    store.rename_entry(&source, 1_775_960_000).await.unwrap();
+    store.legacy_lustre_rename_entry(&source, 1_775_960_000).await.unwrap();
 
     assert_eq!(
-        store.get_entry(&source.fid).await.unwrap().unwrap().name,
+        store.legacy_lustre_get_entry(&source.fid).await.unwrap().unwrap().name,
         destination.name
     );
-    assert!(store.get_entry(&destination.fid).await.unwrap().is_none());
-    assert!(store.get_removed(&destination.fid).await.unwrap().is_some());
+    assert!(store.legacy_lustre_get_entry(&destination.fid).await.unwrap().is_none());
+    assert!(
+        store
+            .legacy_lustre_get_removed(&destination.fid)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -428,17 +761,17 @@ async fn upsert_is_idempotent() {
     let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
 
     let mut entry = make_entry(0x200000401, 0x55, "idempotent.txt");
-    store.upsert_entry(&entry).await.expect("first upsert");
+    store.legacy_lustre_upsert_entry(&entry).await.expect("first upsert");
 
     // Update size and upsert again — should overwrite, not duplicate.
     entry.size = 2048;
     entry.last_seen = 1_775_960_000;
-    store.upsert_entry(&entry).await.expect("second upsert");
+    store.legacy_lustre_upsert_entry(&entry).await.expect("second upsert");
 
-    let count = store.entry_count().await.expect("count");
+    let count = store.legacy_lustre_entry_count().await.expect("count");
     assert_eq!(count, 1, "should be exactly 1 entry after idempotent upsert");
 
-    let back = store.get_entry(&entry.fid).await.expect("get").unwrap();
+    let back = store.legacy_lustre_get_entry(&entry.fid).await.expect("get").unwrap();
     assert_eq!(back.size, 2048, "size should be updated");
     assert_eq!(back.last_seen, 1_775_960_000, "last_seen should be updated");
     println!("idempotent upsert passed");
@@ -475,22 +808,42 @@ async fn sweep_orphans_moves_stale_files() {
     dir.kind = EntryKind::Directory;
     dir.last_seen = stale_ts;
 
-    store.upsert_batch(&[a, b, c, d, dir]).await.expect("upsert");
-    assert_eq!(store.entry_count().await.unwrap(), 5);
+    store
+        .legacy_lustre_upsert_batch(&[a, b, c, d, dir])
+        .await
+        .expect("upsert");
+    assert_eq!(store.legacy_lustre_entry_count().await.unwrap(), 5);
 
     // Dry-run first: should report 2 candidates (two stale files; dir spared).
-    let dry = store.sweep_orphans(fresh_ts - 1_000, 100, true).await.expect("dry run");
+    let dry = store
+        .legacy_lustre_sweep_orphans(fresh_ts - 1_000, 100, true)
+        .await
+        .expect("dry run");
     assert_eq!(dry, 2, "dry run should count exactly 2 stale files");
-    assert_eq!(store.entry_count().await.unwrap(), 5, "dry run must not delete");
+    assert_eq!(
+        store.legacy_lustre_entry_count().await.unwrap(),
+        5,
+        "dry run must not delete"
+    );
 
     // Real sweep: both stale files move into removed_entries.
-    let swept = store.sweep_orphans(fresh_ts - 1_000, 100, false).await.expect("sweep");
+    let swept = store
+        .legacy_lustre_sweep_orphans(fresh_ts - 1_000, 100, false)
+        .await
+        .expect("sweep");
     assert_eq!(swept, 2);
-    assert_eq!(store.entry_count().await.unwrap(), 3, "dir + 2 fresh remain");
+    assert_eq!(
+        store.legacy_lustre_entry_count().await.unwrap(),
+        3,
+        "dir + 2 fresh remain"
+    );
 
-    let rm = store.list_removed(None, 100, 0).await.expect("list_removed");
+    let rm = store
+        .legacy_lustre_list_removed(None, 100, 0)
+        .await
+        .expect("legacy_lustre_list_removed");
     assert!(rm.len() >= 2, "removed_entries has the 2 stale files");
-    println!("sweep_orphans passed");
+    println!("legacy_lustre_sweep_orphans passed");
 }
 
 #[tokio::test]
@@ -534,25 +887,34 @@ async fn subtree_totals_walks_parent_edge() {
     let b = mk(b_fid, Some(sub_fid), "b.txt", 2000, EntryKind::File);
     let c = mk(c_fid, Some(sub_fid), "c.txt", 3000, EntryKind::File);
 
-    store.upsert_batch(&[root, sub, a, b, c]).await.expect("upsert");
+    store
+        .legacy_lustre_upsert_batch(&[root, sub, a, b, c])
+        .await
+        .expect("upsert");
 
     // Under root: 5 entries, 6000 bytes total.
-    let (n, bytes) = store.subtree_totals(&root_fid).await.expect("totals root");
+    let (n, bytes) = store
+        .legacy_lustre_subtree_totals(&root_fid)
+        .await
+        .expect("totals root");
     assert_eq!(n, 5);
     assert_eq!(bytes, 6000);
 
     // Under sub only: 3 entries (sub + b + c), 5000 bytes.
-    let (n, bytes) = store.subtree_totals(&sub_fid).await.expect("totals sub");
+    let (n, bytes) = store.legacy_lustre_subtree_totals(&sub_fid).await.expect("totals sub");
     assert_eq!(n, 3);
     assert_eq!(bytes, 5000);
 
     // A missing FID returns zero.
     let ghost = LuFid::new(0xdead, 0xbeef, 0);
-    let (n, bytes) = store.subtree_totals(&ghost).await.expect("totals missing");
+    let (n, bytes) = store
+        .legacy_lustre_subtree_totals(&ghost)
+        .await
+        .expect("totals missing");
     assert_eq!(n, 0);
     assert_eq!(bytes, 0);
 
-    println!("subtree_totals passed");
+    println!("legacy_lustre_subtree_totals passed");
 }
 
 #[tokio::test]
@@ -572,9 +934,13 @@ async fn depth_field_roundtrips() {
 
     let mut entry = make_entry(0x200000501, 0x01, "deep_file.txt");
     entry.depth = 7;
-    store.upsert_entry(&entry).await.expect("upsert");
+    store.legacy_lustre_upsert_entry(&entry).await.expect("upsert");
 
-    let back = store.get_entry(&entry.fid).await.expect("get").expect("not found");
+    let back = store
+        .legacy_lustre_get_entry(&entry.fid)
+        .await
+        .expect("get")
+        .expect("not found");
     assert_eq!(back.depth, 7, "depth should round-trip through DB");
     println!("depth field roundtrip passed (depth={})", back.depth);
 }

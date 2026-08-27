@@ -193,6 +193,7 @@ mod tests {
             ctime: 1_775_000_000,
             stripe_count: Some(2),
             stripe_size: Some(4_194_304),
+            stripe_items: vec![0, 1],
             pool_name: Some("ssd".to_string()),
             sm_status: serde_json::json!({}),
             last_seen: 1_775_955_820,

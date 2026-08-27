@@ -21,13 +21,20 @@ pub fn enrich_lustre(lustre: &LustreApi, entry: &PosixEntry) -> Result<EntryRow,
         .as_ref()
         .map(|parent| lustre.path_to_fid(parent))
         .transpose()?;
-    let (stripe_count, stripe_size, pool_name) = if entry.kind == EntryKind::File {
+    let (stripe_count, stripe_size, stripe_items, pool_name) = if entry.kind == EntryKind::File {
         lustre
             .get_stripe_info(&entry.path)
-            .map(|layout| (Some(layout.count as u16), Some(layout.size as u32), layout.pool))
-            .unwrap_or((None, None, None))
+            .map(|layout| {
+                (
+                    Some(layout.count as u16),
+                    Some(layout.size as u32),
+                    layout.ost_indices,
+                    layout.pool,
+                )
+            })
+            .unwrap_or((None, None, Vec::new(), None))
     } else {
-        (None, None, None)
+        (None, None, Vec::new(), None)
     };
     Ok(EntryRow {
         fid,
@@ -46,6 +53,7 @@ pub fn enrich_lustre(lustre: &LustreApi, entry: &PosixEntry) -> Result<EntryRow,
         ctime: entry.ctime,
         stripe_count,
         stripe_size,
+        stripe_items,
         pool_name,
         sm_status: serde_json::json!({}),
         last_seen: SystemTime::now()
@@ -84,13 +92,18 @@ pub fn build_entry(
     let fid = lustre.path_to_fid(path)?;
 
     // 3. Stripe info (files only)
-    let (stripe_count, stripe_size, pool_name) = if kind == EntryKind::File {
+    let (stripe_count, stripe_size, stripe_items, pool_name) = if kind == EntryKind::File {
         match lustre.get_stripe_info(path) {
-            Ok(info) => (Some(info.count as u16), Some(info.size as u32), info.pool),
-            Err(_) => (None, None, None),
+            Ok(info) => (
+                Some(info.count as u16),
+                Some(info.size as u32),
+                info.ost_indices,
+                info.pool,
+            ),
+            Err(_) => (None, None, Vec::new(), None),
         }
     } else {
-        (None, None, None)
+        (None, None, Vec::new(), None)
     };
 
     let now = SystemTime::now()
@@ -115,6 +128,7 @@ pub fn build_entry(
         ctime: meta.ctime(),
         stripe_count,
         stripe_size,
+        stripe_items,
         pool_name,
         sm_status: serde_json::json!({}),
         last_seen: now,

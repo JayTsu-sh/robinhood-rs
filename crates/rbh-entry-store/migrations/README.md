@@ -38,3 +38,4 @@ NNN_short_description.sql
 | `005_create_classifiers.sql` | classifier definitions stored as JSON |
 | `006_add_filesystem_scoped_identity.sql` | filesystem registry and backend-native scoped catalog entries |
 | `007_add_scoped_baselines.sql` | filesystem baseline state and parent/name namespace edges |
+| `008_scope_catalog_consumers.sql` | queryable filesystem-scoped metadata, removed entries, and stripe relationships |

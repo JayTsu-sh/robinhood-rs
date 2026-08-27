@@ -5,7 +5,7 @@
 //!
 //! For creation events (Create, Mkdir, Mknod, Softlink), we stat the file
 //! via `fid_to_path` + `symlink_metadata` to populate the full [`EntryRow`].
-//! For deletion events (Unlink with last_link, Rmdir), we call `remove_entry`.
+//! For deletion events (Unlink with last_link, Rmdir), we call `legacy_lustre_remove_entry`.
 //! For Rename, we update parent_fid + name and handle rename-overwrite.
 //! For metadata events (Close, SetAttr, Truncate, MTime, CTime), we re-stat
 //! the file to refresh changed fields.
@@ -205,16 +205,18 @@ pub async fn ingest_loop(
                 }
             };
             let event_time = change.time();
-            match apply_event(&entry_store, &mount_path, &event, event_time).await {
+            match apply_event(&entry_store, &filesystem_id, &mount_path, &event, event_time).await {
                 Ok(true) => {
                     applied += 1;
                     // Incremental classification: re-classify the affected entry.
                     let fid = event.fid();
                     let classifiers = classifier_cache.read().await;
                     if !classifiers.is_empty() {
-                        match entry_store.get_entry(&fid).await {
+                        match entry_store.get_lustre_entry(&filesystem_id, &fid).await {
                             Ok(Some(row)) => {
-                                if let Err(error) = apply_classifiers(&classifiers, &row, &entry_store).await {
+                                if let Err(error) =
+                                    apply_classifiers(&classifiers, &row, &entry_store, &filesystem_id).await
+                                {
                                     errors += 1;
                                     tracing::warn!(%fid, %error, "incremental classification failed");
                                     break;
@@ -362,6 +364,7 @@ async fn apply_juicefs_change(
                     ctime: live.as_ref().map_or(*time, |value| value.ctime()),
                     stripe_count: None,
                     stripe_size: None,
+                    stripe_items: Vec::new(),
                     pool_name: None,
                     sm_status: serde_json::Value::Null,
                     last_seen: *time,
@@ -505,7 +508,7 @@ async fn juicefs_object_path(store: &EntryStore, mount: &Path, key: &EntryKey) -
 /// Run all enabled classifiers against a single entry in-memory and write back any tags.
 async fn apply_classifiers(
     classifiers: &[rbh_policy::ClassifierRow], entry: &rbh_entry_store::model::EntryRow,
-    store: &rbh_entry_store::store::EntryStore,
+    store: &rbh_entry_store::store::EntryStore, filesystem: &FileSystemId,
 ) -> anyhow::Result<()> {
     for classifier in classifiers {
         if !classifier.enabled {
@@ -513,7 +516,14 @@ async fn apply_classifiers(
         }
         if let Some(tags) = rbh_policy::evaluate_classifier(&classifier.definition, entry) {
             store
-                .update_xattr(&entry.fid, tags, &classifier.definition.manages)
+                .legacy_lustre_update_xattr(&entry.fid, tags, &classifier.definition.manages)
+                .await?;
+            store
+                .update_scoped_xattr(
+                    &EntryKey::new(filesystem.clone(), ObjectId::Lustre(entry.fid)),
+                    tags,
+                    &classifier.definition.manages,
+                )
                 .await?;
         }
     }
@@ -654,7 +664,7 @@ fn lustre_event(change: &Change) -> anyhow::Result<ChangelogEvent> {
 /// Apply a single changelog event to the entry store.
 /// Returns `Ok(true)` if the store was modified, `Ok(false)` if skipped.
 async fn apply_event(
-    store: &EntryStore, mount: &Path, event: &ChangelogEvent, event_time: i64,
+    store: &EntryStore, filesystem: &FileSystemId, mount: &Path, event: &ChangelogEvent, event_time: i64,
 ) -> anyhow::Result<bool> {
     match event {
         // ── Creation events: stat the new file and upsert ──
@@ -668,7 +678,7 @@ async fn apply_event(
             };
             match stat_entry_by_fid(mount, fid, Some(*parent), name.clone(), kind).await {
                 Ok(entry) => {
-                    store.upsert_entry(&entry).await?;
+                    store.upsert_lustre_entry(filesystem, &entry).await?;
                     Ok(true)
                 }
                 Err(e) => {
@@ -682,7 +692,7 @@ async fn apply_event(
         ChangelogEvent::Softlink { fid, parent, name, .. } => {
             match stat_entry_by_fid(mount, fid, Some(*parent), name.clone(), EntryKind::Symlink).await {
                 Ok(entry) => {
-                    store.upsert_entry(&entry).await?;
+                    store.upsert_lustre_entry(filesystem, &entry).await?;
                     Ok(true)
                 }
                 Err(_) => Ok(false),
@@ -692,18 +702,18 @@ async fn apply_event(
         ChangelogEvent::Hardlink { fid, parent, name } => {
             // Update the entry's parent/name to the new link location.
             // A full hardlink implementation would insert into the names table.
-            if let Some(mut entry) = store.get_entry(fid).await? {
+            if let Some(mut entry) = store.get_lustre_entry(filesystem, fid).await? {
                 entry.parent_fid = Some(*parent);
                 entry.name = name.clone();
                 entry.nlink = entry.nlink.saturating_add(1);
                 entry.last_seen = now_secs();
-                store.upsert_entry(&entry).await?;
+                store.upsert_lustre_entry(filesystem, &entry).await?;
                 Ok(true)
             } else {
                 // Entry not in catalog — try stat
                 match stat_entry_by_fid(mount, fid, Some(*parent), name.clone(), EntryKind::File).await {
                     Ok(entry) => {
-                        store.upsert_entry(&entry).await?;
+                        store.upsert_lustre_entry(filesystem, &entry).await?;
                         Ok(true)
                     }
                     Err(_) => Ok(false),
@@ -712,7 +722,13 @@ async fn apply_event(
         }
 
         // ── Deletion events ──
-        ChangelogEvent::Unlink { fid, last_link, .. } => {
+        ChangelogEvent::Unlink {
+            fid,
+            parent,
+            name,
+            last_link,
+            ..
+        } => {
             tracing::debug!(fid = %fid, last_link = *last_link, "processing Unlink event");
             if *last_link {
                 // DNE rename stitching hedge: a cross-MDT rename can
@@ -730,14 +746,17 @@ async fn apply_event(
                     );
                     return Ok(false);
                 }
-                store.remove_entry(fid, event_time).await?;
+                store.remove_lustre_entry(filesystem, fid, event_time).await?;
                 Ok(true)
             } else {
+                store
+                    .remove_scoped_namespace_edge(filesystem, ObjectId::Lustre(*parent), name)
+                    .await?;
                 // Decrement nlink if the entry exists.
-                if let Some(mut entry) = store.get_entry(fid).await? {
+                if let Some(mut entry) = store.get_lustre_entry(filesystem, fid).await? {
                     entry.nlink = entry.nlink.saturating_sub(1);
                     entry.last_seen = now_secs();
-                    store.upsert_entry(&entry).await?;
+                    store.upsert_lustre_entry(filesystem, &entry).await?;
                     Ok(true)
                 } else {
                     Ok(false)
@@ -746,7 +765,7 @@ async fn apply_event(
         }
 
         ChangelogEvent::Rmdir { fid, .. } => {
-            store.remove_entry(fid, event_time).await?;
+            store.remove_lustre_entry(filesystem, fid, event_time).await?;
             Ok(true)
         }
 
@@ -765,17 +784,17 @@ async fn apply_event(
             // match, we fall back to a name-only search. The fallback handles
             // entries from initial scans or old changelog replays where
             // parent_fid may not yet be set correctly.
-            let existing = store.get_entry(fid).await?;
+            let existing = store.get_lustre_entry(filesystem, fid).await?;
             if let Some(mut entry) = existing {
                 entry.parent_fid = Some(*parent);
                 entry.name = name.clone();
                 entry.last_seen = now_secs();
-                store.rename_entry(&entry, event_time).await?;
+                store.rename_lustre_entry(filesystem, &entry, event_time).await?;
                 Ok(true)
             } else {
                 match stat_entry_by_fid(mount, fid, Some(*parent), name.clone(), EntryKind::File).await {
                     Ok(entry) => {
-                        store.rename_entry(&entry, event_time).await?;
+                        store.rename_lustre_entry(filesystem, &entry, event_time).await?;
                         Ok(true)
                     }
                     Err(e) => {
@@ -791,7 +810,7 @@ async fn apply_event(
             // Close is the reliable "data changed" signal.
             // cr_pfid is often zero for CLOSE records — only pass parent if non-zero.
             let parent_opt = if parent.is_zero() { None } else { Some(*parent) };
-            restat_entry(store, mount, fid, parent_opt, name.clone()).await
+            restat_entry(store, filesystem, mount, fid, parent_opt, name.clone()).await
         }
 
         ChangelogEvent::Truncate { fid } => {
@@ -799,15 +818,15 @@ async fn apply_event(
             // Lustre version — a CL_HSM(RELEASE) event is NOT generated.
             // After re-statting for size/mtime, check the live HSM state
             // and refresh sm_status.hsm_state if the entry is HSM-managed.
-            let touched = restat_entry(store, mount, fid, None, Bytes::new()).await?;
+            let touched = restat_entry(store, filesystem, mount, fid, None, Bytes::new()).await?;
             if touched {
-                let _ = refresh_hsm_state_if_managed(store, mount, fid).await;
+                let _ = refresh_hsm_state_if_managed(store, filesystem, mount, fid).await;
             }
             Ok(touched)
         }
 
         ChangelogEvent::SetAttr { fid } | ChangelogEvent::MTime { fid } | ChangelogEvent::CTime { fid } => {
-            restat_entry(store, mount, fid, None, Bytes::new()).await
+            restat_entry(store, filesystem, mount, fid, None, Bytes::new()).await
         }
 
         ChangelogEvent::Hsm {
@@ -815,7 +834,7 @@ async fn apply_event(
             hsm_event,
             hsm_flags,
             hsm_error,
-        } => apply_hsm_event(store, fid, *hsm_event, *hsm_flags, *hsm_error).await,
+        } => apply_hsm_event(store, filesystem, fid, *hsm_event, *hsm_flags, *hsm_error).await,
 
         // ── Events we skip for now ──
         ChangelogEvent::XAttr { .. } | ChangelogEvent::Layout { .. } => Ok(false),
@@ -870,20 +889,23 @@ fn build_hsm_patch(hsm_event: u8, hsm_flags: u8, hsm_error: u8, now: i64) -> ser
 }
 
 async fn apply_hsm_event(
-    store: &EntryStore, fid: &lustre_api::LuFid, hsm_event: u8, hsm_flags: u8, hsm_error: u8,
+    store: &EntryStore, filesystem: &FileSystemId, fid: &lustre_api::LuFid, hsm_event: u8, hsm_flags: u8, hsm_error: u8,
 ) -> anyhow::Result<bool> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let patch = build_hsm_patch(hsm_event, hsm_flags, hsm_error, now);
-    let touched = store.patch_sm_status(fid, &patch).await?;
-    if !touched {
+    let touched = store.legacy_lustre_patch_sm_status(fid, &patch).await?;
+    let scoped_touched = store
+        .patch_scoped_sm_status(&EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid)), &patch)
+        .await?;
+    if !touched && !scoped_touched {
         tracing::debug!(%fid, event = hsm_event, "HSM event for entry not yet in catalog — skipped");
     } else {
         tracing::debug!(%fid, event = hsm_event, flags = hsm_flags, error = hsm_error, "HSM state patched");
     }
-    Ok(touched)
+    Ok(touched || scoped_touched)
 }
 
 #[cfg(test)]
@@ -1148,9 +1170,11 @@ mod tests {
 /// Query the live HSM state via FFI and update sm_status.hsm_state in the catalog.
 /// Only called when the entry already has an hsm_state (meaning it's HSM-managed).
 /// This handles the case where TRUNC events are generated instead of CL_HSM(RELEASE).
-async fn refresh_hsm_state_if_managed(store: &EntryStore, mount: &Path, fid: &lustre_api::LuFid) -> anyhow::Result<()> {
+async fn refresh_hsm_state_if_managed(
+    store: &EntryStore, filesystem: &FileSystemId, mount: &Path, fid: &lustre_api::LuFid,
+) -> anyhow::Result<()> {
     // Check if entry has an existing hsm_state in the catalog.
-    let entry = match store.get_entry(fid).await? {
+    let entry = match store.get_lustre_entry(filesystem, fid).await? {
         Some(e) => e,
         None => return Ok(()),
     };
@@ -1197,17 +1221,21 @@ async fn refresh_hsm_state_if_managed(store: &EntryStore, mount: &Path, fid: &lu
             "HSM state refreshed after TRUNC event"
         );
         let patch = serde_json::json!({ "hsm_state": new_state });
-        if let Err(e) = store.patch_sm_status(fid, &patch).await {
+        if let Err(e) = store.legacy_lustre_patch_sm_status(fid, &patch).await {
             tracing::warn!(%fid, error = %e, new_state, "failed to patch hsm_state after TRUNC event");
         }
+        store
+            .patch_scoped_sm_status(&EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid)), &patch)
+            .await?;
     }
     Ok(())
 }
 
 async fn restat_entry(
-    store: &EntryStore, mount: &Path, fid: &lustre_api::LuFid, parent: Option<lustre_api::LuFid>, name: Bytes,
+    store: &EntryStore, filesystem: &FileSystemId, mount: &Path, fid: &lustre_api::LuFid,
+    parent: Option<lustre_api::LuFid>, name: Bytes,
 ) -> anyhow::Result<bool> {
-    if let Some(mut entry) = store.get_entry(fid).await? {
+    if let Some(mut entry) = store.get_lustre_entry(filesystem, fid).await? {
         // Re-stat via FID path for fresh metadata.
         let lustre = LustreApi;
         let fid_copy = *fid;
@@ -1243,7 +1271,7 @@ async fn restat_entry(
             {
                 entry.parent_fid = Some(p);
             }
-            store.upsert_entry(&entry).await?;
+            store.upsert_lustre_entry(filesystem, &entry).await?;
             Ok(true)
         } else {
             // File gone between event and processing.
@@ -1277,13 +1305,18 @@ async fn stat_entry_by_fid(
         let kind = metadata_to_kind(&meta);
 
         // Stripe info for files.
-        let (stripe_count, stripe_size, pool_name) = if kind == EntryKind::File {
+        let (stripe_count, stripe_size, stripe_items, pool_name) = if kind == EntryKind::File {
             match lustre.get_stripe_info(&abs_path) {
-                Ok(info) => (Some(info.count as u16), Some(info.size as u32), info.pool),
-                Err(_) => (None, None, None),
+                Ok(info) => (
+                    Some(info.count as u16),
+                    Some(info.size as u32),
+                    info.ost_indices,
+                    info.pool,
+                ),
+                Err(_) => (None, None, Vec::new(), None),
             }
         } else {
-            (None, None, None)
+            (None, None, Vec::new(), None)
         };
 
         // Never store a zero parent_fid — some event types leave cr_pfid unpopulated.
@@ -1306,6 +1339,7 @@ async fn stat_entry_by_fid(
             ctime: meta.ctime(),
             stripe_count,
             stripe_size,
+            stripe_items,
             pool_name,
             sm_status: serde_json::json!({}),
             last_seen: now_secs(),

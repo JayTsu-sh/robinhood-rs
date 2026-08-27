@@ -134,6 +134,8 @@ unsafe extern "C" {
 
     pub(crate) fn llapi_layout_stripe_size_get(layout: *const c_void, size: *mut u64) -> c_int;
 
+    pub(crate) fn llapi_layout_ost_index_get(layout: *const c_void, stripe_number: u64, index: *mut u64) -> c_int;
+
     pub(crate) fn llapi_layout_pool_name_get(layout: *const c_void, buf: *mut c_char, buflen: usize) -> c_int;
 
     pub(crate) fn llapi_layout_free(layout: *mut c_void);

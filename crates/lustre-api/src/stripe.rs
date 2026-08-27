@@ -30,6 +30,8 @@ pub struct StripeInfo {
     pub size: u64,
     /// Pool name, if the file was created in an OST pool. Empty → no pool.
     pub pool: Option<String>,
+    /// OST index for every concrete stripe in layout order.
+    pub ost_indices: Vec<u32>,
 }
 
 impl LustreApi {
@@ -87,10 +89,21 @@ impl LustreApi {
             None
         };
 
+        let mut ost_indices = Vec::with_capacity(count as usize);
+        for stripe_number in 0..count {
+            let mut index = 0_u64;
+            // SAFETY: layout remains valid under `_guard`; index is a local
+            // out-parameter and stripe_number is bounded by the reported count.
+            let rc = unsafe { sys::llapi_layout_ost_index_get(layout, stripe_number, &mut index) };
+            check_rc(rc, "llapi_layout_ost_index_get")?;
+            ost_indices.push(u32::try_from(index).unwrap_or(u32::MAX));
+        }
+
         Ok(StripeInfo {
             count: u32::try_from(count).unwrap_or(u32::MAX),
             size,
             pool,
+            ost_indices,
         })
     }
 }

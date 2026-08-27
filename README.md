@@ -83,6 +83,9 @@ export RBH_CHANGELOG_USER=cl1            # register via `lctl changelog_register
 
 ## Commands
 
+Catalog commands require `--filesystem ID` (or `RBH_FILESYSTEM=ID`); there is
+no implicit global catalog scope.
+
 | `rbh` subcommand | Purpose |
 |------------------|---------|
 | `find`          | find(1)-style catalog query (`--user --type --size --mtime --hsm-state --sort` etc.) |
@@ -94,7 +97,7 @@ export RBH_CHANGELOG_USER=cl1            # register via `lctl changelog_register
 | `policy-list`   | List policies |
 | `policy-show <id>` | Show one policy |
 | `policy-run <id>` | Manual one-shot run, optional `--target-ost N` / `--target-pool NAME` / `--target-user UID` |
-| `status`        | `/api/entries/count` |
+| `status --filesystem ID` | `/api/entries/count?filesystem=ID` |
 | `health`        | `/api/health` |
 
 ## REST endpoints
@@ -103,19 +106,22 @@ export RBH_CHANGELOG_USER=cl1            # register via `lctl changelog_register
 |--------|------|-------|
 | GET    | `/api/health`        | Liveness |
 | GET    | `/api/metrics`       | Prometheus exposition |
-| GET    | `/api/entries/count` | Catalog row count |
-| POST   | `/api/entries/query` | Generic predicate query |
-| POST   | `/api/reports/aggregate` | Group-by counts |
-| GET    | `/api/reports/top-size` | Top-N by size |
-| GET    | `/api/reports/oldest`    | Oldest-N by atime |
-| GET    | `/api/reports/size-profile` | Bucketed size histogram |
-| GET    | `/api/removed`       | `removed_entries` page |
-| DELETE | `/api/removed/{fid}` | Forget a removed-entry row |
+| GET    | `/api/entries/count?filesystem=ID` | Filesystem-scoped catalog row count |
+| POST   | `/api/entries/query` | Generic predicate query; body requires `filesystem` |
+| POST   | `/api/reports/aggregate` | Group-by counts; body requires `filesystem` |
+| GET    | `/api/reports/top-size?filesystem=ID` | Filesystem-scoped Top-N by size |
+| GET    | `/api/reports/oldest?filesystem=ID` | Oldest-N by atime |
+| GET    | `/api/reports/size-profile?filesystem=ID` | Bucketed size histogram |
+| GET    | `/api/removed?filesystem=ID` | Filesystem-scoped removed objects |
+| DELETE | `/api/removed/{object}?filesystem=ID` | Forget one typed backend object |
 | GET / POST | `/api/policies`  | CRUD |
 | GET / PUT / DELETE | `/api/policies/{id}` | CRUD |
 | POST   | `/api/policies/{id}/run` | Manual one-shot run |
 | POST   | `/api/scans`         | Start an async scan |
 | GET    | `/api/scans[/{id}]`  | Scan progress |
+
+The unscoped Lustre dump, restore, orphan-sweep, and classifier-run surfaces
+are retained only under `/api/compat/lustre/` as an explicit migration boundary.
 
 ## Configuration
 

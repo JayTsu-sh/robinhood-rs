@@ -169,10 +169,29 @@ impl Task for PolicyRunTask {
 
         let candidates = match rt
             .entry_store
-            .query_page(&where_clause, &query_params, order_by.as_deref(), max_count, 0)
+            .query_scoped_page(
+                &rt.filesystem_id,
+                &where_clause,
+                &query_params,
+                order_by.as_deref(),
+                max_count,
+                0,
+            )
             .await
         {
-            Ok(c) => c,
+            Ok(rows) => {
+                let mut candidates = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let Some(entry) = row.to_lustre_compat() else {
+                        return Err(SchedulerError::ExecutionError(format!(
+                            "filesystem {} requires an ActionBackend before policy execution",
+                            rt.filesystem_id
+                        )));
+                    };
+                    candidates.push(entry);
+                }
+                candidates
+            }
             Err(e) => {
                 tracing::error!(error = %e, "failed to query candidates");
                 return Err(SchedulerError::ExecutionError(e.to_string()));
@@ -359,6 +378,7 @@ fn maybe_spawn_low_watermark_monitor(
     };
 
     let entry_store = rt.entry_store.clone();
+    let filesystem_id = rt.filesystem_id.clone();
     let where_clause = where_clause.to_string();
     let params: Vec<_> = query_params.to_vec();
     let policy_name = def.name.clone();
@@ -372,12 +392,12 @@ fn maybe_spawn_low_watermark_monitor(
             }
             let hit = match measure {
                 LowMeasure::Count(low) => entry_store
-                    .count_where(&where_clause, &params)
+                    .count_scoped_where(&filesystem_id, &where_clause, &params)
                     .await
                     .map(|c| c <= low)
                     .unwrap_or(false),
                 LowMeasure::Volume(low) => entry_store
-                    .sum_size_where(&where_clause, &params)
+                    .sum_scoped_size_where(&filesystem_id, &where_clause, &params)
                     .await
                     .map(|v| v <= low)
                     .unwrap_or(false),
@@ -570,6 +590,7 @@ mod tests {
             ctime: 1_600_000_000,
             stripe_count: Some(2),
             stripe_size: Some(4_194_304),
+            stripe_items: vec![0, 1],
             pool_name: Some("ssd".to_string()),
             sm_status: serde_json::json!({}),
             last_seen: 1_775_955_820,

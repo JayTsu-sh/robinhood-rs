@@ -29,4 +29,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 axum-test = "17"
+bytes = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

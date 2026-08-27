@@ -19,21 +19,21 @@ use crate::model::{
     ScopedEntryRow, ScopedNamespaceEdge,
 };
 
-/// A bind parameter for `query_where`. Avoids circular dependency on `rbh-predicate`.
+/// A bind parameter for `legacy_lustre_query_where`. Avoids circular dependency on `rbh-predicate`.
 #[derive(Debug, Clone)]
 pub enum QueryParam {
     Int(i64),
     Str(String),
 }
 
-/// Sort ordering for [`EntryStore::aggregate_by`].
+/// Sort ordering for [`EntryStore::legacy_lustre_aggregate_by`].
 #[derive(Debug, Clone, Copy)]
 pub enum AggregateSort {
     Count,
     Size,
 }
 
-/// Whitelisted column names available for [`EntryStore::aggregate_by`].
+/// Whitelisted column names available for [`EntryStore::legacy_lustre_aggregate_by`].
 /// Never lookup from raw user input — go through this enum.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,7 +59,7 @@ impl AggregateKey {
     }
 }
 
-/// One row returned by [`EntryStore::stripe_distribution`].
+/// One row returned by [`EntryStore::legacy_lustre_stripe_distribution`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StripeDistRow {
     pub ost_index: u32,
@@ -146,19 +146,9 @@ impl EntryStore {
             });
         }
 
-        let (kind, bytes) = encode_object_id(*entry.key.object());
-        let entry_data = serde_json::to_string(entry)?;
-        sqlx::query(
-            r"INSERT INTO scoped_entries (filesystem_id, object_kind, object_id, entry_data)
-              VALUES (?, ?, ?, ?)
-              ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data)",
-        )
-        .bind(entry.key.filesystem().as_str())
-        .bind(kind)
-        .bind(bytes.as_slice())
-        .bind(entry_data)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        upsert_scoped_entry_tx(&mut tx, entry).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -185,19 +175,7 @@ impl EntryStore {
                     object: entry.key.object().backend(),
                 });
             }
-            let (kind, bytes) = encode_object_id(*entry.key.object());
-            let entry_data = serde_json::to_string(entry)?;
-            sqlx::query(
-                r"INSERT INTO scoped_entries (filesystem_id, object_kind, object_id, entry_data)
-                  VALUES (?, ?, ?, ?)
-                  ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data)",
-            )
-            .bind(filesystem.as_str())
-            .bind(kind)
-            .bind(bytes.as_slice())
-            .bind(entry_data)
-            .execute(&mut *tx)
-            .await?;
+            upsert_scoped_entry_tx(&mut tx, entry).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -339,9 +317,12 @@ impl EntryStore {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE scoped_entries SET entry_data = ? WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
+            "UPDATE scoped_entries SET entry_data = ?, nlink = ?, last_seen = ? \
+             WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
         )
         .bind(serde_json::to_string(&entry)?)
+        .bind(entry.nlink)
+        .bind(entry.last_seen)
         .bind(edge.filesystem.as_str())
         .bind(object_kind)
         .bind(object_id.as_slice())
@@ -389,15 +370,31 @@ impl EntryStore {
                 entry.nlink -= 1;
                 entry.last_seen = observed_at;
                 sqlx::query(
-                    "UPDATE scoped_entries SET entry_data = ? WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
+                    "UPDATE scoped_entries SET entry_data = ?, nlink = ?, last_seen = ? \
+                     WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
                 )
                 .bind(serde_json::to_string(&entry)?)
+                .bind(entry.nlink)
+                .bind(entry.last_seen)
                 .bind(key.filesystem().as_str())
                 .bind(object_kind)
                 .bind(object_id.as_slice())
                 .execute(&mut *tx)
                 .await?;
             } else {
+                sqlx::query(
+                    r"INSERT INTO scoped_removed_entries
+                        (filesystem_id, object_kind, object_id, entry_data, rm_time)
+                      VALUES (?, ?, ?, ?, ?)
+                      ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data), rm_time = VALUES(rm_time)",
+                )
+                .bind(key.filesystem().as_str())
+                .bind(object_kind)
+                .bind(object_id.as_slice())
+                .bind(serde_json::to_string(&entry)?)
+                .bind(observed_at)
+                .execute(&mut *tx)
+                .await?;
                 sqlx::query("DELETE FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
                     .bind(key.filesystem().as_str())
                     .bind(object_kind)
@@ -415,6 +412,10 @@ impl EntryStore {
     #[tracing::instrument(name = "store.clear_scoped_catalog", skip(self), fields(filesystem = %filesystem))]
     pub async fn clear_scoped_catalog(&self, filesystem: &FileSystemId) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM scoped_stripe_items WHERE filesystem_id = ?")
+            .bind(filesystem.as_str())
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM scoped_namespace_edges WHERE filesystem_id = ?")
             .bind(filesystem.as_str())
             .execute(&mut *tx)
@@ -510,11 +511,305 @@ impl EntryStore {
             .collect()
     }
 
-    // ── CRUD ────────────────────────────────────────────────────────────
+    /// Count catalog objects in exactly one filesystem.
+    #[tracing::instrument(name = "store.scoped_entry_count", skip(self), fields(filesystem = %filesystem))]
+    pub async fn scoped_entry_count(&self, filesystem: &FileSystemId) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scoped_entries WHERE filesystem_id = ?")
+            .bind(filesystem.as_str())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Query one filesystem's catalog projection with validated predicate and
+    /// ordering fragments produced by `rbh-predicate`.
+    #[tracing::instrument(name = "store.query_scoped_page", skip(self, params), fields(filesystem = %filesystem, sql = %where_clause))]
+    pub async fn query_scoped_page(
+        &self, filesystem: &FileSystemId, where_clause: &str, params: &[QueryParam], order_by: Option<&str>,
+        limit: u64, offset: u64,
+    ) -> Result<Vec<ScopedEntryRow>> {
+        let order_clause = match order_by {
+            Some(order) if !order.is_empty() => format!(" ORDER BY {order}"),
+            _ => String::new(),
+        };
+        let sql = format!(
+            "SELECT entry_data FROM scoped_entries AS entries \
+             WHERE filesystem_id = ? AND ({where_clause}){order_clause} LIMIT ? OFFSET ?"
+        );
+        let mut query = sqlx::query(&sql).bind(filesystem.as_str());
+        for param in params {
+            query = match param {
+                QueryParam::Int(value) => query.bind(*value),
+                QueryParam::Str(value) => query.bind(value.as_str()),
+            };
+        }
+        let rows = query
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| serde_json::from_slice(&row.try_get::<Vec<u8>, _>("entry_data")?).map_err(StoreError::from))
+            .collect()
+    }
+
+    /// Page removed objects belonging to exactly one filesystem.
+    #[tracing::instrument(name = "store.list_scoped_removed", skip(self), fields(filesystem = %filesystem))]
+    pub async fn list_scoped_removed(
+        &self, filesystem: &FileSystemId, since: Option<i64>, limit: u64, offset: u64,
+    ) -> Result<Vec<crate::model::ScopedRemovedEntry>> {
+        let (sql, has_since) = if since.is_some() {
+            (
+                "SELECT entry_data, rm_time FROM scoped_removed_entries WHERE filesystem_id = ? AND rm_time >= ? ORDER BY rm_time DESC LIMIT ? OFFSET ?",
+                true,
+            )
+        } else {
+            (
+                "SELECT entry_data, rm_time FROM scoped_removed_entries WHERE filesystem_id = ? ORDER BY rm_time DESC LIMIT ? OFFSET ?",
+                false,
+            )
+        };
+        let mut query = sqlx::query(sql).bind(filesystem.as_str());
+        if has_since {
+            query = query.bind(since.expect("checked above"));
+        }
+        let rows = query
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::model::ScopedRemovedEntry {
+                    entry: serde_json::from_slice(&row.try_get::<Vec<u8>, _>("entry_data")?)?,
+                    rm_time: row.try_get("rm_time")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Forget one removed object without affecting an identical native id in
+    /// another filesystem.
+    #[tracing::instrument(name = "store.forget_scoped_removed", skip(self), fields(filesystem = %key.filesystem()))]
+    pub async fn forget_scoped_removed(&self, key: &EntryKey) -> Result<bool> {
+        let (kind, object_id) = encode_object_id(*key.object());
+        let result = sqlx::query(
+            "DELETE FROM scoped_removed_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
+        )
+        .bind(key.filesystem().as_str())
+        .bind(kind)
+        .bind(object_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Merge status-manager metadata into one scoped object.
+    #[tracing::instrument(name = "store.patch_scoped_sm_status", skip(self, patch), fields(filesystem = %key.filesystem()))]
+    pub async fn patch_scoped_sm_status(&self, key: &EntryKey, patch: &serde_json::Value) -> Result<bool> {
+        let Some(mut entry) = self.get_scoped_entry(key).await? else {
+            return Ok(false);
+        };
+        if let (Some(current), Some(delta)) = (entry.sm_status.as_object_mut(), patch.as_object()) {
+            for (name, value) in delta {
+                current.insert(name.clone(), value.clone());
+            }
+        } else {
+            entry.sm_status = patch.clone();
+        }
+        entry.last_seen = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        self.upsert_scoped_entry(&entry).await?;
+        Ok(true)
+    }
+
+    /// Replace the classifier-owned xattr keys on one scoped object.
+    #[tracing::instrument(name = "store.update_scoped_xattr", skip(self, tags, clear_keys), fields(filesystem = %key.filesystem()))]
+    pub async fn update_scoped_xattr(
+        &self, key: &EntryKey, tags: &std::collections::HashMap<String, String>, clear_keys: &[String],
+    ) -> Result<bool> {
+        let Some(mut entry) = self.get_scoped_entry(key).await? else {
+            return Ok(false);
+        };
+        if entry
+            .sm_status
+            .get("xattr")
+            .and_then(serde_json::Value::as_object)
+            .is_none()
+        {
+            entry.sm_status["xattr"] = serde_json::json!({});
+        }
+        let xattrs = entry.sm_status["xattr"]
+            .as_object_mut()
+            .expect("xattr object was installed above");
+        for name in clear_keys {
+            xattrs.remove(name);
+        }
+        for (name, value) in tags {
+            xattrs.insert(name.clone(), serde_json::Value::String(value.clone()));
+        }
+        self.upsert_scoped_entry(&entry).await?;
+        Ok(true)
+    }
+
+    /// Count rows matching a predicate inside one filesystem.
+    #[tracing::instrument(name = "store.count_scoped_where", skip(self, params), fields(filesystem = %filesystem, sql = %where_clause))]
+    pub async fn count_scoped_where(
+        &self, filesystem: &FileSystemId, where_clause: &str, params: &[QueryParam],
+    ) -> Result<u64> {
+        let sql =
+            format!("SELECT COUNT(*) FROM scoped_entries AS entries WHERE filesystem_id = ? AND ({where_clause})");
+        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(filesystem.as_str());
+        for param in params {
+            query = match param {
+                QueryParam::Int(value) => query.bind(*value),
+                QueryParam::Str(value) => query.bind(value.as_str()),
+            };
+        }
+        Ok(query.fetch_one(&self.pool).await?.max(0) as u64)
+    }
+
+    /// Sum matching object sizes inside one filesystem.
+    #[tracing::instrument(name = "store.sum_scoped_size_where", skip(self, params), fields(filesystem = %filesystem, sql = %where_clause))]
+    pub async fn sum_scoped_size_where(
+        &self, filesystem: &FileSystemId, where_clause: &str, params: &[QueryParam],
+    ) -> Result<u64> {
+        let sql = format!(
+            "SELECT CAST(COALESCE(SUM(size), 0) AS UNSIGNED) FROM scoped_entries AS entries \
+             WHERE filesystem_id = ? AND ({where_clause})"
+        );
+        let mut query = sqlx::query_scalar::<_, u64>(&sql).bind(filesystem.as_str());
+        for param in params {
+            query = match param {
+                QueryParam::Int(value) => query.bind(*value),
+                QueryParam::Str(value) => query.bind(value.as_str()),
+            };
+        }
+        Ok(query.fetch_one(&self.pool).await?)
+    }
+
+    /// Aggregate a validated catalog column inside one filesystem.
+    #[tracing::instrument(name = "store.aggregate_scoped_by", skip(self), fields(filesystem = %filesystem))]
+    pub async fn aggregate_scoped_by(
+        &self, filesystem: &FileSystemId, key: AggregateKey, order_by: AggregateSort, limit: u64,
+    ) -> Result<Vec<(String, u64, u64)>> {
+        let order = match order_by {
+            AggregateSort::Count => "cnt DESC",
+            AggregateSort::Size => "total_size DESC",
+        };
+        let (group, group_by) = match key {
+            AggregateKey::ParentFid => (
+                "CONCAT(parent_kind, ':', HEX(parent_id))".to_owned(),
+                "parent_kind, parent_id".to_owned(),
+            ),
+            _ => {
+                let column = key.as_column();
+                (format!("CAST({column} AS CHAR)"), column.to_owned())
+            }
+        };
+        let sql = format!(
+            "SELECT {group} AS grp, COUNT(*) AS cnt, \
+             CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total_size \
+             FROM scoped_entries WHERE filesystem_id = ? GROUP BY {group_by} ORDER BY {order} LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(filesystem.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<Option<String>, _>("grp")?.unwrap_or_default(),
+                    row.try_get::<i64, _>("cnt")? as u64,
+                    row.try_get::<u64, _>("total_size").unwrap_or(0),
+                ))
+            })
+            .collect()
+    }
+
+    /// Size histogram for files in one filesystem.
+    #[tracing::instrument(name = "store.scoped_size_profile", skip(self), fields(filesystem = %filesystem))]
+    pub async fn scoped_size_profile(&self, filesystem: &FileSystemId) -> Result<Vec<(String, u64, u64)>> {
+        let sql = r"SELECT
+              CASE WHEN size = 0 THEN '0' WHEN size < 1024 THEN '<1K'
+                   WHEN size < 1024*1024 THEN '1K-1M'
+                   WHEN size < 100*1024*1024 THEN '1M-100M'
+                   WHEN size < 1024*1024*1024 THEN '100M-1G' ELSE '>=1G' END AS bucket,
+              COUNT(*) AS cnt, CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total_size,
+              CASE WHEN size = 0 THEN 0 WHEN size < 1024 THEN 1
+                   WHEN size < 1024*1024 THEN 2 WHEN size < 100*1024*1024 THEN 3
+                   WHEN size < 1024*1024*1024 THEN 4 ELSE 5 END AS ord
+            FROM scoped_entries WHERE filesystem_id = ? AND kind = 0
+            GROUP BY bucket, ord ORDER BY ord";
+        let rows = sqlx::query(sql).bind(filesystem.as_str()).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("bucket")?,
+                    row.try_get::<i64, _>("cnt")? as u64,
+                    row.try_get::<u64, _>("total_size").unwrap_or(0),
+                ))
+            })
+            .collect()
+    }
+
+    /// Recursive totals under one backend-native object id.
+    #[tracing::instrument(name = "store.scoped_subtree_totals", skip(self), fields(filesystem = %root.filesystem()))]
+    pub async fn scoped_subtree_totals(&self, root: &EntryKey) -> Result<(u64, u64)> {
+        let (kind, object_id) = encode_object_id(*root.object());
+        let sql = r"WITH RECURSIVE descendants (object_kind, object_id) AS (
+              SELECT object_kind, object_id FROM scoped_entries
+               WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?
+              UNION ALL
+              SELECT child.object_kind, child.object_id FROM scoped_entries child
+              JOIN descendants parent ON child.parent_kind = parent.object_kind AND child.parent_id = parent.object_id
+               WHERE child.filesystem_id = ?
+            ) SELECT COUNT(*) AS n, CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS bytes
+              FROM scoped_entries WHERE filesystem_id = ? AND (object_kind, object_id) IN
+              (SELECT object_kind, object_id FROM descendants)";
+        let row = sqlx::query(sql)
+            .bind(root.filesystem().as_str())
+            .bind(kind)
+            .bind(object_id.as_slice())
+            .bind(root.filesystem().as_str())
+            .bind(root.filesystem().as_str())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((
+            row.try_get::<i64, _>("n")? as u64,
+            row.try_get::<u64, _>("bytes").unwrap_or(0),
+        ))
+    }
+
+    /// Per-OST distribution for one filesystem's scoped stripe metadata.
+    #[tracing::instrument(name = "store.scoped_stripe_distribution", skip(self), fields(filesystem = %filesystem))]
+    pub async fn scoped_stripe_distribution(&self, filesystem: &FileSystemId) -> Result<Vec<StripeDistRow>> {
+        let sql = r"SELECT stripe.ost_index, COUNT(*) AS n,
+                   CAST(COALESCE(SUM(entry.size / NULLIF(entry.stripe_count, 0)), 0) AS UNSIGNED) AS bytes
+                   FROM scoped_stripe_items stripe JOIN scoped_entries entry
+                     ON entry.filesystem_id = stripe.filesystem_id
+                    AND entry.object_kind = stripe.object_kind AND entry.object_id = stripe.object_id
+                   WHERE stripe.filesystem_id = ? GROUP BY stripe.ost_index ORDER BY bytes DESC";
+        let rows = sqlx::query(sql).bind(filesystem.as_str()).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StripeDistRow {
+                    ost_index: row.try_get("ost_index")?,
+                    file_count: row.try_get::<i64, _>("n")? as u64,
+                    approx_bytes: row.try_get::<u64, _>("bytes").unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    // ── Explicit legacy Lustre compatibility CRUD ──────────────────────
 
     /// Insert or update a single entry via `INSERT ... ON DUPLICATE KEY UPDATE`.
-    #[tracing::instrument(name = "store.upsert_entry", skip(self, entry), fields(fid = %entry.fid))]
-    pub async fn upsert_entry(&self, entry: &EntryRow) -> Result<()> {
+    #[tracing::instrument(name = "store.legacy_lustre_upsert_entry", skip(self, entry), fields(fid = %entry.fid))]
+    pub async fn legacy_lustre_upsert_entry(&self, entry: &EntryRow) -> Result<()> {
         let fid_bin = fid_codec::encode(&entry.fid);
         let parent_bin = entry.parent_fid.as_ref().map(fid_codec::encode);
         let sm_json = serde_json::to_string(&entry.sm_status)?;
@@ -572,8 +867,8 @@ impl EntryStore {
 
     /// Atomically apply a rename, including moving an overwritten destination
     /// to `removed_entries` before updating the source entry.
-    #[tracing::instrument(name = "store.rename_entry", skip(self, entry), fields(fid = %entry.fid))]
-    pub async fn rename_entry(&self, entry: &EntryRow, rm_time: i64) -> Result<()> {
+    #[tracing::instrument(name = "store.legacy_lustre_rename_entry", skip(self, entry), fields(fid = %entry.fid))]
+    pub async fn legacy_lustre_rename_entry(&self, entry: &EntryRow, rm_time: i64) -> Result<()> {
         let fid_bin = fid_codec::encode(&entry.fid);
         let parent_bin = entry.parent_fid.as_ref().map(fid_codec::encode);
         let sm_json = serde_json::to_string(&entry.sm_status)?;
@@ -651,8 +946,8 @@ impl EntryStore {
     }
 
     /// Get one entry by FID.
-    #[tracing::instrument(name = "store.get_entry", skip(self), fields(fid = %fid))]
-    pub async fn get_entry(&self, fid: &LuFid) -> Result<Option<EntryRow>> {
+    #[tracing::instrument(name = "store.legacy_lustre_get_entry", skip(self), fields(fid = %fid))]
+    pub async fn legacy_lustre_get_entry(&self, fid: &LuFid) -> Result<Option<EntryRow>> {
         let fid_bin = fid_codec::encode(fid);
         let row = sqlx::query(
             "SELECT fid, parent_fid, name, kind, size, blocks, uid, gid, projid, mode, nlink,
@@ -670,8 +965,8 @@ impl EntryStore {
     }
 
     /// Delete an entry by FID (moves to `removed_entries` if `rm_time` is set).
-    #[tracing::instrument(name = "store.remove_entry", skip(self), fields(fid = %fid))]
-    pub async fn remove_entry(&self, fid: &LuFid, rm_time: i64) -> Result<()> {
+    #[tracing::instrument(name = "store.legacy_lustre_remove_entry", skip(self), fields(fid = %fid))]
+    pub async fn legacy_lustre_remove_entry(&self, fid: &LuFid, rm_time: i64) -> Result<()> {
         let fid_bin = fid_codec::encode(fid);
 
         // Move to removed_entries in one transaction.
@@ -690,7 +985,7 @@ impl EntryStore {
         .await?;
 
         if result.rows_affected() == 0 {
-            tracing::warn!(fid = %fid, "remove_entry: FID not found in entries table");
+            tracing::warn!(fid = %fid, "legacy_lustre_remove_entry: FID not found in entries table");
         }
 
         sqlx::query("DELETE FROM entries WHERE fid = ?")
@@ -711,8 +1006,8 @@ impl EntryStore {
 
     /// Upsert a batch of entries in one transaction.
     /// Used by changelog ingest and fs-scan.
-    #[tracing::instrument(name = "store.upsert_batch", skip(self, entries), fields(count = entries.len()))]
-    pub async fn upsert_batch(&self, entries: &[EntryRow]) -> Result<()> {
+    #[tracing::instrument(name = "store.legacy_lustre_upsert_batch", skip(self, entries), fields(count = entries.len()))]
+    pub async fn legacy_lustre_upsert_batch(&self, entries: &[EntryRow]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -837,20 +1132,165 @@ impl EntryStore {
             .await?;
 
             let scoped = ScopedEntryRow::from_lustre(filesystem.clone(), entry);
-            let (object_kind, object_bytes) = encode_object_id(*scoped.key.object());
+            upsert_scoped_entry_tx(&mut tx, &scoped).await?;
+            sqlx::query("DELETE FROM stripe_items WHERE fid = ?")
+                .bind(fid_bin.as_slice())
+                .execute(&mut *tx)
+                .await?;
             sqlx::query(
-                r"INSERT INTO scoped_entries (filesystem_id, object_kind, object_id, entry_data)
-                  VALUES (?, ?, ?, ?)
-                  ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data)",
+                "DELETE FROM scoped_stripe_items WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?",
             )
             .bind(filesystem.as_str())
-            .bind(object_kind)
-            .bind(object_bytes.as_slice())
-            .bind(serde_json::to_string(&scoped)?)
+            .bind(fid_bin.as_slice())
             .execute(&mut *tx)
             .await?;
+            for (stripe_index, ost_index) in entry.stripe_items.iter().copied().enumerate() {
+                sqlx::query("INSERT INTO stripe_items (fid, stripe_index, ost_index) VALUES (?, ?, ?)")
+                    .bind(fid_bin.as_slice())
+                    .bind(stripe_index as u16)
+                    .bind(ost_index)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    r"INSERT INTO scoped_stripe_items
+                        (filesystem_id, object_kind, object_id, stripe_index, ost_index)
+                      VALUES (?, 0, ?, ?, ?)",
+                )
+                .bind(filesystem.as_str())
+                .bind(fid_bin.as_slice())
+                .bind(stripe_index as u16)
+                .bind(ost_index)
+                .execute(&mut *tx)
+                .await?;
+            }
+            if let Some(parent) = entry.parent_fid {
+                let parent_id = fid_codec::encode(&parent);
+                sqlx::query(
+                    r"INSERT INTO scoped_namespace_edges
+                        (filesystem_id, parent_kind, parent_id, name, object_kind, object_id)
+                      VALUES (?, 0, ?, ?, 0, ?)
+                      ON DUPLICATE KEY UPDATE object_kind = VALUES(object_kind), object_id = VALUES(object_id)",
+                )
+                .bind(filesystem.as_str())
+                .bind(parent_id.as_slice())
+                .bind(entry.name.as_ref())
+                .bind(fid_bin.as_slice())
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Persist one Lustre observation into both the scoped catalog and the
+    /// temporary legacy compatibility table.
+    #[tracing::instrument(name = "store.upsert_lustre_entry", skip(self, entry), fields(filesystem = %filesystem, fid = %entry.fid))]
+    pub async fn upsert_lustre_entry(&self, filesystem: &FileSystemId, entry: &EntryRow) -> Result<()> {
+        self.upsert_lustre_scan_batch(filesystem, std::slice::from_ref(entry))
+            .await
+    }
+
+    /// Load a Lustre object through its filesystem-scoped identity.
+    #[tracing::instrument(name = "store.get_lustre_entry", skip(self), fields(filesystem = %filesystem, fid = %fid))]
+    pub async fn get_lustre_entry(&self, filesystem: &FileSystemId, fid: &LuFid) -> Result<Option<EntryRow>> {
+        let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
+        Ok(self
+            .get_scoped_entry(&key)
+            .await?
+            .and_then(|entry| entry.to_lustre_compat()))
+    }
+
+    /// Move a scoped Lustre object into the filesystem-scoped removed set.
+    /// The legacy table is updated first as a compatibility side effect; a
+    /// failed scoped transaction prevents checkpoint advancement and replay
+    /// converges both projections.
+    #[tracing::instrument(name = "store.remove_lustre_entry", skip(self), fields(filesystem = %filesystem, fid = %fid))]
+    pub async fn remove_lustre_entry(&self, filesystem: &FileSystemId, fid: &LuFid, rm_time: i64) -> Result<()> {
+        let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
+        let scoped = self.get_scoped_entry(&key).await?;
+        self.legacy_lustre_remove_entry(fid, rm_time).await?;
+        let Some(entry) = scoped else {
+            return Ok(());
+        };
+        let (object_kind, object_id) = encode_object_id(*key.object());
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM scoped_stripe_items WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
+            .bind(filesystem.as_str())
+            .bind(object_kind)
+            .bind(object_id.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r"INSERT INTO scoped_removed_entries (filesystem_id, object_kind, object_id, entry_data, rm_time)
+              VALUES (?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data), rm_time = VALUES(rm_time)",
+        )
+        .bind(filesystem.as_str())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .bind(serde_json::to_string(&entry)?)
+        .bind(rm_time)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
+            .bind(filesystem.as_str())
+            .bind(object_kind)
+            .bind(object_id.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
+            .bind(filesystem.as_str())
+            .bind(object_kind)
+            .bind(object_id.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Apply a Lustre rename to both projections while keeping namespace
+    /// edges inside the selected filesystem.
+    #[tracing::instrument(name = "store.rename_lustre_entry", skip(self, entry), fields(filesystem = %filesystem, fid = %entry.fid))]
+    pub async fn rename_lustre_entry(&self, filesystem: &FileSystemId, entry: &EntryRow, rm_time: i64) -> Result<()> {
+        let displaced = if let Some(parent) = entry.parent_fid {
+            let parent_id = fid_codec::encode(&parent);
+            let row = sqlx::query(
+                r"SELECT object_id FROM scoped_namespace_edges
+                  WHERE filesystem_id = ? AND parent_kind = 0 AND parent_id = ? AND name = ?
+                    AND NOT (object_kind = 0 AND object_id = ?) LIMIT 1",
+            )
+            .bind(filesystem.as_str())
+            .bind(parent_id.as_slice())
+            .bind(entry.name.as_ref())
+            .bind(fid_codec::encode(&entry.fid).as_slice())
+            .fetch_optional(&self.pool)
+            .await?;
+            row.and_then(|row| fid_codec::decode(&row.try_get::<Vec<u8>, _>("object_id").ok()?))
+        } else {
+            None
+        };
+        self.legacy_lustre_rename_entry(entry, rm_time).await?;
+        if let Some(fid) = displaced {
+            self.remove_lustre_entry(filesystem, &fid, rm_time).await?;
+        }
+        let object_id = fid_codec::encode(&entry.fid);
+        sqlx::query("DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?")
+            .bind(filesystem.as_str())
+            .bind(object_id.as_slice())
+            .execute(&self.pool)
+            .await?;
+        self.upsert_scoped_entry(&ScopedEntryRow::from_lustre(filesystem.clone(), entry))
+            .await?;
+        if let Some(parent) = entry.parent_fid {
+            self.upsert_scoped_namespace_edge(&ScopedNamespaceEdge {
+                filesystem: filesystem.clone(),
+                parent: ObjectId::Lustre(parent),
+                name: entry.name.clone(),
+                object: ObjectId::Lustre(entry.fid),
+            })
+            .await?;
+        }
         Ok(())
     }
 
@@ -858,8 +1298,8 @@ impl EntryStore {
     ///
     /// Used by changelog ingest to detect rename-overwrite: when a rename
     /// destination already exists, the displaced entry must be removed.
-    #[tracing::instrument(name = "store.lookup_by_parent_name", skip(self))]
-    pub async fn lookup_by_parent_name(&self, parent_fid: &LuFid, name: &[u8]) -> Result<Option<LuFid>> {
+    #[tracing::instrument(name = "store.legacy_lustre_lookup_by_parent_name", skip(self))]
+    pub async fn legacy_lustre_lookup_by_parent_name(&self, parent_fid: &LuFid, name: &[u8]) -> Result<Option<LuFid>> {
         let parent_bin = fid_codec::encode(parent_fid);
         let row = sqlx::query("SELECT fid FROM entries WHERE parent_fid = ? AND name = ? LIMIT 1")
             .bind(parent_bin.as_slice())
@@ -877,7 +1317,8 @@ impl EntryStore {
     }
 
     /// Count entries in the catalog.
-    pub async fn entry_count(&self) -> Result<u64> {
+    #[tracing::instrument(name = "store.legacy_lustre_entry_count", skip(self))]
+    pub async fn legacy_lustre_entry_count(&self) -> Result<u64> {
         let row = sqlx::query("SELECT COUNT(*) as cnt FROM entries")
             .fetch_one(&self.pool)
             .await?;
@@ -889,15 +1330,19 @@ impl EntryStore {
     ///
     /// Used by PolicyRunTask to push predicate scope down to MariaDB.
     /// Params are `(i64 | String)` bound in order.
-    #[tracing::instrument(name = "store.query_where", skip(self, params), fields(sql = %where_clause))]
-    pub async fn query_where(&self, where_clause: &str, params: &[QueryParam], limit: u64) -> Result<Vec<EntryRow>> {
-        self.query_page(where_clause, params, None, limit, 0).await
+    #[tracing::instrument(name = "store.legacy_lustre_query_where", skip(self, params), fields(sql = %where_clause))]
+    pub async fn legacy_lustre_query_where(
+        &self, where_clause: &str, params: &[QueryParam], limit: u64,
+    ) -> Result<Vec<EntryRow>> {
+        self.legacy_lustre_query_page(where_clause, params, None, limit, 0)
+            .await
     }
 
     /// Paginated query with optional ORDER BY. `order_by` must be a
     /// pre-validated SQL fragment (column name + ASC/DESC). Callers build
     /// it via [`SortKey::to_sql_fragment`] — never from raw user input.
-    pub async fn query_page(
+    #[tracing::instrument(name = "store.legacy_lustre_query_page", skip(self, params), fields(sql = %where_clause))]
+    pub async fn legacy_lustre_query_page(
         &self, where_clause: &str, params: &[QueryParam], order_by: Option<&str>, limit: u64, offset: u64,
     ) -> Result<Vec<EntryRow>> {
         let order_clause = match order_by {
@@ -925,7 +1370,8 @@ impl EntryStore {
     /// Group entries by a column, returning `(key, count, total_size)`
     /// tuples. `group_col` MUST be a validated column name (never raw user
     /// input) — callers go through [`AggregateKey::as_column`].
-    pub async fn aggregate_by(
+    #[tracing::instrument(name = "store.legacy_lustre_aggregate_by", skip(self))]
+    pub async fn legacy_lustre_aggregate_by(
         &self, group_col: &str, order_by: AggregateSort, limit: u64,
     ) -> Result<Vec<(String, u64, u64)>> {
         let order = match order_by {
@@ -960,7 +1406,8 @@ impl EntryStore {
     /// Size-histogram: bucket entries by log2-ish size ranges
     /// (`0`, `1-1K`, `1K-1M`, `1M-100M`, `100M-1G`, `>=1G`).
     /// Returns `(label, count, total_size)` tuples, bucket order preserved.
-    pub async fn size_profile(&self) -> Result<Vec<(String, u64, u64)>> {
+    #[tracing::instrument(name = "store.legacy_lustre_size_profile", skip(self))]
+    pub async fn legacy_lustre_size_profile(&self) -> Result<Vec<(String, u64, u64)>> {
         let sql = "
             SELECT
               CASE
@@ -1002,7 +1449,8 @@ impl EntryStore {
     /// the column as `{}` first if it's NULL. Missing rows are a no-op
     /// (HSM events can arrive before the initial scan); returns whether
     /// a row was touched.
-    pub async fn patch_sm_status(&self, fid: &LuFid, patch: &serde_json::Value) -> Result<bool> {
+    #[tracing::instrument(name = "store.legacy_lustre_patch_sm_status", skip(self, patch), fields(fid = %fid))]
+    pub async fn legacy_lustre_patch_sm_status(&self, fid: &LuFid, patch: &serde_json::Value) -> Result<bool> {
         let bytes = fid_codec::encode(fid);
         // Pull, merge, write. Doing this in-app (not via MySQL
         // JSON_MERGE_PATCH) keeps the logic portable and testable.
@@ -1042,7 +1490,8 @@ impl EntryStore {
 
     /// Page the `removed_entries` table ordered by `rm_time` DESC
     /// (newest first). Optional `since` filters rm_time >= since.
-    pub async fn list_removed(
+    #[tracing::instrument(name = "store.legacy_lustre_list_removed", skip(self))]
+    pub async fn legacy_lustre_list_removed(
         &self, since: Option<i64>, limit: u64, offset: u64,
     ) -> Result<Vec<crate::model::RemovedEntry>> {
         let (sql, use_since) = match since {
@@ -1070,7 +1519,8 @@ impl EntryStore {
 
     /// Purge a removed-entry row (after operator confirmation or
     /// `rbh undelete` success). Returns whether a row was deleted.
-    pub async fn forget_removed(&self, fid: &LuFid) -> Result<bool> {
+    #[tracing::instrument(name = "store.legacy_lustre_forget_removed", skip(self), fields(fid = %fid))]
+    pub async fn legacy_lustre_forget_removed(&self, fid: &LuFid) -> Result<bool> {
         let bytes = fid_codec::encode(fid);
         let res = sqlx::query("DELETE FROM removed_entries WHERE fid = ?")
             .bind(&bytes[..])
@@ -1080,7 +1530,8 @@ impl EntryStore {
     }
 
     /// Look up one removed entry by FID.
-    pub async fn get_removed(&self, fid: &LuFid) -> Result<Option<crate::model::RemovedEntry>> {
+    #[tracing::instrument(name = "store.legacy_lustre_get_removed", skip(self), fields(fid = %fid))]
+    pub async fn legacy_lustre_get_removed(&self, fid: &LuFid) -> Result<Option<crate::model::RemovedEntry>> {
         let bytes = fid_codec::encode(fid);
         let row = sqlx::query(
             "SELECT fid, parent_fid, name, kind, size, uid, gid, sm_status, rm_time \
@@ -1094,7 +1545,8 @@ impl EntryStore {
 
     /// Count matching rows (no limit/offset). Used for paginated responses
     /// that want a total count.
-    pub async fn count_where(&self, where_clause: &str, params: &[QueryParam]) -> Result<u64> {
+    #[tracing::instrument(name = "store.legacy_lustre_count_where", skip(self, params), fields(sql = %where_clause))]
+    pub async fn legacy_lustre_count_where(&self, where_clause: &str, params: &[QueryParam]) -> Result<u64> {
         let sql = format!("SELECT COUNT(*) AS c FROM entries WHERE {where_clause}");
         let mut query = sqlx::query(&sql);
         for p in params {
@@ -1111,7 +1563,8 @@ impl EntryStore {
     /// `SUM(size)` across all rows matching the predicate. Returns 0 when
     /// nothing matches. Used by threshold triggers (fire condition) and by
     /// the low-watermark in-run stopper.
-    pub async fn sum_size_where(&self, where_clause: &str, params: &[QueryParam]) -> Result<u64> {
+    #[tracing::instrument(name = "store.legacy_lustre_sum_size_where", skip(self, params), fields(sql = %where_clause))]
+    pub async fn legacy_lustre_sum_size_where(&self, where_clause: &str, params: &[QueryParam]) -> Result<u64> {
         let sql = format!(
             "SELECT CAST(COALESCE(SUM(size), 0) AS UNSIGNED) AS total \
              FROM entries WHERE {where_clause}"
@@ -1138,7 +1591,8 @@ impl EntryStore {
     ///
     /// Clears every key in `clear_keys`, then sets each key in `tags`.
     /// Other fields in `sm_status` (e.g. `hsm_state`) are untouched.
-    pub async fn update_xattr(
+    #[tracing::instrument(name = "store.legacy_lustre_update_xattr", skip(self, tags, clear_keys), fields(fid = %fid))]
+    pub async fn legacy_lustre_update_xattr(
         &self, fid: &LuFid, tags: &std::collections::HashMap<String, String>, clear_keys: &[String],
     ) -> Result<()> {
         if tags.is_empty() && clear_keys.is_empty() {
@@ -1190,7 +1644,8 @@ impl EntryStore {
     ///
     /// When `dry_run` is true, the scan counts candidates but performs
     /// no deletes.
-    pub async fn sweep_orphans(&self, before: i64, limit: u64, dry_run: bool) -> Result<u64> {
+    #[tracing::instrument(name = "store.legacy_lustre_sweep_orphans", skip(self))]
+    pub async fn legacy_lustre_sweep_orphans(&self, before: i64, limit: u64, dry_run: bool) -> Result<u64> {
         // Candidate fids, ordered oldest-first so repeated calls make
         // monotonic progress.
         let sql = "SELECT fid FROM entries WHERE last_seen < ? AND kind != 1 \
@@ -1212,14 +1667,14 @@ impl EntryStore {
             .unwrap_or(0);
         let mut swept = 0u64;
         for fid_bin in fids {
-            // Decode the blob back into a LuFid to reuse `remove_entry`'s
+            // Decode the blob back into a LuFid to reuse `legacy_lustre_remove_entry`'s
             // transactional move. We could do this with a single bulk
             // INSERT ... SELECT / DELETE pair, but per-row keeps the
             // existing semantics (names-table cleanup included) without
             // duplicating that SQL here.
             if let Some(fid) = fid_codec::decode(&fid_bin) {
-                if let Err(e) = self.remove_entry(&fid, now).await {
-                    tracing::warn!(fid = %fid, error = %e, "sweep_orphans: remove_entry failed");
+                if let Err(e) = self.legacy_lustre_remove_entry(&fid, now).await {
+                    tracing::warn!(fid = %fid, error = %e, "legacy_lustre_sweep_orphans: legacy_lustre_remove_entry failed");
                     continue;
                 }
                 swept += 1;
@@ -1232,7 +1687,8 @@ impl EntryStore {
     /// rooted at `root`. Implemented with a MariaDB recursive CTE on the
     /// `parent_fid` edge. Includes the root itself in the totals when
     /// it exists. Returns `(0, 0)` when the root is absent.
-    pub async fn subtree_totals(&self, root: &LuFid) -> Result<(u64, u64)> {
+    #[tracing::instrument(name = "store.legacy_lustre_subtree_totals", skip(self), fields(fid = %root))]
+    pub async fn legacy_lustre_subtree_totals(&self, root: &LuFid) -> Result<(u64, u64)> {
         let root_bin = fid_codec::encode(root);
         let sql = "WITH RECURSIVE descendants (fid) AS ( \
                      SELECT fid FROM entries WHERE fid = ? \
@@ -1259,7 +1715,8 @@ impl EntryStore {
     ///
     /// Ordered by `approx_bytes DESC` so "fullest OST first" is the
     /// default view.
-    pub async fn stripe_distribution(&self) -> Result<Vec<StripeDistRow>> {
+    #[tracing::instrument(name = "store.legacy_lustre_stripe_distribution", skip(self))]
+    pub async fn legacy_lustre_stripe_distribution(&self) -> Result<Vec<StripeDistRow>> {
         let sql = "SELECT si.ost_index, COUNT(*) AS n, \
                    CAST(COALESCE(SUM(e.size / NULLIF(e.stripe_count, 0)), 0) AS UNSIGNED) AS bytes \
                    FROM stripe_items si \
@@ -1284,9 +1741,10 @@ impl EntryStore {
     /// server-side cursor (MariaDB doesn't expose one to sqlx).
     ///
     /// Returns at most `limit` rows; callers continue with
-    /// `dump_page(rows.last().map(|r| r.fid), limit)` until the result
+    /// `legacy_lustre_dump_page(rows.last().map(|r| r.fid), limit)` until the result
     /// is shorter than `limit`.
-    pub async fn dump_page(&self, after: Option<LuFid>, limit: u64) -> Result<Vec<EntryRow>> {
+    #[tracing::instrument(name = "store.legacy_lustre_dump_page", skip(self))]
+    pub async fn legacy_lustre_dump_page(&self, after: Option<LuFid>, limit: u64) -> Result<Vec<EntryRow>> {
         let sql = "SELECT fid, parent_fid, name, kind, size, blocks, uid, gid, projid, \
                    mode, nlink, atime, mtime, ctime, stripe_count, stripe_size, \
                    pool_name, sm_status, last_seen, depth \
@@ -1300,6 +1758,71 @@ impl EntryStore {
             .await?;
         rows.iter().map(row_to_entry).collect()
     }
+}
+
+async fn upsert_scoped_entry_tx(tx: &mut sqlx::Transaction<'_, MySql>, entry: &ScopedEntryRow) -> Result<()> {
+    let (object_kind, object_id) = encode_object_id(*entry.key.object());
+    let (parent_kind, parent_id) = match entry.parent.as_ref() {
+        Some(parent) => {
+            if parent.filesystem() != entry.key.filesystem() {
+                return Err(StoreError::InvalidObjectIdentity(
+                    "entry parent belongs to another filesystem",
+                ));
+            }
+            let (kind, id) = encode_object_id(*parent.object());
+            (Some(kind), Some(id))
+        }
+        None => (None, None),
+    };
+    let fid = match entry.key.object() {
+        ObjectId::Lustre(fid) => Some(fid_codec::encode(fid)),
+        ObjectId::JuiceFs(_) => None,
+    };
+    let entry_data = serde_json::to_string(entry)?;
+    let sm_status = serde_json::to_string(&entry.sm_status)?;
+    sqlx::query(
+        r"INSERT INTO scoped_entries
+            (filesystem_id, object_kind, object_id, entry_data, parent_kind, parent_id, fid,
+             name, kind, size, blocks, uid, gid, projid, mode, nlink, atime, mtime, ctime,
+             stripe_count, stripe_size, pool_name, sm_status, last_seen, depth)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            entry_data = VALUES(entry_data), parent_kind = VALUES(parent_kind), parent_id = VALUES(parent_id),
+            fid = VALUES(fid), name = VALUES(name), kind = VALUES(kind), size = VALUES(size),
+            blocks = VALUES(blocks), uid = VALUES(uid), gid = VALUES(gid), projid = VALUES(projid),
+            mode = VALUES(mode), nlink = VALUES(nlink), atime = VALUES(atime), mtime = VALUES(mtime),
+            ctime = VALUES(ctime), stripe_count = VALUES(stripe_count), stripe_size = VALUES(stripe_size),
+            pool_name = VALUES(pool_name), sm_status = VALUES(sm_status), last_seen = VALUES(last_seen),
+            depth = VALUES(depth)",
+    )
+    .bind(entry.key.filesystem().as_str())
+    .bind(object_kind)
+    .bind(object_id.as_slice())
+    .bind(entry_data)
+    .bind(parent_kind)
+    .bind(parent_id.as_ref().map(|id| id.as_slice()))
+    .bind(fid.as_ref().map(|id| id.as_slice()))
+    .bind(entry.name.as_ref())
+    .bind(entry.kind as u8)
+    .bind(entry.size)
+    .bind(entry.blocks)
+    .bind(entry.uid)
+    .bind(entry.gid)
+    .bind(entry.projid)
+    .bind(entry.mode)
+    .bind(entry.nlink)
+    .bind(entry.atime)
+    .bind(entry.mtime)
+    .bind(entry.ctime)
+    .bind(entry.stripe_count)
+    .bind(entry.stripe_size)
+    .bind(&entry.pool_name)
+    .bind(sm_status)
+    .bind(entry.last_seen)
+    .bind(entry.depth)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 // ── MariaDB CursorStore implementation ──────────────────────────────────
@@ -1403,6 +1926,7 @@ fn row_to_entry(row: &sqlx::mysql::MySqlRow) -> Result<EntryRow> {
         ctime: row.try_get("ctime")?,
         stripe_count: row.try_get("stripe_count")?,
         stripe_size: row.try_get("stripe_size")?,
+        stripe_items: Vec::new(),
         pool_name: row.try_get("pool_name")?,
         sm_status,
         last_seen: row.try_get("last_seen")?,

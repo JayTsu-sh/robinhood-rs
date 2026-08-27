@@ -682,6 +682,7 @@ mod tests {
             ctime: 1_775_000_000,
             stripe_count: None,
             stripe_size: None,
+            stripe_items: Vec::new(),
             pool_name: None,
             sm_status: serde_json::json!({}),
             last_seen: 1_775_955_820,

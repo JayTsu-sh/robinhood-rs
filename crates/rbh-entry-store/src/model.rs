@@ -176,10 +176,19 @@ pub struct ScopedEntryRow {
     pub ctime: i64,
     pub stripe_count: Option<u16>,
     pub stripe_size: Option<u32>,
+    #[serde(default)]
+    pub stripe_items: Vec<u32>,
     pub pool_name: Option<String>,
     pub sm_status: serde_json::Value,
     pub last_seen: i64,
     pub depth: u32,
+}
+
+/// A removed object retained inside one filesystem's identity domain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopedRemovedEntry {
+    pub entry: ScopedEntryRow,
+    pub rm_time: i64,
 }
 
 /// One namespace link. Objects and links are deliberately stored separately:
@@ -245,11 +254,48 @@ impl ScopedEntryRow {
             ctime: entry.ctime,
             stripe_count: entry.stripe_count,
             stripe_size: entry.stripe_size,
+            stripe_items: entry.stripe_items.clone(),
             pool_name: entry.pool_name.clone(),
             sm_status: entry.sm_status.clone(),
             last_seen: entry.last_seen,
             depth: entry.depth,
         }
+    }
+
+    /// Project a scoped Lustre row into the pre-multi-filesystem shape used by
+    /// existing Lustre-only action adapters. JuiceFS objects are never coerced.
+    pub fn to_lustre_compat(&self) -> Option<EntryRow> {
+        let ObjectId::Lustre(fid) = *self.key.object() else {
+            return None;
+        };
+        let parent_fid = match self.parent.as_ref().map(|key| *key.object()) {
+            Some(ObjectId::Lustre(fid)) => Some(fid),
+            Some(ObjectId::JuiceFs(_)) => return None,
+            None => None,
+        };
+        Some(EntryRow {
+            fid,
+            parent_fid,
+            name: self.name.clone(),
+            kind: self.kind,
+            size: self.size,
+            blocks: self.blocks,
+            uid: self.uid,
+            gid: self.gid,
+            projid: self.projid,
+            mode: self.mode,
+            nlink: self.nlink,
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: self.ctime,
+            stripe_count: self.stripe_count,
+            stripe_size: self.stripe_size,
+            stripe_items: self.stripe_items.clone(),
+            pool_name: self.pool_name.clone(),
+            sm_status: self.sm_status.clone(),
+            last_seen: self.last_seen,
+            depth: self.depth,
+        })
     }
 }
 
@@ -302,6 +348,9 @@ pub struct EntryRow {
     pub ctime: i64,
     pub stripe_count: Option<u16>,
     pub stripe_size: Option<u32>,
+    /// OST indices in stripe order. Empty when layout metadata is unavailable.
+    #[serde(default)]
+    pub stripe_items: Vec<u32>,
     pub pool_name: Option<String>,
     pub sm_status: serde_json::Value,
     pub last_seen: i64,
@@ -382,6 +431,7 @@ mod tests {
             ctime: 3,
             stripe_count: Some(2),
             stripe_size: Some(4 * 1024 * 1024),
+            stripe_items: vec![0, 1],
             pool_name: Some("pool1".into()),
             sm_status: serde_json::json!({"hsm_state": "archived"}),
             last_seen: 4,

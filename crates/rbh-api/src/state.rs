@@ -29,6 +29,7 @@ pub struct AppState {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanRecord {
     pub id: String,
+    pub filesystem: rbh_entry_store::FileSystemId,
     pub root: String,
     pub since_mtime: Option<i64>,
     pub ignore_globs: Vec<String>,

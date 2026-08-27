@@ -55,6 +55,7 @@ pub fn adapt(
         ctime: entry.ctime,
         stripe_count: None,
         stripe_size: None,
+        stripe_items: Vec::new(),
         pool_name: None,
         sm_status: serde_json::Value::Null,
         last_seen: observed_at,

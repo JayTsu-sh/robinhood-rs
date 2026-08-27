@@ -92,7 +92,7 @@ pub async fn delete_classifier(
 /// Manually run a classifier against all entries in the catalog.
 ///
 /// Loads all entries in pages, evaluates the classifier rules in-memory,
-/// and writes tags via `update_xattr`. Returns `{"classified": N}`.
+/// and writes tags via `legacy_lustre_update_xattr`. Returns `{"classified": N}`.
 pub async fn run_classifier(
     State(state): State<AppState>, Path(id): Path<u64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -103,7 +103,7 @@ pub async fn run_classifier(
         return Ok(Json(serde_json::json!({"classified": 0, "skipped": "disabled"})));
     }
 
-    // Iterate all entries using dump_page (FID-ordered cursor, page size 10k).
+    // Iterate all entries using legacy_lustre_dump_page (FID-ordered cursor, page size 10k).
     const MAX_ENTRIES: u64 = 1_000_000;
     let mut classified: u64 = 0;
     let mut errors: u64 = 0;
@@ -121,7 +121,7 @@ pub async fn run_classifier(
         }
         let batch = state
             .entry_store
-            .dump_page(after, 10_000)
+            .legacy_lustre_dump_page(after, 10_000)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         if batch.is_empty() {
@@ -131,12 +131,16 @@ pub async fn run_classifier(
         scanned += batch.len() as u64;
         for entry in &batch {
             if let Some(tags) = evaluate_classifier(def, entry) {
-                match state.entry_store.update_xattr(&entry.fid, tags, &def.manages).await {
+                match state
+                    .entry_store
+                    .legacy_lustre_update_xattr(&entry.fid, tags, &def.manages)
+                    .await
+                {
                     Ok(()) => classified += 1,
                     Err(e) => {
                         errors += 1;
                         if errors <= 10 || errors.is_multiple_of(1000) {
-                            tracing::warn!(fid = %entry.fid, error = %e, errors, "update_xattr failed during classifier run");
+                            tracing::warn!(fid = %entry.fid, error = %e, errors, "legacy_lustre_update_xattr failed during classifier run");
                         }
                     }
                 }

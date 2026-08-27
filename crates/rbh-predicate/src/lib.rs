@@ -48,8 +48,8 @@ pub enum Predicate {
     /// Match entries whose pool_name equals the given string.
     InPool { pool: String },
     /// Match entries with a stripe on any of the given OST indices.
-    /// Generated SQL is `EXISTS (SELECT 1 FROM stripe_items s WHERE
-    /// s.fid = entries.fid AND s.ost_index IN (?, ?, …))`.
+    /// Generated SQL is scoped by the entry's filesystem and native object id
+    /// through `scoped_stripe_items`.
     OnOst { osts: Vec<u32> },
     /// Match entries whose `sm_status.hsm_state` JSON field equals the
     /// given string (e.g. `"archived"`, `"released"`, `"none"`). Uses

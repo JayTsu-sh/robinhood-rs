@@ -67,11 +67,11 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!("database migrations complete");
 
     // 4. Initial fs-scan if catalog is empty.
-    let count = entry_store.entry_count().await.unwrap_or(0);
+    let count = entry_store.scoped_entry_count(&filesystem_id).await.unwrap_or(0);
     if count == 0 {
         tracing::info!(filesystem = %filesystem_id, mount = %mount_path.display(), "catalog empty — running initial fs-scan");
         run_initial_scan(&entry_store, &filesystem_id, &mount_path).await;
-        let new_count = entry_store.entry_count().await.unwrap_or(0);
+        let new_count = entry_store.scoped_entry_count(&filesystem_id).await.unwrap_or(0);
         tracing::info!(filesystem = %filesystem_id, entries = new_count, "initial scan complete");
     } else {
         tracing::info!(filesystem = %filesystem_id, entries = count, "catalog already populated");

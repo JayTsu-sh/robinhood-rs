@@ -129,7 +129,10 @@ impl ThresholdChecker {
 
                 let (fired, fire_target) = match params.measure {
                     Measure::Count { high } => {
-                        let c = self.entry_store.count_where(&where_clause, &store_params).await?;
+                        let c = self
+                            .entry_store
+                            .count_scoped_where(&self.filesystem_id, &where_clause, &store_params)
+                            .await?;
                         tracing::debug!(
                             policy_id = policy.id,
                             trigger_idx = idx,
@@ -141,7 +144,10 @@ impl ThresholdChecker {
                     }
                     Measure::Volume { high } => {
                         // SUM(size) WHERE scope — use a one-shot raw query.
-                        let v = self.entry_store.sum_size_where(&where_clause, &store_params).await?;
+                        let v = self
+                            .entry_store
+                            .sum_scoped_size_where(&self.filesystem_id, &where_clause, &store_params)
+                            .await?;
                         tracing::debug!(
                             policy_id = policy.id,
                             trigger_idx = idx,
