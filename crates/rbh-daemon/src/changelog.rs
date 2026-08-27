@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use lustre_api::LustreApi;
 use lustre_changelog::ChangelogEvent;
 use rbh_change_source::{BackendChange, Change, ChangeSource, ContentChangeKind, MetadataChangeKind};
-use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId, ObjectId};
+use rbh_entry_store::model::{EntryKey, EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow};
 use rbh_entry_store::store::EntryStore;
 
 /// Run the changelog ingest loop. Consumes batches from the listener,
@@ -96,6 +96,17 @@ pub async fn ingest_loop(
         }
 
         for change in &batch.changes {
+            if change_object(change).backend() == rbh_entry_store::BackendKind::JuiceFs {
+                match apply_juicefs_change(&entry_store, &filesystem_id, &mount_path, change).await {
+                    Ok(()) => applied += 1,
+                    Err(error) => {
+                        errors += 1;
+                        tracing::error!(%error, "failed to apply JuiceFS catalog change");
+                        break;
+                    }
+                }
+                continue;
+            }
             let event = match lustre_event(change) {
                 Ok(event) => event,
                 Err(error) => {
@@ -164,6 +175,180 @@ pub async fn ingest_loop(
     }
 
     tracing::info!("changelog ingest loop exiting");
+}
+
+fn change_object(change: &Change) -> ObjectId {
+    match change {
+        Change::Created { object, .. }
+        | Change::Hardlinked { object, .. }
+        | Change::Removed { object, .. }
+        | Change::Renamed { object, .. }
+        | Change::MetadataChanged { object, .. }
+        | Change::ContentChanged { object, .. }
+        | Change::Backend(BackendChange::LustreHsm { object, .. })
+        | Change::Backend(BackendChange::LustreLayout { object, .. }) => *object,
+    }
+}
+
+async fn apply_juicefs_change(
+    store: &EntryStore, filesystem: &FileSystemId, mount: &Path, change: &Change,
+) -> anyhow::Result<()> {
+    let object = change_object(change);
+    let key = EntryKey::new(filesystem.clone(), object);
+    match change {
+        Change::Created {
+            parent,
+            name,
+            kind,
+            metadata,
+            time,
+            ..
+        } => {
+            let parent_key = EntryKey::new(filesystem.clone(), *parent);
+            let path = juicefs_child_path(store, mount, &parent_key, name).await?;
+            let live = tokio::fs::symlink_metadata(&path).await.ok();
+            if let Some(live) = &live
+                && live.ino() != object_inode(object)?
+            {
+                anyhow::bail!("JuiceFS inode changed before CREATE apply: {}", path.display());
+            }
+            let (uid, gid, mode) = live
+                .as_ref()
+                .map(|value| (value.uid(), value.gid(), value.mode()))
+                .or_else(|| metadata.map(|value| (value.uid, value.gid, value.mode)))
+                .ok_or_else(|| anyhow::anyhow!("CREATE has neither live nor recorded metadata"))?;
+            store
+                .upsert_scoped_entry(&ScopedEntryRow {
+                    key,
+                    parent: Some(parent_key),
+                    name: name.clone(),
+                    kind: *kind,
+                    size: live.as_ref().map_or(0, |value| value.size()),
+                    blocks: live.as_ref().map_or(0, |value| value.blocks()),
+                    uid,
+                    gid,
+                    projid: 0,
+                    mode,
+                    nlink: live.as_ref().map_or(1, |value| value.nlink() as u32),
+                    atime: live.as_ref().map_or(*time, |value| value.atime()),
+                    mtime: live.as_ref().map_or(*time, |value| value.mtime()),
+                    ctime: live.as_ref().map_or(*time, |value| value.ctime()),
+                    stripe_count: None,
+                    stripe_size: None,
+                    pool_name: None,
+                    sm_status: serde_json::Value::Null,
+                    last_seen: *time,
+                    depth: path
+                        .strip_prefix(mount)
+                        .map_or(0, |value| value.components().count() as u32),
+                })
+                .await?;
+            Ok(())
+        }
+        Change::Renamed { parent, name, time, .. } => {
+            let mut entry = store
+                .get_scoped_entry(&key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("MOVE references an uncataloged inode"))?;
+            entry.parent = Some(EntryKey::new(filesystem.clone(), *parent));
+            entry.name = name.clone();
+            entry.ctime = *time;
+            entry.last_seen = *time;
+            store.upsert_scoped_entry(&entry).await?;
+            Ok(())
+        }
+        Change::Removed {
+            parent,
+            name,
+            directory,
+            ..
+        } => {
+            if let Some(mut entry) = store.get_scoped_entry(&key).await? {
+                let removed_parent = EntryKey::new(filesystem.clone(), *parent);
+                let removes_cataloged_edge = entry.parent.as_ref() == Some(&removed_parent) && entry.name == *name;
+                if !directory && !removes_cataloged_edge {
+                    let path = juicefs_object_path(store, mount, &key).await?;
+                    let live = tokio::fs::symlink_metadata(&path).await?;
+                    if live.ino() != object_inode(object)? {
+                        anyhow::bail!("JuiceFS inode changed before UNLINK apply: {}", path.display());
+                    }
+                    entry.nlink = live.nlink() as u32;
+                    entry.last_seen = change.time();
+                    store.upsert_scoped_entry(&entry).await?;
+                } else if !directory && entry.nlink > 1 {
+                    anyhow::bail!("UNLINK removed the only cataloged path for a multiply linked inode");
+                } else {
+                    store.remove_scoped_entry(&key).await?;
+                }
+            }
+            Ok(())
+        }
+        Change::MetadataChanged { .. } | Change::ContentChanged { .. } => {
+            let mut entry = store
+                .get_scoped_entry(&key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("change references an uncataloged inode"))?;
+            let path = juicefs_object_path(store, mount, &key).await?;
+            let live = tokio::fs::symlink_metadata(&path).await?;
+            if live.ino() != object_inode(object)? {
+                anyhow::bail!("JuiceFS inode changed before metadata apply: {}", path.display());
+            }
+            entry.size = live.size();
+            entry.blocks = live.blocks();
+            entry.uid = live.uid();
+            entry.gid = live.gid();
+            entry.mode = live.mode();
+            entry.nlink = live.nlink() as u32;
+            entry.atime = live.atime();
+            entry.mtime = live.mtime();
+            entry.ctime = live.ctime();
+            entry.last_seen = change.time();
+            store.upsert_scoped_entry(&entry).await?;
+            Ok(())
+        }
+        Change::Hardlinked { .. } => anyhow::bail!("JuiceFS hard-link catalog edges are not implemented"),
+        Change::Backend(_) => anyhow::bail!("backend event cannot belong to JuiceFS"),
+    }
+}
+
+fn object_inode(object: ObjectId) -> anyhow::Result<u64> {
+    match object {
+        ObjectId::JuiceFs(inode) => Ok(inode),
+        ObjectId::Lustre(_) => anyhow::bail!("expected JuiceFS inode"),
+    }
+}
+
+async fn juicefs_child_path(
+    store: &EntryStore, mount: &Path, parent: &EntryKey, name: &Bytes,
+) -> anyhow::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(juicefs_object_path(store, mount, parent)
+        .await?
+        .join(std::ffi::OsString::from_vec(name.to_vec())))
+}
+
+async fn juicefs_object_path(store: &EntryStore, mount: &Path, key: &EntryKey) -> anyhow::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut current = key.clone();
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..1024 {
+        if current.object() == &ObjectId::JuiceFs(1) {
+            let mut path = mount.to_path_buf();
+            for name in names.iter().rev() {
+                path.push(std::ffi::OsString::from_vec(name.clone()));
+            }
+            return Ok(path);
+        }
+        let entry = store
+            .get_scoped_entry(&current)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing JuiceFS namespace parent"))?;
+        names.push(entry.name.to_vec());
+        current = entry
+            .parent
+            .ok_or_else(|| anyhow::anyhow!("JuiceFS namespace chain has no root"))?;
+    }
+    anyhow::bail!("JuiceFS namespace chain exceeds 1024 parents")
 }
 
 /// Run all enabled classifiers against a single entry in-memory and write back any tags.
@@ -235,6 +420,8 @@ fn lustre_event(change: &Change) -> anyhow::Result<ChangelogEvent> {
         },
         Change::Removed {
             object,
+            parent,
+            name,
             last_link,
             directory,
             ..
@@ -243,27 +430,32 @@ fn lustre_event(change: &Change) -> anyhow::Result<ChangelogEvent> {
             if *directory {
                 ChangelogEvent::Rmdir {
                     fid,
-                    parent: lustre_api::LuFid::default(),
-                    name: Bytes::new(),
+                    parent: lustre_fid(*parent)?,
+                    name: name.clone(),
                 }
             } else {
                 ChangelogEvent::Unlink {
                     fid,
-                    parent: lustre_api::LuFid::default(),
-                    name: Bytes::new(),
+                    parent: lustre_fid(*parent)?,
+                    name: name.clone(),
                     last_link: *last_link,
                     hsm_exists: false,
                 }
             }
         }
         Change::Renamed {
-            object, parent, name, ..
+            object,
+            source_parent,
+            source_name,
+            parent,
+            name,
+            ..
         } => ChangelogEvent::Rename {
             fid: lustre_fid(*object)?,
             parent: lustre_fid(*parent)?,
             name: name.clone(),
-            src_parent: lustre_api::LuFid::default(),
-            src_name: Bytes::new(),
+            src_parent: lustre_fid(*source_parent)?,
+            src_name: source_name.clone(),
         },
         Change::MetadataChanged { object, kind, .. } => match kind {
             MetadataChangeKind::Attributes => ChangelogEvent::SetAttr {
@@ -546,6 +738,10 @@ async fn apply_hsm_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use rbh_change_source::{ChangeBatch, ChangeSourceError, Checkpoint};
+    use rbh_entry_store::{BackendCapabilities, BackendKind, FileSystemConfig};
+    use tokio::sync::oneshot;
 
     #[test]
     fn archive_event_sets_archived_state() {
@@ -586,6 +782,130 @@ mod tests {
         let p = build_hsm_patch(5, 0, 0, 0);
         assert_eq!(p["hsm_last_op"], "state");
         assert!(p.get("hsm_state").is_none());
+    }
+
+    struct OneBatchSource {
+        batch: Option<ChangeBatch>,
+        committed: Option<oneshot::Sender<Checkpoint>>,
+    }
+
+    #[async_trait]
+    impl ChangeSource for OneBatchSource {
+        async fn next_batch(&mut self) -> Result<Option<ChangeBatch>, ChangeSourceError> {
+            Ok(self.batch.take())
+        }
+
+        async fn commit(&mut self, checkpoint: Checkpoint) -> Result<(), ChangeSourceError> {
+            if let Some(committed) = self.committed.take() {
+                let _ = committed.send(checkpoint);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn juicefs_checkpoint_is_committed_after_catalog_write() {
+        if std::env::var("RBH_INTEGRATION").as_deref() != Ok("1") {
+            return;
+        }
+        let url = "mysql://root@localhost/rbh_entries_test";
+        let store = EntryStore::connect(url).await.unwrap();
+        let filesystem = FileSystemId::new("jfs-ack-test").unwrap();
+        store
+            .register_filesystem(&FileSystemConfig {
+                id: filesystem.clone(),
+                backend: BackendKind::JuiceFs,
+                mount_path: "/mnt/jfs".into(),
+                capabilities: BackendCapabilities {
+                    changelog: true,
+                    namespace: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let checkpoint = Checkpoint {
+            source: "jfs-nfs".into(),
+            position: 77,
+        };
+        let (commit_tx, commit_rx) = oneshot::channel();
+        ingest_loop(
+            Box::new(OneBatchSource {
+                batch: Some(ChangeBatch {
+                    filesystem: filesystem.clone(),
+                    changes: vec![Change::Created {
+                        object: ObjectId::JuiceFs(42),
+                        parent: ObjectId::JuiceFs(1),
+                        name: Bytes::from_static(b"durable-before-ack"),
+                        kind: EntryKind::File,
+                        metadata: Some(rbh_change_source::CreatedMetadata {
+                            uid: 1000,
+                            gid: 1000,
+                            mode: 0o644,
+                        }),
+                        time: 1_700_000_000,
+                    }],
+                    checkpoint: checkpoint.clone(),
+                }),
+                committed: Some(commit_tx),
+            }),
+            store.clone(),
+            filesystem.clone(),
+            "/mnt/jfs".into(),
+            CancellationToken::new(),
+            Default::default(),
+        )
+        .await;
+        assert_eq!(commit_rx.await.unwrap(), checkpoint);
+        let persisted = store
+            .get_scoped_entry(&EntryKey::new(filesystem, ObjectId::JuiceFs(42)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.name, Bytes::from_static(b"durable-before-ack"));
+
+        let rejected_filesystem = FileSystemId::new("jfs-rejected-test").unwrap();
+        store
+            .register_filesystem(&FileSystemConfig {
+                id: rejected_filesystem.clone(),
+                backend: BackendKind::Lustre,
+                mount_path: "/mnt/lustre".into(),
+                capabilities: BackendCapabilities::default(),
+            })
+            .await
+            .unwrap();
+        let (should_not_commit, commit_rx) = oneshot::channel();
+        ingest_loop(
+            Box::new(OneBatchSource {
+                batch: Some(ChangeBatch {
+                    filesystem: rejected_filesystem.clone(),
+                    changes: vec![Change::Created {
+                        object: ObjectId::JuiceFs(99),
+                        parent: ObjectId::JuiceFs(1),
+                        name: Bytes::from_static(b"must-not-ack"),
+                        kind: EntryKind::File,
+                        metadata: Some(rbh_change_source::CreatedMetadata {
+                            uid: 1000,
+                            gid: 1000,
+                            mode: 0o644,
+                        }),
+                        time: 1_700_000_001,
+                    }],
+                    checkpoint: Checkpoint {
+                        source: "jfs-nfs".into(),
+                        position: 78,
+                    },
+                }),
+                committed: Some(should_not_commit),
+            }),
+            store,
+            rejected_filesystem,
+            "/mnt/jfs".into(),
+            CancellationToken::new(),
+            Default::default(),
+        )
+        .await;
+        assert!(commit_rx.await.is_err(), "failed catalog write must not commit or ACK");
     }
 }
 

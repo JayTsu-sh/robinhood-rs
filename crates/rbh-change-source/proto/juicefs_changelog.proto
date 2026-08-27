@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package robinhood.juicefs.v1;
+
+// Wire-compatible copy of the deployed JuiceFS changelog Agent contract.
+service Changelog {
+  rpc Watch(WatchRequest) returns (stream ChangelogRecord);
+  rpc Ack(AckRequest) returns (AckResponse);
+}
+
+message WatchRequest {
+  string volume = 1;
+}
+
+message ChangelogRecord {
+  string volume = 1;
+  int64 version = 2;
+  string entry = 3;
+}
+
+message AckRequest {
+  string volume = 1;
+  int64 version = 2;
+}
+
+message AckResponse {}

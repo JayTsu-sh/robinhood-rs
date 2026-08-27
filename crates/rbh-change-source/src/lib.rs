@@ -6,6 +6,13 @@ use lustre_changelog::{ChangelogEvent, EventAck, ListenerHandle};
 use rbh_entry_store::model::{EntryKind, FileSystemId, ObjectId};
 use std::collections::VecDeque;
 
+mod juicefs;
+pub use juicefs::JuiceFsChangeSource;
+
+pub mod juicefs_proto {
+    tonic::include_proto!("robinhood.juicefs.v1");
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub source: String,
@@ -26,6 +33,7 @@ pub enum Change {
         parent: ObjectId,
         name: Bytes,
         kind: EntryKind,
+        metadata: Option<CreatedMetadata>,
         time: i64,
     },
     Hardlinked {
@@ -36,12 +44,16 @@ pub enum Change {
     },
     Removed {
         object: ObjectId,
+        parent: ObjectId,
+        name: Bytes,
         last_link: bool,
         directory: bool,
         time: i64,
     },
     Renamed {
         object: ObjectId,
+        source_parent: ObjectId,
+        source_name: Bytes,
         parent: ObjectId,
         name: Bytes,
         time: i64,
@@ -59,6 +71,13 @@ pub enum Change {
         time: i64,
     },
     Backend(BackendChange),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedMetadata {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +162,16 @@ pub enum ChangeSourceError {
     PendingCheckpoint,
     #[error("checkpoint belongs to {actual}, expected {expected}")]
     WrongSource { expected: String, actual: String },
+    #[error("gRPC transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+    #[error("gRPC request failed: {0}")]
+    Rpc(#[from] tonic::Status),
+    #[error("malformed JuiceFS changelog record: {0}")]
+    MalformedRecord(String),
+    #[error("record belongs to volume {actual}, expected {expected}")]
+    WrongVolume { expected: String, actual: String },
+    #[error("invalid changelog version {actual}; last acknowledged was {last}")]
+    OutOfOrder { last: u64, actual: i64 },
 }
 
 #[async_trait]
@@ -239,6 +268,7 @@ fn normalize_lustre(event: ChangelogEvent, time: i64) -> Change {
             parent: lustre(parent),
             name,
             kind: EntryKind::File,
+            metadata: None,
             time,
         },
         ChangelogEvent::Mkdir { fid, parent, name, .. } => Change::Created {
@@ -246,6 +276,7 @@ fn normalize_lustre(event: ChangelogEvent, time: i64) -> Change {
             parent: lustre(parent),
             name,
             kind: EntryKind::Directory,
+            metadata: None,
             time,
         },
         ChangelogEvent::Mknod { fid, parent, name, .. } => Change::Created {
@@ -253,6 +284,7 @@ fn normalize_lustre(event: ChangelogEvent, time: i64) -> Change {
             parent: lustre(parent),
             name,
             kind: EntryKind::File,
+            metadata: None,
             time,
         },
         ChangelogEvent::Softlink { fid, parent, name } => Change::Created {
@@ -260,6 +292,7 @@ fn normalize_lustre(event: ChangelogEvent, time: i64) -> Change {
             parent: lustre(parent),
             name,
             kind: EntryKind::Symlink,
+            metadata: None,
             time,
         },
         ChangelogEvent::Hardlink { fid, parent, name } => Change::Hardlinked {
@@ -268,20 +301,38 @@ fn normalize_lustre(event: ChangelogEvent, time: i64) -> Change {
             name,
             time,
         },
-        ChangelogEvent::Unlink { fid, last_link, .. } => Change::Removed {
+        ChangelogEvent::Unlink {
+            fid,
+            parent,
+            name,
+            last_link,
+            ..
+        } => Change::Removed {
             object: lustre(fid),
+            parent: lustre(parent),
+            name,
             last_link,
             directory: false,
             time,
         },
-        ChangelogEvent::Rmdir { fid, .. } => Change::Removed {
+        ChangelogEvent::Rmdir { fid, parent, name } => Change::Removed {
             object: lustre(fid),
+            parent: lustre(parent),
+            name,
             last_link: true,
             directory: true,
             time,
         },
-        ChangelogEvent::Rename { fid, parent, name, .. } => Change::Renamed {
+        ChangelogEvent::Rename {
+            fid,
+            parent,
+            name,
+            src_parent,
+            src_name,
+        } => Change::Renamed {
             object: lustre(fid),
+            source_parent: lustre(src_parent),
+            source_name: src_name,
             parent: lustre(parent),
             name,
             time,

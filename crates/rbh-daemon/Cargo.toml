@@ -23,8 +23,12 @@ axum = { version = "0.8" }
 bytes = { workspace = true }
 sd-notify = "0.4"
 serde_json = { workspace = true }
+serde = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

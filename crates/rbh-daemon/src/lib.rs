@@ -143,6 +143,56 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
+    for runtime in runtime_registry
+        .iter()
+        .filter(|runtime| runtime.config.backend == rbh_entry_store::BackendKind::JuiceFs)
+    {
+        let Some(agent) = runtime.changelog_agent.as_ref() else {
+            tracing::warn!(filesystem = %runtime.config.id, "JuiceFS runtime has no changelog_agent configuration");
+            continue;
+        };
+        let ingest_store = entry_store.clone();
+        let ingest_filesystem = runtime.config.id.clone();
+        let ingest_mount = runtime.config.mount_path.clone();
+        let ingest_cancel = daemon_cancel.clone();
+        let classifier_cache = classifier_cache.clone();
+        let endpoint = agent.endpoint.clone();
+        let volume = agent.volume.clone();
+        tokio::spawn(async move {
+            loop {
+                if ingest_cancel.is_cancelled() {
+                    break;
+                }
+                match rbh_change_source::JuiceFsChangeSource::connect(
+                    ingest_filesystem.clone(),
+                    endpoint.clone(),
+                    volume.clone(),
+                )
+                .await
+                {
+                    Ok(source) => {
+                        changelog::ingest_loop(
+                            Box::new(source),
+                            ingest_store.clone(),
+                            ingest_filesystem.clone(),
+                            ingest_mount.clone(),
+                            ingest_cancel.clone(),
+                            classifier_cache.clone(),
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        tracing::error!(filesystem = %ingest_filesystem, %endpoint, %error, "JuiceFS Agent unavailable; retrying")
+                    }
+                }
+                tokio::select! {
+                    _ = ingest_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
+            }
+        });
+    }
+
     // 6. Set up scheduler-rs.
     let scheduler_store = Arc::new(
         scheduler_rs::store::MysqlStore::new(pool.clone())

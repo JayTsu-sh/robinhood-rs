@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use rbh_entry_store::{BackendCapabilities, BackendKind, FileSystemConfig, FileSystemId, FileSystemIdError};
+use serde::Deserialize;
 
 const DEFAULT_LUSTRE_ID: &str = "lustre";
 const DEFAULT_LUSTRE_MOUNT: &str = "/lustre";
@@ -8,6 +9,21 @@ const DEFAULT_LUSTRE_MOUNT: &str = "/lustre";
 #[derive(Debug, Clone)]
 pub struct FileSystemRuntime {
     pub config: FileSystemConfig,
+    pub changelog_agent: Option<JuiceFsAgentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct JuiceFsAgentConfig {
+    pub endpoint: String,
+    pub volume: String,
+}
+
+#[derive(Deserialize)]
+struct RuntimeInput {
+    #[serde(flatten)]
+    config: FileSystemConfig,
+    #[serde(default)]
+    changelog_agent: Option<JuiceFsAgentConfig>,
 }
 
 impl FileSystemRuntime {
@@ -34,13 +50,21 @@ impl RuntimeRegistry {
         explicit_json: Option<&str>, legacy_mount: Option<&str>, legacy_id: Option<&str>,
     ) -> Result<Self, RuntimeConfigError> {
         let configs = match explicit_json.filter(|value| !value.trim().is_empty()) {
-            Some(json) => {
-                serde_json::from_str::<Vec<FileSystemConfig>>(json).map_err(RuntimeConfigError::InvalidRegistryJson)?
-            }
-            None => vec![legacy_lustre_config(legacy_mount, legacy_id)?],
+            Some(json) => serde_json::from_str::<Vec<RuntimeInput>>(json)
+                .map_err(RuntimeConfigError::InvalidRegistryJson)?
+                .into_iter()
+                .map(|input| FileSystemRuntime {
+                    config: input.config,
+                    changelog_agent: input.changelog_agent,
+                })
+                .collect(),
+            None => vec![FileSystemRuntime {
+                config: legacy_lustre_config(legacy_mount, legacy_id)?,
+                changelog_agent: None,
+            }],
         };
 
-        let runtimes: Vec<_> = configs.into_iter().map(|config| FileSystemRuntime { config }).collect();
+        let runtimes = configs;
         let lustre: Vec<_> = runtimes
             .iter()
             .enumerate()
@@ -125,6 +149,25 @@ mod tests {
         assert_eq!(registry.lustre().config.id.as_str(), "lustre-no-hsm");
         assert!(!registry.lustre().config.capabilities.hsm);
         assert!(!registry.lustre().should_start_hsm_poller(30));
+    }
+
+    #[test]
+    fn explicit_juicefs_runtime_carries_plaintext_agent_configuration() {
+        let json = r#"[
+          {"id":"lustre","backend":"lustre","mount_path":"/lustre","capabilities":{"changelog":true,"namespace":true,"purge":true,"hsm":true,"stripe":true,"ost":true}},
+          {"id":"jfs-nfs","backend":"juice_fs","mount_path":"/jfs","capabilities":{"changelog":true,"namespace":true,"purge":true,"hsm":false,"stripe":false,"ost":false},"changelog_agent":{"endpoint":"http://10.131.9.41:9443","volume":"jfs-nfs"}}
+        ]"#;
+        let registry = RuntimeRegistry::resolve(Some(json), None, None).unwrap();
+        let juicefs = registry
+            .iter()
+            .find(|runtime| runtime.config.id.as_str() == "jfs-nfs")
+            .unwrap();
+        assert_eq!(juicefs.changelog_agent.as_ref().unwrap().volume, "jfs-nfs");
+        assert_eq!(
+            juicefs.changelog_agent.as_ref().unwrap().endpoint,
+            "http://10.131.9.41:9443"
+        );
+        assert!(!juicefs.config.capabilities.hsm);
     }
 
     #[test]

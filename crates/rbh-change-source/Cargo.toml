@@ -12,9 +12,17 @@ bytes = { workspace = true }
 lustre-api = { path = "../lustre-api" }
 lustre-changelog = { path = "../lustre-changelog" }
 rbh-entry-store = { path = "../rbh-entry-store" }
+prost = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
 tracing = { workspace = true }
 
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
+
 [dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = { workspace = true }

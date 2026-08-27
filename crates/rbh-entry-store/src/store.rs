@@ -228,6 +228,19 @@ impl EntryStore {
         Ok(Some(entry))
     }
 
+    /// Delete one filesystem-scoped catalog entry. Repeating the deletion is
+    /// intentionally harmless for replayed changelog records.
+    pub async fn remove_scoped_entry(&self, key: &EntryKey) -> Result<()> {
+        let (kind, bytes) = encode_object_id(*key.object());
+        sqlx::query("DELETE FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
+            .bind(key.filesystem().as_str())
+            .bind(kind)
+            .bind(bytes.as_slice())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ── CRUD ────────────────────────────────────────────────────────────
 
     /// Insert or update a single entry via `INSERT ... ON DUPLICATE KEY UPDATE`.

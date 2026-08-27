@@ -57,6 +57,9 @@ bitflags = { version = "2", features = ["serde"] }
 bytes = "1"
 base64 = "0.22"
 futures-util = "0.3"
+prost = "0.14.4"
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-prost = "0.14.6"
 
 # Async domain layer (Phase 1b additions).
 tokio-util = { version = "0.7", features = ["rt"] }
