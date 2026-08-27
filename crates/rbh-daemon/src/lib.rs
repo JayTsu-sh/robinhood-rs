@@ -115,9 +115,10 @@ pub async fn run() -> anyhow::Result<()> {
                     let ingest_filesystem = filesystem_id.clone();
                     let ingest_cancel = daemon_cancel.clone();
                     let classifier_cache_cl = classifier_cache.clone();
+                    let source = rbh_change_source::LustreChangeSource::new(ingest_filesystem.clone(), handle);
                     tokio::spawn(async move {
                         changelog::ingest_loop(
-                            handle,
+                            Box::new(source),
                             ingest_store,
                             ingest_filesystem,
                             ingest_mount,

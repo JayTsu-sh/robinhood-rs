@@ -1,0 +1,20 @@
+[package]
+name = "rbh-change-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Backend-neutral filesystem change stream contract and adapters."
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+lustre-api = { path = "../lustre-api" }
+lustre-changelog = { path = "../lustre-changelog" }
+rbh-entry-store = { path = "../rbh-entry-store" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-util = { workspace = true }

@@ -15,6 +15,7 @@
 members = [
     "crates/lustre-api",
     "crates/lustre-changelog",
+    "crates/rbh-change-source",
     "crates/rbh-observability",
     "crates/rbh-entry-store",
     "crates/rbh-predicate",

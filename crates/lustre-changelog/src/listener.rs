@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use lustre_api::{ChangelogEventType, LustreApi, RecView};
 
 use crate::batcher::{BatcherConfig, EventBatch, EventBatcher};
-use crate::cursor::CursorStore;
+use crate::cursor::{CursorError, CursorStore};
 use crate::error::ChangelogError;
 use crate::parse;
 
@@ -177,9 +177,8 @@ fn run_polling_loop(
     let api = LustreApi::new();
     let mut batcher = EventBatcher::new(&cfg.mdt, cfg.batcher.clone());
     let mut ack_state = AckState {
-        last_cleared: start_rec.saturating_sub(1),
-        records_since_commit: 0,
-        last_commit_time: std::time::Instant::now(),
+        last_cleared: -1,
+        pending: (start_rec > 0).then_some(start_rec - 1),
     };
     let mut next_start = start_rec;
 
@@ -302,9 +301,8 @@ fn run_follow_loop(
     let api = LustreApi::new();
     let mut batcher = EventBatcher::new(&cfg.mdt, cfg.batcher.clone());
     let mut ack_state = AckState {
-        last_cleared: start_rec.saturating_sub(1),
-        records_since_commit: 0,
-        last_commit_time: std::time::Instant::now(),
+        last_cleared: -1,
+        pending: (start_rec > 0).then_some(start_rec - 1),
     };
 
     let mut handle = api.open_changelog(&cfg.mdt, start_rec, cfg.follow)?;
@@ -397,8 +395,7 @@ fn run_follow_loop(
 /// Mutable state tracked across ack processing rounds.
 struct AckState {
     last_cleared: i64,
-    records_since_commit: u64,
-    last_commit_time: std::time::Instant,
+    pending: Option<i64>,
 }
 
 /// Non-blocking drain of pending acks → drive clear_changelog + cursor commits.
@@ -409,52 +406,80 @@ fn process_acks(
 ) {
     while let Ok(ack) = ack_rx.try_recv() {
         let idx = ack.committed_index as i64;
-        if idx > state.last_cleared {
-            match api.clear_changelog(mdt, reader_id, idx) {
-                Ok(()) => {
-                    state.last_cleared = idx;
-                    // M4 fix: only increment on successful clear.
-                    state.records_since_commit += 1;
-                }
-                Err(e) => {
-                    if matches!(&e, lustre_api::LustreApiError::Ffi { errno, .. } if *errno == libc::EINVAL) {
-                        // EINVAL means idx precedes this reader's registration start on
-                        // the MDS (common in drain-mode tests that open from rec 0).
-                        // Advance last_cleared so we don't retry the same index on
-                        // every ack round.
-                        state.last_cleared = idx;
-                        debug!(
-                            mdt,
-                            idx, "clear_changelog EINVAL — pre-registration record, advancing cursor"
-                        );
-                    } else {
-                        warn!(mdt, idx, err = %e, "clear_changelog failed");
-                    }
-                }
-            }
+        if idx > state.last_cleared && state.pending.is_none_or(|pending| idx > pending) {
+            state.pending = Some(idx);
         }
     }
 
-    // Periodic cursor commit: every 1000 records or 5s.
-    let should_commit =
-        state.records_since_commit >= 1000 || state.last_commit_time.elapsed() >= Duration::from_secs(5);
-    // H2 fix: use >= 0 so position 0 is committable.
-    if should_commit && state.last_cleared >= 0 {
-        let idx = state.last_cleared as u64;
-        let store = Arc::clone(cursor_store);
-        let mdt_owned = mdt.to_owned();
-        // H1 fix: use Handle::spawn instead of block_on to avoid panic on
-        // current_thread runtime (used by #[tokio::test]). Fire-and-forget
-        // — cursor commit is best-effort; next startup resumes from the last
-        // successfully committed position.
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            drop(rt.spawn(async move {
-                if let Err(e) = store.commit(&mdt_owned, idx).await {
-                    tracing::warn!(mdt = mdt_owned, idx, err = %e, "cursor commit failed");
-                }
-            }));
+    let Some(idx) = state.pending else {
+        return;
+    };
+
+    // Persist before clearing the MDT. A crash in between is safe: restart
+    // resumes after the durable cursor while the redundant server-side record
+    // is cleared on a later acknowledgement.
+    if let Err(error) = persist_cursor(cursor_store, mdt, idx as u64) {
+        warn!(mdt, idx, %error, "cursor commit failed; retaining checkpoint for retry");
+        return;
+    }
+
+    match api.clear_changelog(mdt, reader_id, idx) {
+        Ok(()) => {
+            state.last_cleared = idx;
+            state.pending = None;
         }
-        state.records_since_commit = 0;
-        state.last_commit_time = std::time::Instant::now();
+        Err(e) => {
+            if matches!(&e, lustre_api::LustreApiError::Ffi { errno, .. } if *errno == libc::EINVAL) {
+                state.last_cleared = idx;
+                state.pending = None;
+                debug!(
+                    mdt,
+                    idx, "clear_changelog EINVAL — pre-registration record, advancing cursor"
+                );
+            } else {
+                warn!(mdt, idx, err = %e, "clear_changelog failed; retaining checkpoint for retry");
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PersistCursorError {
+    #[error("Tokio runtime unavailable while persisting cursor")]
+    Runtime(#[source] tokio::runtime::TryCurrentError),
+    #[error("cursor store rejected checkpoint")]
+    Cursor(#[source] CursorError),
+    #[error("cursor commit task ended without a result")]
+    ResultChannel(#[from] std::sync::mpsc::RecvError),
+}
+
+fn persist_cursor(cursor_store: &Arc<dyn CursorStore>, mdt: &str, idx: u64) -> Result<(), PersistCursorError> {
+    let runtime = tokio::runtime::Handle::try_current().map_err(PersistCursorError::Runtime)?;
+    let store = Arc::clone(cursor_store);
+    let mdt = mdt.to_owned();
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    drop(runtime.spawn(async move {
+        let result = store.commit(&mdt, idx).await;
+        let _ = result_tx.send(result);
+    }));
+    result_rx.recv()?.map_err(PersistCursorError::Cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cursor::MemoryCursorStore;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_is_durable_before_checkpoint_processing_returns() {
+        let store = Arc::new(MemoryCursorStore::new());
+        let trait_store: Arc<dyn CursorStore> = store.clone();
+
+        tokio::task::spawn_blocking(move || persist_cursor(&trait_store, "testfs-MDT0000", 73))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(store.snapshot().get("testfs-MDT0000"), Some(&73));
     }
 }

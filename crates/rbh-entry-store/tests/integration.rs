@@ -247,6 +247,39 @@ async fn remove_entry_moves_to_removed_entries() {
 }
 
 #[tokio::test]
+async fn rename_entry_atomically_replaces_destination() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let parent = LuFid::new(0x200000401, 1, 0);
+    let mut source = make_entry(0x200000401, 2, "source");
+    source.parent_fid = Some(parent);
+    let mut destination = make_entry(0x200000401, 3, "destination");
+    destination.parent_fid = Some(parent);
+    store.upsert_entry(&source).await.unwrap();
+    store.upsert_entry(&destination).await.unwrap();
+
+    source.name = destination.name.clone();
+    store.rename_entry(&source, 1_775_960_000).await.unwrap();
+
+    assert_eq!(
+        store.get_entry(&source.fid).await.unwrap().unwrap().name,
+        destination.name
+    );
+    assert!(store.get_entry(&destination.fid).await.unwrap().is_none());
+    assert!(store.get_removed(&destination.fid).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn cursor_store_mariadb_roundtrip() {
     if !integration_enabled() {
         eprintln!("skipping (set RBH_INTEGRATION=1)");

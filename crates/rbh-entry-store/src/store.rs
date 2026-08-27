@@ -247,6 +247,86 @@ impl EntryStore {
         Ok(())
     }
 
+    /// Atomically apply a rename, including moving an overwritten destination
+    /// to `removed_entries` before updating the source entry.
+    #[tracing::instrument(name = "store.rename_entry", skip(self, entry), fields(fid = %entry.fid))]
+    pub async fn rename_entry(&self, entry: &EntryRow, rm_time: i64) -> Result<()> {
+        let fid_bin = fid_codec::encode(&entry.fid);
+        let parent_bin = entry.parent_fid.as_ref().map(fid_codec::encode);
+        let sm_json = serde_json::to_string(&entry.sm_status)?;
+        let mut tx = self.pool.begin().await?;
+
+        if let Some(parent) = parent_bin.as_ref() {
+            let displaced: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT fid FROM entries WHERE parent_fid = ? AND name = ? AND fid != ? LIMIT 1 FOR UPDATE",
+            )
+            .bind(parent.as_slice())
+            .bind(entry.name.as_ref())
+            .bind(fid_bin.as_slice())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(displaced) = displaced {
+                sqlx::query(
+                    "INSERT INTO removed_entries (fid, parent_fid, name, kind, size, uid, gid, sm_status, rm_time)
+                     SELECT fid, parent_fid, name, kind, size, uid, gid, sm_status, ? FROM entries WHERE fid = ?
+                     ON DUPLICATE KEY UPDATE rm_time = VALUES(rm_time)",
+                )
+                .bind(rm_time)
+                .bind(&displaced)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM names WHERE fid = ?")
+                    .bind(&displaced)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM entries WHERE fid = ?")
+                    .bind(&displaced)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        sqlx::query(
+            r"INSERT INTO entries
+                (fid, parent_fid, name, kind, size, blocks, uid, gid, projid, mode, nlink,
+                 atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen, depth)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                parent_fid = VALUES(parent_fid), name = VALUES(name), kind = VALUES(kind),
+                size = VALUES(size), blocks = VALUES(blocks), uid = VALUES(uid), gid = VALUES(gid),
+                projid = VALUES(projid), mode = VALUES(mode), nlink = VALUES(nlink),
+                atime = VALUES(atime), mtime = VALUES(mtime), ctime = VALUES(ctime),
+                stripe_count = VALUES(stripe_count), stripe_size = VALUES(stripe_size),
+                pool_name = VALUES(pool_name), sm_status = VALUES(sm_status),
+                last_seen = VALUES(last_seen), depth = VALUES(depth)",
+        )
+        .bind(fid_bin.as_slice())
+        .bind(parent_bin.as_ref().map(|value| value.as_slice()))
+        .bind(entry.name.as_ref())
+        .bind(entry.kind as u8)
+        .bind(entry.size)
+        .bind(entry.blocks)
+        .bind(entry.uid)
+        .bind(entry.gid)
+        .bind(entry.projid)
+        .bind(entry.mode)
+        .bind(entry.nlink)
+        .bind(entry.atime)
+        .bind(entry.mtime)
+        .bind(entry.ctime)
+        .bind(entry.stripe_count)
+        .bind(entry.stripe_size)
+        .bind(&entry.pool_name)
+        .bind(&sm_json)
+        .bind(entry.last_seen)
+        .bind(entry.depth)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Get one entry by FID.
     #[tracing::instrument(name = "store.get_entry", skip(self), fields(fid = %fid))]
     pub async fn get_entry(&self, fid: &LuFid) -> Result<Option<EntryRow>> {

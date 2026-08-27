@@ -18,8 +18,9 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use lustre_api::LustreApi;
-use lustre_changelog::{ChangelogEvent, EventAck, ListenerHandle};
-use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId};
+use lustre_changelog::ChangelogEvent;
+use rbh_change_source::{BackendChange, Change, ChangeSource, ContentChangeKind, MetadataChangeKind};
+use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId, ObjectId};
 use rbh_entry_store::store::EntryStore;
 
 /// Run the changelog ingest loop. Consumes batches from the listener,
@@ -28,18 +29,22 @@ use rbh_entry_store::store::EntryStore;
 /// Exits when the listener channel closes or the cancel token fires.
 #[tracing::instrument(name = "changelog.ingest", skip_all, fields(filesystem = %filesystem_id))]
 pub async fn ingest_loop(
-    mut handle: ListenerHandle, entry_store: EntryStore, filesystem_id: FileSystemId, mount_path: PathBuf,
+    mut source: Box<dyn ChangeSource>, entry_store: EntryStore, filesystem_id: FileSystemId, mount_path: PathBuf,
     cancel: CancellationToken, classifier_cache: std::sync::Arc<tokio::sync::RwLock<Vec<rbh_policy::ClassifierRow>>>,
 ) {
     tracing::info!("changelog ingest loop started");
 
     loop {
         let batch = tokio::select! {
-            batch = handle.events.recv() => {
+            batch = source.next_batch() => {
                 match batch {
-                    Some(b) => b,
-                    None => {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
                         tracing::info!("changelog event channel closed");
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "change source failed");
                         break;
                     }
                 }
@@ -50,14 +55,22 @@ pub async fn ingest_loop(
             }
         };
 
-        let mdt = batch.mdt.clone();
-        let max_index = batch.max_index;
-        let event_count = batch.events.len();
+        let mdt = batch.checkpoint.source.clone();
+        let max_index = batch.checkpoint.position;
+        let event_count = batch.changes.len();
+
+        if batch.filesystem != filesystem_id {
+            tracing::error!(
+                expected = %filesystem_id,
+                actual = %batch.filesystem,
+                "change batch routed to the wrong filesystem; checkpoint will not advance"
+            );
+            break;
+        }
 
         tracing::info!(
             mdt = %mdt,
             events = event_count,
-            min_idx = batch.min_index,
             max_idx = max_index,
             "processing changelog batch"
         );
@@ -72,8 +85,8 @@ pub async fn ingest_loop(
         {
             use std::collections::HashMap;
             let mut by_type: HashMap<&'static str, u64> = HashMap::new();
-            for envelope in &batch.events {
-                *by_type.entry(envelope.event.kind_name()).or_insert(0) += 1;
+            for change in &batch.changes {
+                *by_type.entry(change.kind_name()).or_insert(0) += 1;
             }
             for (ty, n) in by_type {
                 rbh_observability::metrics::CHANGELOG_EVENTS
@@ -82,25 +95,46 @@ pub async fn ingest_loop(
             }
         }
 
-        for envelope in &batch.events {
-            match apply_event(&entry_store, &mount_path, &envelope.event, envelope.time).await {
+        for change in &batch.changes {
+            let event = match lustre_event(change) {
+                Ok(event) => event,
+                Err(error) => {
+                    errors += 1;
+                    tracing::error!(%error, "change is incompatible with Lustre runtime");
+                    break;
+                }
+            };
+            let event_time = change.time();
+            match apply_event(&entry_store, &mount_path, &event, event_time).await {
                 Ok(true) => {
                     applied += 1;
                     // Incremental classification: re-classify the affected entry.
-                    let fid = envelope.event.fid();
+                    let fid = event.fid();
                     let classifiers = classifier_cache.read().await;
-                    if !classifiers.is_empty()
-                        && let Ok(Some(row)) = entry_store.get_entry(&fid).await
-                    {
-                        apply_classifiers(&classifiers, &row, &entry_store).await;
+                    if !classifiers.is_empty() {
+                        match entry_store.get_entry(&fid).await {
+                            Ok(Some(row)) => {
+                                if let Err(error) = apply_classifiers(&classifiers, &row, &entry_store).await {
+                                    errors += 1;
+                                    tracing::warn!(%fid, %error, "incremental classification failed");
+                                    break;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                errors += 1;
+                                tracing::warn!(%fid, %error, "failed to reload entry for classification");
+                                break;
+                            }
+                        }
                     }
                 }
                 Ok(false) => skipped += 1,
                 Err(e) => {
                     errors += 1;
                     tracing::warn!(
-                        fid = %envelope.event.fid(),
-                        kind = envelope.event.kind_name(),
+                        fid = %event.fid(),
+                        kind = event.kind_name(),
                         error = %e,
                         "failed to apply changelog event"
                     );
@@ -117,17 +151,14 @@ pub async fn ingest_loop(
             "changelog batch complete"
         );
 
-        // Ack after durable commit.
-        if handle
-            .acks
-            .send(EventAck {
-                mdt,
-                committed_index: max_index,
-            })
-            .await
-            .is_err()
-        {
-            tracing::warn!("ack channel closed — listener may have stopped");
+        if errors > 0 {
+            tracing::error!(errors, "batch was not fully applied; checkpoint will not advance");
+            break;
+        }
+
+        // Commit only after every catalog effect in the batch is durable.
+        if let Err(error) = source.commit(batch.checkpoint).await {
+            tracing::warn!(%error, "checkpoint commit failed — batch will replay");
             break;
         }
     }
@@ -139,24 +170,142 @@ pub async fn ingest_loop(
 async fn apply_classifiers(
     classifiers: &[rbh_policy::ClassifierRow], entry: &rbh_entry_store::model::EntryRow,
     store: &rbh_entry_store::store::EntryStore,
-) {
+) -> anyhow::Result<()> {
     for classifier in classifiers {
         if !classifier.enabled {
             continue;
         }
-        if let Some(tags) = rbh_policy::evaluate_classifier(&classifier.definition, entry)
-            && let Err(e) = store
+        if let Some(tags) = rbh_policy::evaluate_classifier(&classifier.definition, entry) {
+            store
                 .update_xattr(&entry.fid, tags, &classifier.definition.manages)
-                .await
-        {
-            tracing::warn!(
-                fid = %entry.fid,
-                classifier = %classifier.name,
-                error = %e,
-                "update_xattr failed during incremental classification"
-            );
+                .await?;
         }
     }
+    Ok(())
+}
+
+fn lustre_fid(object: ObjectId) -> anyhow::Result<lustre_api::LuFid> {
+    match object {
+        ObjectId::Lustre(fid) => Ok(fid),
+        ObjectId::JuiceFs(inode) => anyhow::bail!("JuiceFS inode {inode} received by Lustre runtime"),
+    }
+}
+
+fn lustre_event(change: &Change) -> anyhow::Result<ChangelogEvent> {
+    Ok(match change {
+        Change::Created {
+            object,
+            parent,
+            name,
+            kind,
+            ..
+        } => {
+            let fid = lustre_fid(*object)?;
+            let parent = lustre_fid(*parent)?;
+            match kind {
+                EntryKind::Directory => ChangelogEvent::Mkdir {
+                    fid,
+                    parent,
+                    name: name.clone(),
+                    jobid: None,
+                    uid: None,
+                    gid: None,
+                },
+                EntryKind::Symlink => ChangelogEvent::Softlink {
+                    fid,
+                    parent,
+                    name: name.clone(),
+                },
+                _ => ChangelogEvent::Create {
+                    fid,
+                    parent,
+                    name: name.clone(),
+                    jobid: None,
+                    uid: None,
+                    gid: None,
+                },
+            }
+        }
+        Change::Hardlinked {
+            object, parent, name, ..
+        } => ChangelogEvent::Hardlink {
+            fid: lustre_fid(*object)?,
+            parent: lustre_fid(*parent)?,
+            name: name.clone(),
+        },
+        Change::Removed {
+            object,
+            last_link,
+            directory,
+            ..
+        } => {
+            let fid = lustre_fid(*object)?;
+            if *directory {
+                ChangelogEvent::Rmdir {
+                    fid,
+                    parent: lustre_api::LuFid::default(),
+                    name: Bytes::new(),
+                }
+            } else {
+                ChangelogEvent::Unlink {
+                    fid,
+                    parent: lustre_api::LuFid::default(),
+                    name: Bytes::new(),
+                    last_link: *last_link,
+                    hsm_exists: false,
+                }
+            }
+        }
+        Change::Renamed {
+            object, parent, name, ..
+        } => ChangelogEvent::Rename {
+            fid: lustre_fid(*object)?,
+            parent: lustre_fid(*parent)?,
+            name: name.clone(),
+            src_parent: lustre_api::LuFid::default(),
+            src_name: Bytes::new(),
+        },
+        Change::MetadataChanged { object, kind, .. } => match kind {
+            MetadataChangeKind::Attributes => ChangelogEvent::SetAttr {
+                fid: lustre_fid(*object)?,
+            },
+            MetadataChangeKind::Xattr => ChangelogEvent::XAttr {
+                fid: lustre_fid(*object)?,
+                xattr_name: Bytes::new(),
+            },
+        },
+        Change::ContentChanged {
+            object,
+            parent,
+            name,
+            kind,
+            ..
+        } => match kind {
+            ContentChangeKind::Data => ChangelogEvent::Close {
+                fid: lustre_fid(*object)?,
+                parent: parent.map(lustre_fid).transpose()?.unwrap_or_default(),
+                name: name.clone(),
+            },
+            ContentChangeKind::Truncate => ChangelogEvent::Truncate {
+                fid: lustre_fid(*object)?,
+            },
+        },
+        Change::Backend(BackendChange::LustreHsm {
+            object,
+            event,
+            flags,
+            error,
+            ..
+        }) => ChangelogEvent::Hsm {
+            fid: lustre_fid(*object)?,
+            hsm_event: *event,
+            hsm_flags: *flags,
+            hsm_error: *error,
+        },
+        Change::Backend(BackendChange::LustreLayout { object, .. }) => ChangelogEvent::Layout {
+            fid: lustre_fid(*object)?,
+        },
+    })
 }
 
 /// Apply a single changelog event to the entry store.
@@ -273,33 +422,17 @@ async fn apply_event(
             // match, we fall back to a name-only search. The fallback handles
             // entries from initial scans or old changelog replays where
             // parent_fid may not yet be set correctly.
-            let displaced = store
-                .lookup_by_parent_name(parent, name)
-                .await
-                .ok()
-                .flatten()
-                .filter(|dfid| *dfid != *fid);
-
-            if let Some(displaced_fid) = displaced {
-                tracing::info!(
-                    displaced_fid = %displaced_fid,
-                    dst_name = %String::from_utf8_lossy(name),
-                    "Rename-overwrite: removing displaced entry"
-                );
-                store.remove_entry(&displaced_fid, event_time).await?;
-            }
-
             let existing = store.get_entry(fid).await?;
             if let Some(mut entry) = existing {
                 entry.parent_fid = Some(*parent);
                 entry.name = name.clone();
                 entry.last_seen = now_secs();
-                store.upsert_entry(&entry).await?;
+                store.rename_entry(&entry, event_time).await?;
                 Ok(true)
             } else {
                 match stat_entry_by_fid(mount, fid, Some(*parent), name.clone(), EntryKind::File).await {
                     Ok(entry) => {
-                        store.upsert_entry(&entry).await?;
+                        store.rename_entry(&entry, event_time).await?;
                         Ok(true)
                     }
                     Err(e) => {
