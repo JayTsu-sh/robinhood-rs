@@ -19,6 +19,8 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyDef {
     pub name: String,
+    /// Exactly one registered filesystem owns evaluation and action dispatch.
+    pub filesystem: rbh_entry_store::FileSystemId,
     pub kind: PolicyKind,
     /// Tag key-value filter — ALL tags must match (AND semantics).
     /// Expands to `AND(Xattr(k1=v1), Xattr(k2=v2), …)` at query time.
@@ -303,6 +305,7 @@ mod tests {
     fn policy_def_serde_roundtrip() {
         let def = PolicyDef {
             name: "archive_cold".to_string(),
+            filesystem: rbh_entry_store::FileSystemId::new("lustre").unwrap(),
             kind: PolicyKind::HsmArchive,
             match_tags: [("tier".to_string(), "cold".to_string())].into(),
             trigger: "fs > 85%".to_string(),
@@ -323,12 +326,107 @@ mod tests {
     #[test]
     fn policy_def_empty_match_tags_is_valid() {
         let json = r#"{
-            "name":"purge_all","kind":"purge",
+            "name":"purge_all","filesystem":"lustre","kind":"purge",
             "trigger":"1h"
         }"#;
         let def: PolicyDef = serde_json::from_str(json).unwrap();
         assert!(def.match_tags.is_empty());
         assert!(def.enabled);
+    }
+
+    #[test]
+    fn policy_definition_requires_exactly_one_filesystem() {
+        let json = r#"{
+            "name":"unscoped","kind":"purge","trigger":"1h"
+        }"#;
+        let error = serde_json::from_str::<PolicyDef>(json).unwrap_err();
+        assert!(error.to_string().contains("filesystem"));
+    }
+
+    #[test]
+    fn juicefs_hsm_policy_is_rejected_with_an_actionable_capability_error() {
+        let def: PolicyDef = serde_json::from_str(
+            r#"{
+              "name":"bad-hsm","filesystem":"juice-a","kind":"hsm_archive",
+              "trigger":"1h","action":{"hsm":{"archive_id":1}}
+            }"#,
+        )
+        .unwrap();
+        let config = rbh_entry_store::FileSystemConfig {
+            id: rbh_entry_store::FileSystemId::new("juice-a").unwrap(),
+            backend: rbh_entry_store::BackendKind::JuiceFs,
+            mount_path: "/jfs".into(),
+            capabilities: rbh_entry_store::BackendCapabilities {
+                namespace: true,
+                ..Default::default()
+            },
+        };
+        let error = crate::validate_policy_for_filesystem(&def, &config).unwrap_err();
+        assert!(error.to_string().contains("juice-a"));
+        assert!(error.to_string().contains("hsm"));
+    }
+
+    #[test]
+    fn juicefs_ost_trigger_is_rejected_before_scheduling() {
+        let def: PolicyDef = serde_json::from_str(
+            r#"{
+              "name":"bad-ost","filesystem":"juice-a","kind":"alert",
+              "trigger":"ost>80%"
+            }"#,
+        )
+        .unwrap();
+        let config = rbh_entry_store::FileSystemConfig {
+            id: def.filesystem.clone(),
+            backend: rbh_entry_store::BackendKind::JuiceFs,
+            mount_path: "/jfs".into(),
+            capabilities: rbh_entry_store::BackendCapabilities {
+                namespace: true,
+                ..Default::default()
+            },
+        };
+        let error = crate::validate_policy_for_filesystem(&def, &config).unwrap_err();
+        assert!(error.to_string().contains("ost"));
+    }
+
+    #[test]
+    fn existing_lustre_hsm_and_ost_policy_remains_valid() {
+        let def: PolicyDef = serde_json::from_str(
+            r#"{
+              "name":"lustre-hsm","filesystem":"lustre-a","kind":"hsm_archive",
+              "trigger":"ost>80%","action":{"hsm":{"archive_id":1}}
+            }"#,
+        )
+        .unwrap();
+        let config = rbh_entry_store::FileSystemConfig {
+            id: def.filesystem.clone(),
+            backend: rbh_entry_store::BackendKind::Lustre,
+            mount_path: "/lustre".into(),
+            capabilities: rbh_entry_store::BackendCapabilities {
+                namespace: true,
+                hsm: true,
+                ost: true,
+                stripe: true,
+                purge: true,
+                ..Default::default()
+            },
+        };
+        crate::validate_policy_for_filesystem(&def, &config).unwrap();
+    }
+
+    #[test]
+    fn policy_cannot_be_validated_against_another_filesystem() {
+        let def: PolicyDef =
+            serde_json::from_str(r#"{"name":"scoped","filesystem":"lustre-a","kind":"alert","trigger":"1h"}"#).unwrap();
+        let config = rbh_entry_store::FileSystemConfig {
+            id: rbh_entry_store::FileSystemId::new("lustre-b").unwrap(),
+            backend: rbh_entry_store::BackendKind::Lustre,
+            mount_path: "/other".into(),
+            capabilities: rbh_entry_store::BackendCapabilities::default(),
+        };
+        assert!(matches!(
+            crate::validate_policy_for_filesystem(&def, &config),
+            Err(crate::PolicyError::FilesystemMismatch { .. })
+        ));
     }
 
     #[test]

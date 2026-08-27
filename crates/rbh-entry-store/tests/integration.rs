@@ -74,6 +74,46 @@ async fn scope_catalog_migration_is_retry_safe() {
 }
 
 #[tokio::test]
+async fn policy_filesystem_migration_backfills_legacy_rows_and_is_retry_safe() {
+    if !integration_enabled() {
+        return;
+    }
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    sqlx::query("INSERT INTO policies (name, kind, definition, enabled) VALUES (?, ?, ?, TRUE)")
+        .bind("legacy-policy")
+        .bind("alert")
+        .bind(r#"{"name":"legacy-policy","kind":"alert","trigger":"1h"}"#)
+        .execute(store.pool())
+        .await
+        .expect("insert legacy policy");
+
+    let migration = include_str!("../migrations/009_scope_policies.sql");
+    sqlx::raw_sql(migration)
+        .execute(store.pool())
+        .await
+        .expect("first retry");
+    sqlx::raw_sql(migration)
+        .execute(store.pool())
+        .await
+        .expect("second retry");
+
+    let filesystem: Option<String> = sqlx::query_scalar(
+        "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(definition, '$.filesystem')) AS CHAR) FROM policies WHERE name = ?",
+    )
+    .bind("legacy-policy")
+    .fetch_one(store.pool())
+    .await
+    .expect("read migrated policy");
+    assert_eq!(filesystem.as_deref(), Some("__legacy_lustre__"));
+}
+
+#[tokio::test]
 async fn juicefs_baseline_state_and_hardlink_edges_are_durable_and_idempotent() {
     if !integration_enabled() {
         eprintln!("skipping (set RBH_INTEGRATION=1)");

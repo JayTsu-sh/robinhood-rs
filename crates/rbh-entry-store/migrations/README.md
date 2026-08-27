@@ -39,3 +39,4 @@ NNN_short_description.sql
 | `006_add_filesystem_scoped_identity.sql` | filesystem registry and backend-native scoped catalog entries |
 | `007_add_scoped_baselines.sql` | filesystem baseline state and parent/name namespace edges |
 | `008_scope_catalog_consumers.sql` | queryable filesystem-scoped metadata, removed entries, and stripe relationships |
+| `009_scope_policies.sql` | bind legacy policy definitions explicitly to the `lustre` filesystem |

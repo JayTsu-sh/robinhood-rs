@@ -22,7 +22,7 @@ pub struct ImportResult {
     pub fileclasses: HashMap<String, Predicate>,
 }
 
-pub fn import(src: &str) -> Result<ImportResult> {
+pub fn import(src: &str, filesystem: &rbh_policy::FileSystemId) -> Result<ImportResult> {
     let cleaned = strip_comments(src);
     let blocks = split_top_level_blocks(&cleaned)?;
 
@@ -38,7 +38,7 @@ pub fn import(src: &str) -> Result<ImportResult> {
                 Err(e) => out.warnings.push(format!("FileClass {name}: {e}")),
             }
         } else if let Some(name) = hdr.strip_prefix("define_policy ") {
-            match parse_policy(name.trim(), body, &out.fileclasses) {
+            match parse_policy(name.trim(), body, &out.fileclasses, filesystem) {
                 Ok((pol, mut warns)) => {
                     out.warnings.append(&mut warns);
                     out.policies.push(pol);
@@ -161,7 +161,9 @@ fn parse_fileclass(name: &str, body: &str) -> Result<(String, Predicate)> {
     Ok((name.to_string(), pred))
 }
 
-fn parse_policy(name: &str, body: &str, fileclasses: &HashMap<String, Predicate>) -> Result<(PolicyDef, Vec<String>)> {
+fn parse_policy(
+    name: &str, body: &str, fileclasses: &HashMap<String, Predicate>, filesystem: &rbh_policy::FileSystemId,
+) -> Result<(PolicyDef, Vec<String>)> {
     let (blocks, kvs) = split_body(body);
     let mut warns = Vec::new();
 
@@ -231,6 +233,7 @@ fn parse_policy(name: &str, body: &str, fileclasses: &HashMap<String, Predicate>
 
     let def = PolicyDef {
         name: name.to_string(),
+        filesystem: filesystem.clone(),
         kind,
         match_tags: std::collections::HashMap::new(), // populated by user after import
         trigger: trigger_str,
@@ -535,11 +538,13 @@ mod tests {
                 default_lru_sort_attr = last_mod;
             }
         "#;
-        let r = import(src).unwrap();
+        let filesystem = rbh_policy::FileSystemId::new("archive-fs").unwrap();
+        let r = import(src, &filesystem).unwrap();
         assert_eq!(r.fileclasses.len(), 1);
         assert_eq!(r.policies.len(), 1);
         let p = &r.policies[0];
         assert_eq!(p.name, "lhsm_archive");
+        assert_eq!(p.filesystem, filesystem);
         assert_eq!(p.kind, PolicyKind::HsmArchive);
         assert_eq!(p.action.lru_sort, Some(LruSortAttr::Mtime));
     }
@@ -553,7 +558,8 @@ mod tests {
                 default_lru_sort_attr = last_access;
             }
         "#;
-        let r = import(src).unwrap();
+        let filesystem = rbh_policy::FileSystemId::new("archive-fs").unwrap();
+        let r = import(src, &filesystem).unwrap();
         assert!(r.warnings.iter().any(|w| w.contains("General")));
         assert_eq!(r.policies.len(), 1);
         assert_eq!(r.policies[0].kind, PolicyKind::Purge);

@@ -6,7 +6,6 @@
 //! 3. Queries candidate entries from `rbh-entry-store`.
 //! 4. Dispatches all candidates to the action executor with uniform `ActionOpts`.
 
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -17,8 +16,6 @@ use serde::{Deserialize, Serialize};
 pub struct PolicyRuntime {
     pub policy_store: crate::PolicyStore,
     pub entry_store: rbh_entry_store::store::EntryStore,
-    pub filesystem_id: rbh_entry_store::FileSystemId,
-    pub mount_path: PathBuf,
 }
 
 static RUNTIME: OnceLock<Arc<PolicyRuntime>> = OnceLock::new();
@@ -108,7 +105,6 @@ impl Task for PolicyRunTask {
         let pid_lbl = self.policy_id.to_string();
 
         tracing::info!(
-            filesystem = %rt.filesystem_id,
             policy_id = self.policy_id,
             execution_id = %ctx.execution_id.0,
             "policy run started"
@@ -128,7 +124,23 @@ impl Task for PolicyRunTask {
             }
         };
         let def = &policy.definition;
-        tracing::info!(policy_id = self.policy_id, kind = def.kind.as_str(), "policy loaded");
+        let config = match rt.entry_store.get_filesystem(&def.filesystem).await {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                return Err(SchedulerError::ExecutionError(format!(
+                    "unknown filesystem: {}",
+                    def.filesystem
+                )));
+            }
+            Err(error) => return Err(SchedulerError::ExecutionError(error.to_string())),
+        };
+        if let Err(error) = crate::validate_policy_for_filesystem(def, &config) {
+            return Err(SchedulerError::ExecutionError(error.to_string()));
+        }
+        if let Err(error) = crate::validate_target_for_filesystem(&self.target, &config) {
+            return Err(SchedulerError::ExecutionError(error.to_string()));
+        }
+        tracing::info!(policy_id = self.policy_id, filesystem = %def.filesystem, kind = def.kind.as_str(), "policy loaded");
 
         // 2. Get executor for this policy kind.
         let executor: Arc<dyn rbh_actions::ActionExecutor> = match make_executor(def) {
@@ -170,7 +182,7 @@ impl Task for PolicyRunTask {
         let candidates = match rt
             .entry_store
             .query_scoped_page(
-                &rt.filesystem_id,
+                &def.filesystem,
                 &where_clause,
                 &query_params,
                 order_by.as_deref(),
@@ -185,7 +197,7 @@ impl Task for PolicyRunTask {
                     let Some(entry) = row.to_lustre_compat() else {
                         return Err(SchedulerError::ExecutionError(format!(
                             "filesystem {} requires an ActionBackend before policy execution",
-                            rt.filesystem_id
+                            def.filesystem
                         )));
                     };
                     candidates.push(entry);
@@ -206,7 +218,7 @@ impl Task for PolicyRunTask {
 
         // 4. Dispatch.
         let action_ctx = Arc::new(rbh_actions::ActionContext {
-            mount_path: rt.mount_path.clone(),
+            mount_path: config.mount_path.clone(),
             lustre: lustre_api::LustreApi,
         });
         let concurrency = def.action.nb_threads.map(|n| n.max(1) as usize).unwrap_or(1);
@@ -378,7 +390,7 @@ fn maybe_spawn_low_watermark_monitor(
     };
 
     let entry_store = rt.entry_store.clone();
-    let filesystem_id = rt.filesystem_id.clone();
+    let filesystem_id = def.filesystem.clone();
     let where_clause = where_clause.to_string();
     let params: Vec<_> = query_params.to_vec();
     let policy_name = def.name.clone();
@@ -571,6 +583,7 @@ mod tests {
     use bytes::Bytes;
     use lustre_api::LuFid;
     use rbh_entry_store::model::{EntryKind, EntryRow};
+    use std::path::PathBuf;
 
     fn test_entry() -> EntryRow {
         EntryRow {

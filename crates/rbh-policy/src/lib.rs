@@ -15,17 +15,20 @@ pub mod reconcile;
 pub mod store;
 pub mod task;
 pub mod trigger_parser;
+pub mod validation;
 
 pub use classifier::{ClassifierDef, ClassifierRow, ClassifierRule, ClassifierStore, evaluate_classifier, parse_when};
 pub use model::{
     ActionOpts, AlertParams, CmdParams, HsmParams, LruSortAttr, PolicyDef, PolicyKind, PolicyRow, RateLimit,
     RetryParams, TriggerSpec, WindowModeSpec,
 };
+pub use rbh_entry_store::FileSystemId;
 pub use reconcile::reconcile_triggers;
 pub use store::PolicyStore;
 pub use task::TargetFilter;
 pub use task::{PolicyRunTask, PolicyRuntime, init_runtime};
 pub use trigger_parser::parse_trigger;
+pub use validation::{validate_policy_for_filesystem, validate_target_for_filesystem};
 
 /// Errors produced by the policy layer.
 #[derive(Debug, thiserror::Error)]
@@ -46,4 +49,15 @@ pub enum PolicyError {
     InvalidTrigger(String),
     #[error("scheduler error: {0}")]
     Scheduler(String),
+    #[error("policy selects filesystem {policy}, but validation used {configured}")]
+    FilesystemMismatch {
+        policy: rbh_entry_store::FileSystemId,
+        configured: rbh_entry_store::FileSystemId,
+    },
+    #[error("filesystem {filesystem} does not provide required capability '{capability}': {reason}")]
+    UnsupportedCapability {
+        filesystem: rbh_entry_store::FileSystemId,
+        capability: &'static str,
+        reason: &'static str,
+    },
 }

@@ -121,6 +121,7 @@ struct CreatePolicyRequest {
 async fn create_policy(
     State(state): State<AppState>, Json(body): Json<CreatePolicyRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    validate_policy_request(&state, &body.definition).await?;
     let id = state.policy_store.create(&body.definition).await?;
     // Reconcile triggers → scheduler-rs schedules.
     if let Some(ref scheduler) = state.scheduler
@@ -148,6 +149,7 @@ async fn get_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Resul
 async fn update_policy(
     State(state): State<AppState>, Path(id): Path<u64>, Json(body): Json<CreatePolicyRequest>,
 ) -> Result<StatusCode, ApiError> {
+    validate_policy_request(&state, &body.definition).await?;
     state.policy_store.update(id, &body.definition).await?;
     if let Some(ref scheduler) = state.scheduler
         && let Err(e) =
@@ -181,14 +183,17 @@ async fn run_policy_now(
     use scheduler_rs::trigger::ImmediateTrigger;
 
     // Verify the policy exists first (returns 404 if not).
-    let _row = state.policy_store.get(id).await?;
+    let row = state.policy_store.get(id).await?;
+    let config = validate_policy_request(&state, &row.definition).await?;
+
+    let target = req.target.unwrap_or(rbh_policy::TargetFilter::Fs);
+    rbh_policy::validate_target_for_filesystem(&target, &config)?;
 
     let scheduler = state
         .scheduler
         .as_ref()
         .ok_or_else(|| ApiError::Internal("scheduler not configured".into()))?;
 
-    let target = req.target.unwrap_or(rbh_policy::TargetFilter::Fs);
     let task = rbh_policy::PolicyRunTask {
         policy_id: id,
         trigger_idx: u32::MAX, // sentinel: manual run, no trigger bound
@@ -221,6 +226,19 @@ async fn run_policy_now(
         "schedule_id": schedule_id.0.to_string(),
         "name": name,
     })))
+}
+
+async fn validate_policy_request(
+    state: &AppState, definition: &PolicyDef,
+) -> Result<rbh_entry_store::FileSystemConfig, ApiError> {
+    let config = state
+        .entry_store
+        .get_filesystem(&definition.filesystem)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown filesystem: {}", definition.filesystem)))?;
+    rbh_policy::validate_policy_for_filesystem(definition, &config)?;
+    Ok(config)
 }
 
 #[tracing::instrument(skip(state))]
@@ -1107,6 +1125,9 @@ impl IntoResponse for ApiError {
                 (StatusCode::NOT_FOUND, format!("policy not found: name={name}"))
             }
             ApiError::Policy(PolicyError::InvalidTrigger(msg)) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::Policy(
+                error @ (PolicyError::FilesystemMismatch { .. } | PolicyError::UnsupportedCapability { .. }),
+            ) => (StatusCode::BAD_REQUEST, error.to_string()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Policy(e) => {
                 tracing::error!(error = %e, "policy error");
@@ -1383,5 +1404,51 @@ mod scoped_api_tests {
         assert_eq!(body["object_id"], serde_json::json!({"juice_fs": object_inode}));
         assert_eq!(body["file_count"], 1);
         assert_eq!(body["total_bytes"], 7);
+    }
+
+    #[tokio::test]
+    async fn create_policy_rejects_juicefs_hsm_before_persisting_or_scheduling() {
+        if !integration_enabled() {
+            return;
+        }
+        let store = rbh_entry_store::EntryStore::connect("mysql://root@localhost/rbh_entries_test")
+            .await
+            .unwrap();
+        let filesystem = FileSystemId::new(format!("policy-jfs-{}", std::process::id())).unwrap();
+        store
+            .register_filesystem(&rbh_entry_store::FileSystemConfig {
+                id: filesystem.clone(),
+                backend: rbh_entry_store::BackendKind::JuiceFs,
+                mount_path: "/jfs".into(),
+                capabilities: rbh_entry_store::BackendCapabilities {
+                    namespace: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let pool = store.pool().clone();
+        let server = TestServer::new(crate::router(AppState {
+            policy_store: rbh_policy::PolicyStore::new(pool.clone()),
+            classifier_store: rbh_policy::ClassifierStore::new(pool),
+            classifier_cache: Arc::new(RwLock::new(Vec::new())),
+            entry_store: store,
+            scheduler: None,
+            scans: Arc::new(Mutex::new(HashMap::new())),
+        }))
+        .unwrap();
+        let response = server
+            .post("/api/policies")
+            .json(&serde_json::json!({
+                "name": format!("invalid-hsm-{}", std::process::id()),
+                "filesystem": filesystem,
+                "kind": "hsm_archive",
+                "trigger": "1h",
+                "action": {"hsm": {"archive_id": 1}}
+            }))
+            .await;
+        response.assert_status_bad_request();
+        let body: serde_json::Value = response.json();
+        assert!(body["error"].as_str().unwrap().contains("hsm"));
     }
 }

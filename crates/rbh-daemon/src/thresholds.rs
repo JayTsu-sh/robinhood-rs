@@ -76,9 +76,19 @@ impl ThresholdChecker {
     async fn one_cycle(&self, last_fired: &LastFired, next_check: &mut HashMap<(u64, u32), u64>) -> anyhow::Result<()> {
         let policies = self.policy_store.list().await?;
         let now = now_secs();
+        let Some(config) = self.entry_store.get_filesystem(&self.filesystem_id).await? else {
+            anyhow::bail!("unknown filesystem: {}", self.filesystem_id);
+        };
 
         for policy in &policies {
             if !policy.enabled {
+                continue;
+            }
+            if policy.definition.filesystem != self.filesystem_id {
+                continue;
+            }
+            if let Err(error) = rbh_policy::validate_policy_for_filesystem(&policy.definition, &config) {
+                tracing::warn!(policy_id = policy.id, filesystem = %self.filesystem_id, %error, "policy capability validation failed before threshold evaluation");
                 continue;
             }
             let trigger_spec = match parse_trigger(&policy.definition.trigger) {
@@ -109,6 +119,10 @@ impl ThresholdChecker {
                 }
 
                 let target = resolve_target(params.target);
+                if let Err(error) = rbh_policy::validate_target_for_filesystem(&target, &config) {
+                    tracing::warn!(policy_id = policy.id, filesystem = %self.filesystem_id, %error, "threshold target is unsupported");
+                    continue;
+                }
                 let tags_pred = Predicate::Tags {
                     match_tags: policy.definition.match_tags.clone(),
                 };

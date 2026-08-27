@@ -15,6 +15,10 @@ struct Cli {
     /// Path to the robinhood-C config file.
     config: PathBuf,
 
+    /// Registered filesystem ID that will own every imported policy.
+    #[arg(long, env = "RBH_FILESYSTEM_ID")]
+    filesystem: String,
+
     /// POST each policy to the given daemon base URL (/api/policies) on
     /// success. Without this flag, just print the JSON to stdout.
     #[arg(long, env = "RBH_API_URL")]
@@ -33,7 +37,8 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let src = std::fs::read_to_string(&cli.config).with_context(|| format!("reading {}", cli.config.display()))?;
-    let result = rbh_config_import::import(&src)?;
+    let filesystem = rbh_policy::FileSystemId::new(cli.filesystem).context("invalid --filesystem")?;
+    let result = rbh_config_import::import(&src, &filesystem)?;
 
     for w in &result.warnings {
         eprintln!("warning: {w}");

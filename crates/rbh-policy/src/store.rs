@@ -30,6 +30,21 @@ impl PolicyStore {
         Ok(())
     }
 
+    /// Bind rows upgraded from the pre-filesystem policy schema to the
+    /// deployment's uniquely selected Lustre filesystem. This is idempotent.
+    pub async fn bind_legacy_lustre_filesystem(
+        &self, filesystem: &rbh_entry_store::FileSystemId,
+    ) -> Result<u64, PolicyError> {
+        let result = sqlx::query(
+            "UPDATE policies SET definition = JSON_SET(definition, '$.filesystem', ?) \
+             WHERE JSON_UNQUOTE(JSON_EXTRACT(definition, '$.filesystem')) = '__legacy_lustre__'",
+        )
+        .bind(filesystem.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     #[tracing::instrument(skip(self, def), fields(policy_name = %def.name))]
     pub async fn create(&self, def: &PolicyDef) -> Result<u64, PolicyError> {
         validate_policy(def)?;

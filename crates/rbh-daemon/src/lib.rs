@@ -58,6 +58,13 @@ pub async fn run() -> anyhow::Result<()> {
         .check_schema()
         .await
         .context("policy schema check failed")?;
+    let rebound = policy_store
+        .bind_legacy_lustre_filesystem(&filesystem_id)
+        .await
+        .context("failed to bind legacy policies to the configured Lustre filesystem")?;
+    if rebound > 0 {
+        tracing::info!(filesystem = %filesystem_id, policies = rebound, "legacy policies bound to configured Lustre filesystem");
+    }
     let classifier_store = rbh_policy::ClassifierStore::new(pool.clone());
 
     // Load classifier cache for changelog-driven classification.
@@ -272,12 +279,10 @@ pub async fn run() -> anyhow::Result<()> {
     rbh_policy::init_runtime(Arc::new(rbh_policy::PolicyRuntime {
         policy_store: policy_store.clone(),
         entry_store: entry_store.clone(),
-        filesystem_id: filesystem_id.clone(),
-        mount_path: mount_path.clone(),
     }));
 
     // Reconcile existing policies → scheduler schedules.
-    reconcile_all_policies(&scheduler, &policy_store).await;
+    reconcile_all_policies(&scheduler, &policy_store, &entry_store).await;
 
     // Prune threshold-fire schedules left behind by previous runs. Their
     // names follow `rbh.policy.<id>.threshold.<idx>.<unix>` and the
@@ -313,18 +318,20 @@ pub async fn run() -> anyhow::Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(30);
-    let checker = thresholds::ThresholdChecker {
-        policy_store: policy_store.clone(),
-        entry_store: entry_store.clone(),
-        scheduler: scheduler.clone(),
-        lustre: lustre_api::LustreApi,
-        filesystem_id: filesystem_id.clone(),
-        mount_path: mount_path.clone(),
-        tick: std::time::Duration::from_secs(threshold_tick_secs),
-        cancel: daemon_cancel.clone(),
-    };
-    tokio::spawn(checker.run());
-    tracing::info!(filesystem = %filesystem_id, tick_secs = threshold_tick_secs, "threshold checker spawned");
+    for runtime in runtime_registry.iter() {
+        let checker = thresholds::ThresholdChecker {
+            policy_store: policy_store.clone(),
+            entry_store: entry_store.clone(),
+            scheduler: scheduler.clone(),
+            lustre: lustre_api::LustreApi,
+            filesystem_id: runtime.config.id.clone(),
+            mount_path: runtime.config.mount_path.clone(),
+            tick: std::time::Duration::from_secs(threshold_tick_secs),
+            cancel: daemon_cancel.clone(),
+        };
+        tokio::spawn(checker.run());
+        tracing::info!(filesystem = %runtime.config.id, tick_secs = threshold_tick_secs, "threshold checker spawned");
+    }
 
     // Active HSM state poller. Walks the catalog in small batches,
     // calls llapi_hsm_state_get, patches sm_status if the stored state
@@ -676,11 +683,34 @@ async fn run_juicefs_baseline(
 }
 
 /// Reconcile all enabled policies to scheduler-rs schedules on startup.
-async fn reconcile_all_policies(scheduler: &Scheduler, policy_store: &rbh_policy::PolicyStore) {
+async fn reconcile_all_policies(
+    scheduler: &Scheduler, policy_store: &rbh_policy::PolicyStore, entry_store: &rbh_entry_store::store::EntryStore,
+) {
     match policy_store.list().await {
         Ok(policies) => {
             for policy in &policies {
                 if policy.enabled {
+                    let validation = match entry_store.get_filesystem(&policy.definition.filesystem).await {
+                        Ok(Some(config)) => rbh_policy::validate_policy_for_filesystem(&policy.definition, &config),
+                        Ok(None) => Err(rbh_policy::PolicyError::Store(format!(
+                            "unknown filesystem: {}",
+                            policy.definition.filesystem
+                        ))),
+                        Err(error) => Err(rbh_policy::PolicyError::Store(error.to_string())),
+                    };
+                    if let Err(error) = validation {
+                        tracing::error!(policy_id = policy.id, %error, "policy rejected before schedule reconciliation");
+                        if let Err(remove_error) =
+                            rbh_policy::reconcile::remove_policy_schedule(scheduler, policy.id).await
+                        {
+                            tracing::error!(
+                                policy_id = policy.id,
+                                error = %remove_error,
+                                "failed to remove schedule for rejected policy"
+                            );
+                        }
+                        continue;
+                    }
                     match rbh_policy::reconcile_triggers(
                         scheduler,
                         policy.id,
