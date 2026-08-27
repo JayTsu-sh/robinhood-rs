@@ -9,7 +9,52 @@ use lustre_api::LustreApi;
 use lustre_api::fid::LuFid;
 use rbh_entry_store::model::{EntryKind, EntryRow};
 
+use crate::PosixEntry;
 use crate::ScanError;
+
+/// Add Lustre-native identity and layout metadata to a POSIX walk result.
+#[tracing::instrument(skip(lustre, entry), fields(path = %entry.path.display()))]
+pub fn enrich_lustre(lustre: &LustreApi, entry: &PosixEntry) -> Result<EntryRow, ScanError> {
+    let fid = lustre.path_to_fid(&entry.path)?;
+    let parent_fid = entry
+        .parent_path
+        .as_ref()
+        .map(|parent| lustre.path_to_fid(parent))
+        .transpose()?;
+    let (stripe_count, stripe_size, pool_name) = if entry.kind == EntryKind::File {
+        lustre
+            .get_stripe_info(&entry.path)
+            .map(|layout| (Some(layout.count as u16), Some(layout.size as u32), layout.pool))
+            .unwrap_or((None, None, None))
+    } else {
+        (None, None, None)
+    };
+    Ok(EntryRow {
+        fid,
+        parent_fid,
+        name: entry.name.clone(),
+        kind: entry.kind,
+        size: entry.size,
+        blocks: entry.blocks,
+        uid: entry.uid,
+        gid: entry.gid,
+        projid: 0,
+        mode: entry.mode,
+        nlink: entry.nlink,
+        atime: entry.atime,
+        mtime: entry.mtime,
+        ctime: entry.ctime,
+        stripe_count,
+        stripe_size,
+        pool_name,
+        sm_status: serde_json::json!({}),
+        last_seen: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        depth: entry.depth,
+    })
+}
 
 /// Build an [`EntryRow`] from filesystem metadata.
 ///

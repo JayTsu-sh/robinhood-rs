@@ -484,7 +484,7 @@ async fn run_initial_scan(
             rbh_fs_scan::ScanEvent::Entry(entry) => {
                 batch.push(*entry);
                 if batch.len() >= 100 {
-                    if let Err(e) = entry_store.upsert_batch(&batch).await {
+                    if let Err(e) = persist_scan_batch(entry_store, filesystem_id, &batch).await {
                         tracing::warn!(error = %e, "batch upsert failed");
                     }
                     batch.clear();
@@ -497,13 +497,20 @@ async fn run_initial_scan(
     }
     // Flush remaining.
     if !batch.is_empty()
-        && let Err(e) = entry_store.upsert_batch(&batch).await
+        && let Err(e) = persist_scan_batch(entry_store, filesystem_id, &batch).await
     {
         tracing::warn!(error = %e, "final batch upsert failed");
     }
 
     let (scanned, errors, dirs) = progress.snapshot();
     tracing::info!(filesystem = %filesystem_id, scanned, errors, dirs, "fs-scan complete");
+}
+
+async fn persist_scan_batch(
+    entry_store: &rbh_entry_store::store::EntryStore, filesystem_id: &rbh_entry_store::FileSystemId,
+    entries: &[rbh_entry_store::model::EntryRow],
+) -> Result<(), rbh_entry_store::StoreError> {
+    entry_store.upsert_lustre_scan_batch(filesystem_id, entries).await
 }
 
 /// Reconcile all enabled policies to scheduler-rs schedules on startup.

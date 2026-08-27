@@ -130,6 +130,43 @@ async fn scoped_identities_isolate_the_same_native_object_id() {
     assert_eq!(store.get_entry(&legacy.fid).await.unwrap().unwrap().name, legacy.name);
 }
 
+#[tokio::test]
+async fn lustre_scan_batch_populates_filesystem_scoped_baseline() {
+    if !integration_enabled() {
+        eprintln!("skipping (set RBH_INTEGRATION=1)");
+        return;
+    }
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(TEST_DB_URL)
+        .await
+        .expect("connect");
+    reset_db(&pool).await;
+    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let filesystem = FileSystemId::new("lustre-archive").unwrap();
+    store
+        .register_filesystem(&FileSystemConfig {
+            id: filesystem.clone(),
+            backend: BackendKind::Lustre,
+            mount_path: "/lustre".into(),
+            capabilities: BackendCapabilities {
+                namespace: true,
+                stripe: true,
+                ..BackendCapabilities::default()
+            },
+        })
+        .await
+        .unwrap();
+    let rows = [make_entry(0x200000401, 10, "a"), make_entry(0x200000401, 11, "b")];
+    store.upsert_lustre_scan_batch(&filesystem, &rows).await.unwrap();
+
+    for row in rows {
+        assert_eq!(store.get_entry(&row.fid).await.unwrap().unwrap().name, row.name);
+        let entry = ScopedEntryRow::from_lustre(filesystem.clone(), &row);
+        assert_eq!(store.get_scoped_entry(&entry.key).await.unwrap(), Some(entry));
+    }
+}
+
 fn make_entry(seq: u64, oid: u32, name: &str) -> EntryRow {
     EntryRow {
         fid: LuFid::new(seq, oid, 0),

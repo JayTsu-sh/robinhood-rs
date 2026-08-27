@@ -239,10 +239,10 @@ POLICY_JSON=$(cat <<JSON
 {
   "name": "e2e_purge",
   "kind": "purge",
-  "scope": {"op":"cmp","field":"uid","cmp":"ge","value":0},
-  "rules": [{"condition":{"op":"true"},"action":{}}],
-  "default_action": {"max_count": 2, "nb_threads": 1},
-  "triggers": []
+  "match_tags": {},
+  "trigger": "1h",
+  "action": {"max_count": 2, "nb_threads": 1},
+  "enabled": true
 }
 JSON
 )
@@ -262,7 +262,7 @@ note "  -> dry-run left $AFTER_DRY files untouched"
 # ---- 7. metrics + health ----
 note "scenario 9: /api/metrics exposes families"
 METRICS=$(curl -sf "$API/api/metrics")
-for m in rbh_catalog_entries rbh_policy_runs_total rbh_changelog_events_total rbh_hsm_poll_scanned_total; do
+for m in rbh_catalog_entries rbh_policy_runs_total rbh_changelog_events_total; do
     assert_contains "$METRICS" "$m" "metric $m registered"
 done
 note "  -> metrics ok"

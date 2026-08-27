@@ -159,6 +159,47 @@ impl EntryStore {
         Ok(())
     }
 
+    /// Upsert a scanner batch into the filesystem-scoped catalog atomically.
+    #[tracing::instrument(name = "store.upsert_scoped_batch", skip(self, entries), fields(count = entries.len()))]
+    pub async fn upsert_scoped_batch(&self, entries: &[ScopedEntryRow]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let filesystem = entries[0].key.filesystem();
+        let config = self
+            .get_filesystem(filesystem)
+            .await?
+            .ok_or_else(|| StoreError::UnknownFilesystem(filesystem.clone()))?;
+        let mut tx = self.pool.begin().await?;
+        for entry in entries {
+            if entry.key.filesystem() != filesystem {
+                return Err(StoreError::InvalidObjectIdentity("scoped batch mixes filesystems"));
+            }
+            if config.backend != entry.key.object().backend() {
+                return Err(StoreError::BackendMismatch {
+                    filesystem: filesystem.clone(),
+                    configured: config.backend,
+                    object: entry.key.object().backend(),
+                });
+            }
+            let (kind, bytes) = encode_object_id(*entry.key.object());
+            let entry_data = serde_json::to_string(entry)?;
+            sqlx::query(
+                r"INSERT INTO scoped_entries (filesystem_id, object_kind, object_id, entry_data)
+                  VALUES (?, ?, ?, ?)
+                  ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data)",
+            )
+            .bind(filesystem.as_str())
+            .bind(kind)
+            .bind(bytes.as_slice())
+            .bind(entry_data)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Load a complete catalog entry by filesystem-scoped identity.
     #[tracing::instrument(name = "store.get_scoped_entry", skip(self), fields(filesystem = %key.filesystem(), backend = ?key.object().backend()))]
     pub async fn get_scoped_entry(&self, key: &EntryKey) -> Result<Option<ScopedEntryRow>> {
@@ -450,6 +491,84 @@ impl EntryStore {
         }
         tx.commit().await?;
         debug!(count = entries.len(), "batch upserted");
+        Ok(())
+    }
+
+    /// Atomically persist one Lustre scan batch in both compatibility and
+    /// filesystem-scoped catalogs.
+    #[tracing::instrument(name = "store.upsert_lustre_scan_batch", skip(self, entries), fields(filesystem = %filesystem, count = entries.len()))]
+    pub async fn upsert_lustre_scan_batch(&self, filesystem: &FileSystemId, entries: &[EntryRow]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let config = self
+            .get_filesystem(filesystem)
+            .await?
+            .ok_or_else(|| StoreError::UnknownFilesystem(filesystem.clone()))?;
+        if config.backend != crate::model::BackendKind::Lustre {
+            return Err(StoreError::BackendMismatch {
+                filesystem: filesystem.clone(),
+                configured: config.backend,
+                object: crate::model::BackendKind::Lustre,
+            });
+        }
+        let mut tx = self.pool.begin().await?;
+        for entry in entries {
+            let fid_bin = fid_codec::encode(&entry.fid);
+            let parent_bin = entry.parent_fid.as_ref().map(fid_codec::encode);
+            let sm_json = serde_json::to_string(&entry.sm_status)?;
+            sqlx::query(
+                r"INSERT INTO entries
+                    (fid, parent_fid, name, kind, size, blocks, uid, gid, projid, mode, nlink,
+                     atime, mtime, ctime, stripe_count, stripe_size, pool_name, sm_status, last_seen, depth)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  ON DUPLICATE KEY UPDATE
+                    parent_fid = VALUES(parent_fid), name = VALUES(name), kind = VALUES(kind),
+                    size = VALUES(size), blocks = VALUES(blocks), uid = VALUES(uid), gid = VALUES(gid),
+                    projid = VALUES(projid), mode = VALUES(mode), nlink = VALUES(nlink),
+                    atime = VALUES(atime), mtime = VALUES(mtime), ctime = VALUES(ctime),
+                    stripe_count = VALUES(stripe_count), stripe_size = VALUES(stripe_size),
+                    pool_name = VALUES(pool_name), sm_status = VALUES(sm_status),
+                    last_seen = VALUES(last_seen), depth = VALUES(depth)",
+            )
+            .bind(fid_bin.as_slice())
+            .bind(parent_bin.as_ref().map(|value| value.as_slice()))
+            .bind(entry.name.as_ref())
+            .bind(entry.kind as u8)
+            .bind(entry.size)
+            .bind(entry.blocks)
+            .bind(entry.uid)
+            .bind(entry.gid)
+            .bind(entry.projid)
+            .bind(entry.mode)
+            .bind(entry.nlink)
+            .bind(entry.atime)
+            .bind(entry.mtime)
+            .bind(entry.ctime)
+            .bind(entry.stripe_count)
+            .bind(entry.stripe_size)
+            .bind(&entry.pool_name)
+            .bind(&sm_json)
+            .bind(entry.last_seen)
+            .bind(entry.depth)
+            .execute(&mut *tx)
+            .await?;
+
+            let scoped = ScopedEntryRow::from_lustre(filesystem.clone(), entry);
+            let (object_kind, object_bytes) = encode_object_id(*scoped.key.object());
+            sqlx::query(
+                r"INSERT INTO scoped_entries (filesystem_id, object_kind, object_id, entry_data)
+                  VALUES (?, ?, ?, ?)
+                  ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data)",
+            )
+            .bind(filesystem.as_str())
+            .bind(object_kind)
+            .bind(object_bytes.as_slice())
+            .bind(serde_json::to_string(&scoped)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

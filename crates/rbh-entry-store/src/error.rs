@@ -26,6 +26,9 @@ pub enum StoreError {
     #[error("invalid persisted object identity: {0}")]
     InvalidObjectIdentity(&'static str),
 
+    #[error("filesystem {0} is not registered")]
+    UnknownFilesystem(crate::model::FileSystemId),
+
     #[error("filesystem {filesystem} uses backend {configured:?}, but object id uses {object:?}")]
     BackendMismatch {
         filesystem: crate::model::FileSystemId,

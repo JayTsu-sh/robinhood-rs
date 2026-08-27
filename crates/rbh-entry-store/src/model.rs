@@ -182,6 +182,36 @@ pub struct ScopedEntryRow {
     pub depth: u32,
 }
 
+impl ScopedEntryRow {
+    /// Preserve a genuine Lustre FID while adding filesystem scope.
+    pub fn from_lustre(filesystem: FileSystemId, entry: &EntryRow) -> Self {
+        Self {
+            key: EntryKey::new(filesystem.clone(), ObjectId::Lustre(entry.fid)),
+            parent: entry
+                .parent_fid
+                .map(|fid| EntryKey::new(filesystem, ObjectId::Lustre(fid))),
+            name: entry.name.clone(),
+            kind: entry.kind,
+            size: entry.size,
+            blocks: entry.blocks,
+            uid: entry.uid,
+            gid: entry.gid,
+            projid: entry.projid,
+            mode: entry.mode,
+            nlink: entry.nlink,
+            atime: entry.atime,
+            mtime: entry.mtime,
+            ctime: entry.ctime,
+            stripe_count: entry.stripe_count,
+            stripe_size: entry.stripe_size,
+            pool_name: entry.pool_name.clone(),
+            sm_status: entry.sm_status.clone(),
+            last_seen: entry.last_seen,
+            depth: entry.depth,
+        }
+    }
+}
+
 /// Entry kind — matches the `kind` TINYINT column in `entries`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -351,6 +381,23 @@ mod tests {
         assert_ne!(lustre, juicefs);
         assert_eq!(lustre.object(), &ObjectId::Lustre(fid));
         assert_eq!(juicefs.object(), &ObjectId::JuiceFs(0x200000401));
+    }
+
+    #[test]
+    fn lustre_entry_converts_to_scoped_identity_without_losing_metadata() {
+        let row = demo_row();
+        let filesystem = FileSystemId::new("archive").unwrap();
+        let scoped = ScopedEntryRow::from_lustre(filesystem.clone(), &row);
+
+        assert_eq!(scoped.key, EntryKey::new(filesystem.clone(), ObjectId::Lustre(row.fid)));
+        assert_eq!(
+            scoped.parent,
+            row.parent_fid
+                .map(|fid| EntryKey::new(filesystem, ObjectId::Lustre(fid)))
+        );
+        assert_eq!(scoped.name, row.name);
+        assert_eq!(scoped.stripe_count, row.stripe_count);
+        assert_eq!(scoped.sm_status, row.sm_status);
     }
 
     #[test]
