@@ -1,8 +1,10 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use rbh_actions::{ActionBackend, BackendAction, BackendActionOutcome};
+use rbh_actions::{ActionBackend, BackendAction, BackendActionOutcome, BackendAlert, BackendBackup};
 use rbh_entry_store::model::ScopedNamespaceEdge;
 use rbh_entry_store::{
     BackendCapabilities, BackendKind, EntryKey, EntryKind, EntryStore, FileSystemConfig, FileSystemId, ObjectId,
@@ -42,6 +44,26 @@ fn row(key: EntryKey, parent: Option<EntryKey>, name: &[u8], metadata: &fs::Meta
         sm_status: serde_json::json!({}),
         last_seen: metadata.ctime(),
         depth: 1,
+    }
+}
+
+struct RecordingBackup {
+    sources: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+#[async_trait::async_trait]
+impl rbh_backup::BackupAdapter for RecordingBackup {
+    async fn archive(&self, invocation: &rbh_backup::ToolInvocation<'_>) -> Result<(), rbh_backup::BackupError> {
+        self.sources.lock().unwrap().push(invocation.src.to_path_buf());
+        Ok(())
+    }
+
+    async fn restore(&self, _invocation: &rbh_backup::ToolInvocation<'_>) -> Result<(), rbh_backup::BackupError> {
+        Ok(())
+    }
+
+    async fn remove(&self, _invocation: &rbh_backup::ToolInvocation<'_>) -> Result<(), rbh_backup::BackupError> {
+        Ok(())
     }
 }
 
@@ -206,4 +228,77 @@ async fn juicefs_purge_uses_native_inode_namespace_and_persists_removal() {
     let persisted = store.get_scoped_entry(&busy_key).await.unwrap().unwrap();
     assert_eq!(persisted.sm_status["action"]["kind"], "purge");
     assert_eq!(persisted.sm_status["action"]["retryable"], false);
+
+    let alert_path = mount.join("alert-target");
+    fs::write(&alert_path, b"alert").unwrap();
+    let alert_key = EntryKey::new(
+        filesystem.clone(),
+        ObjectId::JuiceFs(fs::metadata(&alert_path).unwrap().ino()),
+    );
+    let alert_entry = row(
+        alert_key.clone(),
+        Some(root.clone()),
+        b"alert-target",
+        &fs::metadata(&alert_path).unwrap(),
+    );
+    store.upsert_scoped_entry(&alert_entry).await.unwrap();
+    store
+        .upsert_scoped_namespace_edge(&ScopedNamespaceEdge {
+            filesystem: filesystem.clone(),
+            parent: *root.object(),
+            name: alert_entry.name.clone(),
+            object: *alert_key.object(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        backend
+            .alert(
+                &alert_entry,
+                &BackendAlert {
+                    webhook: None,
+                    log: false,
+                    message: Some("cold file".into())
+                }
+            )
+            .await
+            .unwrap(),
+        BackendActionOutcome::Success
+    );
+    let alerted = store.get_scoped_entry(&alert_key).await.unwrap().unwrap();
+    assert_eq!(alerted.sm_status["action"]["kind"], "alert");
+    assert_eq!(
+        alerted.sm_status["action"]["path"],
+        alert_path.to_string_lossy().as_ref()
+    );
+
+    let sources = Arc::new(Mutex::new(Vec::new()));
+    assert_eq!(
+        backend
+            .backup(
+                &alert_entry,
+                &BackendBackup {
+                    adapter: Arc::new(RecordingBackup {
+                        sources: sources.clone()
+                    }),
+                    op: rbh_backup::BackupOp::Archive,
+                    archive_id: 1,
+                    hints: None,
+                    dest_template: Some("/archive/{src}".into()),
+                },
+            )
+            .await
+            .unwrap(),
+        BackendActionOutcome::Success
+    );
+    assert_eq!(
+        sources.lock().unwrap().as_slice(),
+        &[Path::new(&alert_path).to_path_buf()]
+    );
+    let backed_up = store.get_scoped_entry(&alert_key).await.unwrap().unwrap();
+    assert_eq!(backed_up.sm_status["action"]["kind"], "backup");
+    assert_eq!(
+        backed_up.sm_status["action"]["path"],
+        alert_path.to_string_lossy().as_ref()
+    );
 }

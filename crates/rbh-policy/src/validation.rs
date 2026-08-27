@@ -26,6 +26,11 @@ pub fn validate_policy_for_filesystem(def: &PolicyDef, config: &FileSystemConfig
             configured: config.id.clone(),
         });
     }
+    if def.kind == PolicyKind::Backup && def.action.backup.is_none() {
+        return Err(PolicyError::InvalidAction(
+            "backup policies require action.backup command configuration".into(),
+        ));
+    }
     match def.kind {
         PolicyKind::Purge => require(
             config,
@@ -38,6 +43,12 @@ pub fn validate_policy_for_filesystem(def: &PolicyDef, config: &FileSystemConfig
             config.capabilities.hsm,
             "hsm",
             "HSM actions require a Lustre filesystem with HSM enabled",
+        ),
+        PolicyKind::Alert | PolicyKind::Backup => require(
+            config,
+            config.capabilities.namespace,
+            "namespace",
+            "alert and backup require filesystem namespace resolution",
         ),
         _ => Ok(()),
     }?;
@@ -65,9 +76,10 @@ pub fn validate_policy_for_filesystem(def: &PolicyDef, config: &FileSystemConfig
     }?;
     require(
         config,
-        config.backend == BackendKind::Lustre || def.kind == PolicyKind::Purge,
+        config.backend == BackendKind::Lustre
+            || matches!(def.kind, PolicyKind::Purge | PolicyKind::Alert | PolicyKind::Backup),
         "action_backend",
-        "this action has no JuiceFS backend adapter; only purge is currently supported",
+        "this action has no JuiceFS backend adapter; HSM, migration and Lustre layout actions are not emulated",
     )
 }
 

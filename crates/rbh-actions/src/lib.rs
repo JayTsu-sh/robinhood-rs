@@ -13,7 +13,7 @@
 mod backend;
 mod executor;
 
-pub use backend::{ActionBackend, BackendAction, BackendActionOutcome};
+pub use backend::{ActionBackend, BackendAction, BackendActionOutcome, BackendAlert, BackendBackup};
 
 pub use executor::{
     ActionContext, ActionExecutor, ActionOutcome, AlertExecutor, BackupExecutor, CmdExecutor, HsmArchiveExecutor,

@@ -142,17 +142,7 @@ impl Task for PolicyRunTask {
         }
         tracing::info!(policy_id = self.policy_id, filesystem = %def.filesystem, kind = def.kind.as_str(), "policy loaded");
 
-        // 2. Get executor for this policy kind.
-        let executor: Arc<dyn rbh_actions::ActionExecutor> = match make_executor(def) {
-            Ok(e) => e,
-            Err(reason) => {
-                tracing::warn!(policy_id = self.policy_id, reason, "skipping misconfigured policy");
-                record_run(&pid_lbl, "misconfigured", run_started);
-                return Ok(());
-            }
-        };
-
-        // 3. Build WHERE clause: Tags(match_tags) AND target_filter.
+        // 2. Build WHERE clause: Tags(match_tags) AND target_filter.
         let tags_pred = rbh_predicate::Predicate::Tags {
             match_tags: def.match_tags.clone(),
         };
@@ -223,16 +213,21 @@ impl Task for PolicyRunTask {
         let _low_wm_guard = maybe_spawn_low_watermark_monitor(def, &where_clause, &query_params, cancel.clone(), rt);
 
         let candidate_count = scoped_candidates.len();
-        if def.kind == crate::PolicyKind::Purge {
+        if matches!(
+            def.kind,
+            crate::PolicyKind::Purge | crate::PolicyKind::Alert | crate::PolicyKind::Backup
+        ) {
             let outcome = if self.dry_run {
                 (0, candidate_count as u64, 0)
             } else {
                 let backend = rbh_actions::ActionBackend::new(rt.entry_store.clone(), def.filesystem.clone())
                     .await
                     .map_err(|error| SchedulerError::ExecutionError(error.to_string()))?;
-                dispatch_backend_purge(
+                let action = backend_policy_action(def)?;
+                dispatch_backend_action(
                     scoped_candidates,
                     Arc::new(backend),
+                    action,
                     concurrency,
                     cancel,
                     self.policy_id,
@@ -262,7 +257,14 @@ impl Task for PolicyRunTask {
             tracing::info!(policy_id = self.policy_id, "dry_run mode");
             Arc::new(DryRunExecutor)
         } else {
-            executor
+            match make_executor(def) {
+                Ok(executor) => executor,
+                Err(reason) => {
+                    tracing::warn!(policy_id = self.policy_id, reason, "skipping misconfigured policy");
+                    record_run(&pid_lbl, "misconfigured", run_started);
+                    return Ok(());
+                }
+            }
         };
 
         let (success, skipped, failed) = dispatch_workers(
@@ -483,11 +485,79 @@ impl rbh_actions::ActionExecutor for DryRunExecutor {
 
 // ── Dispatch workers ──────────────────────────────────────────────────────────
 
+#[derive(Clone)]
+enum BackendPolicyAction {
+    Purge,
+    Alert(rbh_actions::BackendAlert),
+    Backup(rbh_actions::BackendBackup),
+}
+
+impl BackendPolicyAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Purge => "purge",
+            Self::Alert(_) => "alert",
+            Self::Backup(_) => "backup",
+        }
+    }
+
+    async fn execute(
+        &self, backend: &dyn rbh_actions::BackendAction, entry: &rbh_entry_store::ScopedEntryRow,
+    ) -> Result<rbh_actions::BackendActionOutcome, rbh_actions::ActionError> {
+        match self {
+            Self::Purge => backend.purge(entry).await,
+            Self::Alert(alert) => backend.alert(entry, alert).await,
+            Self::Backup(backup) => backend.backup(entry, backup).await,
+        }
+    }
+}
+
+fn backend_policy_action(def: &crate::PolicyDef) -> Result<BackendPolicyAction, SchedulerError> {
+    Ok(match def.kind {
+        crate::PolicyKind::Purge => BackendPolicyAction::Purge,
+        crate::PolicyKind::Alert => {
+            let (webhook, log, message) = def
+                .action
+                .alert
+                .as_ref()
+                .map(|alert| (alert.webhook.clone(), alert.log, alert.message.clone()))
+                .unwrap_or((None, true, None));
+            BackendPolicyAction::Alert(rbh_actions::BackendAlert { webhook, log, message })
+        }
+        crate::PolicyKind::Backup => {
+            let config = def
+                .action
+                .backup
+                .as_ref()
+                .ok_or_else(|| SchedulerError::ExecutionError("backup policy has no backup config".into()))?;
+            let (archive_id, hints) = def
+                .action
+                .hsm
+                .as_ref()
+                .map(|hsm| (hsm.archive_id.unwrap_or(1), hsm.hints.clone()))
+                .unwrap_or((1, None));
+            BackendPolicyAction::Backup(rbh_actions::BackendBackup {
+                adapter: Arc::new(config.build()),
+                op: rbh_backup::BackupOp::Archive,
+                archive_id,
+                hints,
+                dest_template: config.dest_template.clone(),
+            })
+        }
+        _ => {
+            return Err(SchedulerError::ExecutionError(format!(
+                "{:?} is not a backend-neutral action",
+                def.kind
+            )));
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_backend_purge(
-    candidates: Vec<rbh_entry_store::ScopedEntryRow>, backend: Arc<dyn rbh_actions::BackendAction>, concurrency: usize,
-    cancel: CancellationToken, policy_id: u64, max_volume: Option<u64>,
-    rate_limiter: Option<crate::ratelimit::RateLimiter>, timeout_secs: Option<u64>,
+async fn dispatch_backend_action(
+    candidates: Vec<rbh_entry_store::ScopedEntryRow>, backend: Arc<dyn rbh_actions::BackendAction>,
+    action: BackendPolicyAction, concurrency: usize, cancel: CancellationToken, policy_id: u64,
+    max_volume: Option<u64>, rate_limiter: Option<crate::ratelimit::RateLimiter>, timeout_secs: Option<u64>,
     retry: Option<crate::model::RetryParams>, skip_hardlinked: bool,
 ) -> (u64, u64, u64) {
     use tokio::sync::Semaphore;
@@ -514,6 +584,7 @@ async fn dispatch_backend_purge(
             break;
         };
         let backend = backend.clone();
+        let action = action.clone();
         let cancel = cancel.clone();
         let attempts = retry.map(|value| value.max_attempts.max(1)).unwrap_or(1);
         let backoff = retry.map(|value| value.backoff_secs).unwrap_or(0);
@@ -523,8 +594,13 @@ async fn dispatch_backend_purge(
                 if cancel.is_cancelled() {
                     return WorkerOutcome::Skipped;
                 }
-                let result =
-                    execute_backend_purge_with_completion_barrier(backend.clone(), entry.clone(), timeout_secs).await;
+                let result = execute_backend_action_with_completion_barrier(
+                    backend.clone(),
+                    action.clone(),
+                    entry.clone(),
+                    timeout_secs,
+                )
+                .await;
                 match result {
                     Ok(rbh_actions::BackendActionOutcome::Success) => return WorkerOutcome::Success,
                     Ok(rbh_actions::BackendActionOutcome::AlreadyMissing) => return WorkerOutcome::Skipped,
@@ -551,34 +627,37 @@ async fn dispatch_backend_purge(
             Ok(WorkerOutcome::Failed) | Err(_) => failed += 1,
         }
     }
-    tracing::debug!(policy_id, success, skipped, failed, "backend purge dispatch complete");
+    tracing::debug!(policy_id, success, skipped, failed, "backend action dispatch complete");
     (success, skipped, failed)
 }
 
-async fn execute_backend_purge_with_completion_barrier(
-    backend: Arc<dyn rbh_actions::BackendAction>, entry: rbh_entry_store::ScopedEntryRow, timeout_secs: Option<u64>,
+async fn execute_backend_action_with_completion_barrier(
+    backend: Arc<dyn rbh_actions::BackendAction>, action: BackendPolicyAction, entry: rbh_entry_store::ScopedEntryRow,
+    timeout_secs: Option<u64>,
 ) -> Result<rbh_actions::BackendActionOutcome, rbh_actions::ActionError> {
     let worker_backend = backend.clone();
     let worker_entry = entry.clone();
-    let mut task = tokio::spawn(async move { worker_backend.purge(&worker_entry).await });
+    let action_name = action.name();
+    let mut task = tokio::spawn(async move { action.execute(worker_backend.as_ref(), &worker_entry).await });
     if let Some(seconds) = timeout_secs {
         match tokio::time::timeout(std::time::Duration::from_secs(seconds), &mut task).await {
             Ok(result) => {
                 return result
-                    .map_err(|error| rbh_actions::ActionError::Store(format!("backend purge join error: {error}")))?;
+                    .map_err(|error| rbh_actions::ActionError::Store(format!("backend action join error: {error}")))?;
             }
             Err(_) => {
                 backend
                     .record_retryable_failure(
                         &entry,
-                        &format!("purge exceeded {seconds}s; waiting for reconciliation"),
+                        action_name,
+                        &format!("{action_name} exceeded {seconds}s; waiting for reconciliation"),
                     )
                     .await?;
             }
         }
     }
     task.await
-        .map_err(|error| rbh_actions::ActionError::Store(format!("backend purge join error: {error}")))?
+        .map_err(|error| rbh_actions::ActionError::Store(format!("backend action join error: {error}")))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -774,9 +853,10 @@ mod tests {
         let backend = Arc::new(RetryableBackend {
             calls: AtomicUsize::new(0),
         });
-        let result = dispatch_backend_purge(
+        let result = dispatch_backend_action(
             vec![entry],
             backend.clone(),
+            BackendPolicyAction::Purge,
             1,
             CancellationToken::new(),
             7,
@@ -816,9 +896,10 @@ mod tests {
             max_bytes_per_sec: None,
         });
         let started = std::time::Instant::now();
-        let result = dispatch_backend_purge(
+        let result = dispatch_backend_action(
             vec![entry.clone(), entry],
             Arc::new(SuccessBackend),
+            BackendPolicyAction::Purge,
             2,
             CancellationToken::new(),
             8,
@@ -847,7 +928,7 @@ mod tests {
         }
 
         async fn record_retryable_failure(
-            &self, _entry: &rbh_entry_store::ScopedEntryRow, _error: &str,
+            &self, _entry: &rbh_entry_store::ScopedEntryRow, _action: &str, _error: &str,
         ) -> Result<(), rbh_actions::ActionError> {
             self.recorded.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -863,9 +944,10 @@ mod tests {
         let backend = Arc::new(SlowBackend {
             recorded: AtomicUsize::new(0),
         });
-        let outcome = execute_backend_purge_with_completion_barrier(backend.clone(), entry, Some(0))
-            .await
-            .unwrap();
+        let outcome =
+            execute_backend_action_with_completion_barrier(backend.clone(), BackendPolicyAction::Purge, entry, Some(0))
+                .await
+                .unwrap();
         assert_eq!(outcome, rbh_actions::BackendActionOutcome::Success);
         assert_eq!(backend.recorded.load(Ordering::SeqCst), 1);
     }

@@ -1,9 +1,10 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use rbh_actions::{ActionBackend, BackendAction, BackendActionOutcome};
+use rbh_actions::{ActionBackend, BackendAction, BackendActionOutcome, BackendAlert, BackendBackup};
 use rbh_entry_store::model::ScopedNamespaceEdge;
 use rbh_entry_store::{
     BackendCapabilities, BackendKind, EntryKey, EntryKind, EntryStore, FileSystemConfig, FileSystemId, ObjectId,
@@ -12,6 +13,24 @@ use rbh_entry_store::{
 
 fn enabled() -> bool {
     matches!(std::env::var("RBH_LUSTRE_INTEGRATION"), Ok(value) if !value.is_empty() && value != "0")
+}
+
+struct RecordingBackup(Arc<Mutex<Vec<PathBuf>>>);
+
+#[async_trait::async_trait]
+impl rbh_backup::BackupAdapter for RecordingBackup {
+    async fn archive(&self, invocation: &rbh_backup::ToolInvocation<'_>) -> Result<(), rbh_backup::BackupError> {
+        self.0.lock().unwrap().push(invocation.src.to_path_buf());
+        Ok(())
+    }
+
+    async fn restore(&self, _: &rbh_backup::ToolInvocation<'_>) -> Result<(), rbh_backup::BackupError> {
+        Ok(())
+    }
+
+    async fn remove(&self, _: &rbh_backup::ToolInvocation<'_>) -> Result<(), rbh_backup::BackupError> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -106,6 +125,38 @@ async fn lustre_purge_uses_the_same_backend_contract_and_native_fid() {
         .await
         .unwrap();
     let backend = ActionBackend::new(store.clone(), filesystem).await.unwrap();
+    assert_eq!(
+        backend
+            .alert(
+                &entry,
+                &BackendAlert {
+                    webhook: None,
+                    log: false,
+                    message: Some("lustre regression".into()),
+                },
+            )
+            .await
+            .unwrap(),
+        BackendActionOutcome::Success
+    );
+    let sources = Arc::new(Mutex::new(Vec::new()));
+    assert_eq!(
+        backend
+            .backup(
+                &entry,
+                &BackendBackup {
+                    adapter: Arc::new(RecordingBackup(sources.clone())),
+                    op: rbh_backup::BackupOp::Archive,
+                    archive_id: 1,
+                    hints: None,
+                    dest_template: None,
+                },
+            )
+            .await
+            .unwrap(),
+        BackendActionOutcome::Success
+    );
+    assert_eq!(sources.lock().unwrap().as_slice(), &[Path::new(&path).to_path_buf()]);
     assert_eq!(backend.purge(&entry).await.unwrap(), BackendActionOutcome::Success);
     assert!(!path.exists());
     assert!(store.get_scoped_entry(&key).await.unwrap().is_none());

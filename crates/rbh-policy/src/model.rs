@@ -407,6 +407,48 @@ mod tests {
     }
 
     #[test]
+    fn juicefs_alert_and_configured_backup_are_backend_neutral() {
+        let config = rbh_entry_store::FileSystemConfig {
+            id: rbh_entry_store::FileSystemId::new("juice-a").unwrap(),
+            backend: rbh_entry_store::BackendKind::JuiceFs,
+            mount_path: "/jfs".into(),
+            capabilities: rbh_entry_store::BackendCapabilities {
+                namespace: true,
+                ..Default::default()
+            },
+        };
+        let alert: PolicyDef =
+            serde_json::from_str(r#"{"name":"juice-alert","filesystem":"juice-a","kind":"alert","trigger":"1h"}"#)
+                .unwrap();
+        let backup: PolicyDef = serde_json::from_str(
+            r#"{"name":"juice-backup","filesystem":"juice-a","kind":"backup","trigger":"1h","action":{"backup":{"command":"backup-tool"}}}"#,
+        )
+        .unwrap();
+        crate::validate_policy_for_filesystem(&alert, &config).unwrap();
+        crate::validate_policy_for_filesystem(&backup, &config).unwrap();
+    }
+
+    #[test]
+    fn juicefs_backup_without_adapter_configuration_is_rejected() {
+        let def: PolicyDef =
+            serde_json::from_str(r#"{"name":"juice-backup","filesystem":"juice-a","kind":"backup","trigger":"1h"}"#)
+                .unwrap();
+        let config = rbh_entry_store::FileSystemConfig {
+            id: def.filesystem.clone(),
+            backend: rbh_entry_store::BackendKind::JuiceFs,
+            mount_path: "/jfs".into(),
+            capabilities: rbh_entry_store::BackendCapabilities {
+                namespace: true,
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            crate::validate_policy_for_filesystem(&def, &config),
+            Err(crate::PolicyError::InvalidAction(_))
+        ));
+    }
+
+    #[test]
     fn existing_lustre_hsm_and_ost_policy_remains_valid() {
         let def: PolicyDef = serde_json::from_str(
             r#"{

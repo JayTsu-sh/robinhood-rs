@@ -47,6 +47,8 @@ pub enum PolicyError {
     Store(String),
     #[error("invalid trigger: {0}")]
     InvalidTrigger(String),
+    #[error("invalid action configuration: {0}")]
+    InvalidAction(String),
     #[error("scheduler error: {0}")]
     Scheduler(String),
     #[error("policy selects filesystem {policy}, but validation used {configured}")]
