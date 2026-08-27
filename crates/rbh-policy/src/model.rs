@@ -389,6 +389,24 @@ mod tests {
     }
 
     #[test]
+    fn juicefs_purge_policy_is_accepted_when_purge_capability_is_enabled() {
+        let def: PolicyDef =
+            serde_json::from_str(r#"{"name":"juice-purge","filesystem":"juice-a","kind":"purge","trigger":"1h"}"#)
+                .unwrap();
+        let config = rbh_entry_store::FileSystemConfig {
+            id: def.filesystem.clone(),
+            backend: rbh_entry_store::BackendKind::JuiceFs,
+            mount_path: "/jfs".into(),
+            capabilities: rbh_entry_store::BackendCapabilities {
+                namespace: true,
+                purge: true,
+                ..Default::default()
+            },
+        };
+        crate::validate_policy_for_filesystem(&def, &config).unwrap();
+    }
+
+    #[test]
     fn existing_lustre_hsm_and_ost_policy_remains_valid() {
         let def: PolicyDef = serde_json::from_str(
             r#"{

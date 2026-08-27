@@ -179,7 +179,7 @@ impl Task for PolicyRunTask {
             .and_then(|s| s.column())
             .map(|col| format!("{col} ASC"));
 
-        let candidates = match rt
+        let scoped_candidates = match rt
             .entry_store
             .query_scoped_page(
                 &def.filesystem,
@@ -191,19 +191,7 @@ impl Task for PolicyRunTask {
             )
             .await
         {
-            Ok(rows) => {
-                let mut candidates = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let Some(entry) = row.to_lustre_compat() else {
-                        return Err(SchedulerError::ExecutionError(format!(
-                            "filesystem {} requires an ActionBackend before policy execution",
-                            def.filesystem
-                        )));
-                    };
-                    candidates.push(entry);
-                }
-                candidates
-            }
+            Ok(rows) => rows,
             Err(e) => {
                 tracing::error!(error = %e, "failed to query candidates");
                 return Err(SchedulerError::ExecutionError(e.to_string()));
@@ -212,7 +200,7 @@ impl Task for PolicyRunTask {
 
         tracing::info!(
             policy_id = self.policy_id,
-            candidate_count = candidates.len(),
+            candidate_count = scoped_candidates.len(),
             "candidates queried"
         );
 
@@ -234,7 +222,42 @@ impl Task for PolicyRunTask {
         // Low-watermark monitor: cancel dispatch when measure drops below low threshold.
         let _low_wm_guard = maybe_spawn_low_watermark_monitor(def, &where_clause, &query_params, cancel.clone(), rt);
 
-        let candidate_count = candidates.len();
+        let candidate_count = scoped_candidates.len();
+        if def.kind == crate::PolicyKind::Purge {
+            let outcome = if self.dry_run {
+                (0, candidate_count as u64, 0)
+            } else {
+                let backend = rbh_actions::ActionBackend::new(rt.entry_store.clone(), def.filesystem.clone())
+                    .await
+                    .map_err(|error| SchedulerError::ExecutionError(error.to_string()))?;
+                dispatch_backend_purge(
+                    scoped_candidates,
+                    Arc::new(backend),
+                    concurrency,
+                    cancel,
+                    self.policy_id,
+                    def.action.max_volume,
+                    rate_limiter,
+                    def.action.timeout_secs,
+                    def.action.retry,
+                    def.action.skip_hardlinked,
+                )
+                .await
+            };
+            finish_run(self.policy_id, &pid_lbl, candidate_count, outcome, run_started);
+            return Ok(());
+        }
+        let candidates = scoped_candidates
+            .into_iter()
+            .map(|row| {
+                row.to_lustre_compat().ok_or_else(|| {
+                    SchedulerError::ExecutionError(format!(
+                        "filesystem {} requires an ActionBackend before policy execution",
+                        def.filesystem
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let effective_executor: Arc<dyn rbh_actions::ActionExecutor> = if self.dry_run {
             tracing::info!(policy_id = self.policy_id, "dry_run mode");
             Arc::new(DryRunExecutor)
@@ -257,36 +280,48 @@ impl Task for PolicyRunTask {
         )
         .await;
 
-        tracing::info!(
-            policy_id = self.policy_id,
-            candidates = candidate_count,
-            success,
-            skipped,
-            failed,
-            "policy run completed"
+        finish_run(
+            self.policy_id,
+            &pid_lbl,
+            candidate_count,
+            (success, skipped, failed),
+            run_started,
         );
-
-        let outcome = if failed == 0 && candidate_count == 0 {
-            "empty"
-        } else if failed == 0 {
-            "success"
-        } else if success > 0 {
-            "partial"
-        } else {
-            "failed"
-        };
-        rbh_observability::metrics::ACTIONS
-            .with_label_values(&[pid_lbl.as_str(), "success"])
-            .inc_by(success);
-        rbh_observability::metrics::ACTIONS
-            .with_label_values(&[pid_lbl.as_str(), "skipped"])
-            .inc_by(skipped);
-        rbh_observability::metrics::ACTIONS
-            .with_label_values(&[pid_lbl.as_str(), "failed"])
-            .inc_by(failed);
-        record_run(&pid_lbl, outcome, run_started);
         Ok(())
     }
+}
+
+fn finish_run(
+    policy_id: u64, pid_lbl: &str, candidate_count: usize, counts: (u64, u64, u64), run_started: std::time::Instant,
+) {
+    let (success, skipped, failed) = counts;
+    tracing::info!(
+        policy_id,
+        candidates = candidate_count,
+        success,
+        skipped,
+        failed,
+        "policy run completed"
+    );
+    let outcome = if failed == 0 && candidate_count == 0 {
+        "empty"
+    } else if failed == 0 {
+        "success"
+    } else if success > 0 {
+        "partial"
+    } else {
+        "failed"
+    };
+    rbh_observability::metrics::ACTIONS
+        .with_label_values(&[pid_lbl, "success"])
+        .inc_by(success);
+    rbh_observability::metrics::ACTIONS
+        .with_label_values(&[pid_lbl, "skipped"])
+        .inc_by(skipped);
+    rbh_observability::metrics::ACTIONS
+        .with_label_values(&[pid_lbl, "failed"])
+        .inc_by(failed);
+    record_run(pid_lbl, outcome, run_started);
 }
 
 fn record_run(pid: &str, outcome: &str, started: std::time::Instant) {
@@ -449,6 +484,104 @@ impl rbh_actions::ActionExecutor for DryRunExecutor {
 // ── Dispatch workers ──────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+async fn dispatch_backend_purge(
+    candidates: Vec<rbh_entry_store::ScopedEntryRow>, backend: Arc<dyn rbh_actions::BackendAction>, concurrency: usize,
+    cancel: CancellationToken, policy_id: u64, max_volume: Option<u64>,
+    rate_limiter: Option<crate::ratelimit::RateLimiter>, timeout_secs: Option<u64>,
+    retry: Option<crate::model::RetryParams>, skip_hardlinked: bool,
+) -> (u64, u64, u64) {
+    use tokio::sync::Semaphore;
+    let sem = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut set = tokio::task::JoinSet::new();
+    let mut bytes = 0u64;
+    let mut skipped = 0u64;
+    for entry in candidates {
+        if cancel.is_cancelled() {
+            break;
+        }
+        if skip_hardlinked && entry.nlink > 1 {
+            skipped += 1;
+            continue;
+        }
+        if max_volume.is_some_and(|limit| bytes.saturating_add(entry.size) > limit) {
+            break;
+        }
+        bytes = bytes.saturating_add(entry.size);
+        if let Some(limiter) = &rate_limiter {
+            limiter.acquire(entry.size).await;
+        }
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            break;
+        };
+        let backend = backend.clone();
+        let cancel = cancel.clone();
+        let attempts = retry.map(|value| value.max_attempts.max(1)).unwrap_or(1);
+        let backoff = retry.map(|value| value.backoff_secs).unwrap_or(0);
+        set.spawn(async move {
+            let _permit = permit;
+            for attempt in 1..=attempts {
+                if cancel.is_cancelled() {
+                    return WorkerOutcome::Skipped;
+                }
+                let result =
+                    execute_backend_purge_with_completion_barrier(backend.clone(), entry.clone(), timeout_secs).await;
+                match result {
+                    Ok(rbh_actions::BackendActionOutcome::Success) => return WorkerOutcome::Success,
+                    Ok(rbh_actions::BackendActionOutcome::AlreadyMissing) => return WorkerOutcome::Skipped,
+                    Ok(rbh_actions::BackendActionOutcome::Failed { retryable: false, .. }) => {
+                        return WorkerOutcome::Failed;
+                    }
+                    Ok(rbh_actions::BackendActionOutcome::Failed { retryable: true, .. }) | Err(_)
+                        if attempt < attempts =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    }
+                    Ok(rbh_actions::BackendActionOutcome::Failed { .. }) | Err(_) => return WorkerOutcome::Failed,
+                }
+            }
+            WorkerOutcome::Failed
+        });
+    }
+    let mut success = 0;
+    let mut failed = 0;
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok(WorkerOutcome::Success) => success += 1,
+            Ok(WorkerOutcome::Skipped) => skipped += 1,
+            Ok(WorkerOutcome::Failed) | Err(_) => failed += 1,
+        }
+    }
+    tracing::debug!(policy_id, success, skipped, failed, "backend purge dispatch complete");
+    (success, skipped, failed)
+}
+
+async fn execute_backend_purge_with_completion_barrier(
+    backend: Arc<dyn rbh_actions::BackendAction>, entry: rbh_entry_store::ScopedEntryRow, timeout_secs: Option<u64>,
+) -> Result<rbh_actions::BackendActionOutcome, rbh_actions::ActionError> {
+    let worker_backend = backend.clone();
+    let worker_entry = entry.clone();
+    let mut task = tokio::spawn(async move { worker_backend.purge(&worker_entry).await });
+    if let Some(seconds) = timeout_secs {
+        match tokio::time::timeout(std::time::Duration::from_secs(seconds), &mut task).await {
+            Ok(result) => {
+                return result
+                    .map_err(|error| rbh_actions::ActionError::Store(format!("backend purge join error: {error}")))?;
+            }
+            Err(_) => {
+                backend
+                    .record_retryable_failure(
+                        &entry,
+                        &format!("purge exceeded {seconds}s; waiting for reconciliation"),
+                    )
+                    .await?;
+            }
+        }
+    }
+    task.await
+        .map_err(|error| rbh_actions::ActionError::Store(format!("backend purge join error: {error}")))?
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_workers(
     candidates: Vec<rbh_entry_store::model::EntryRow>, executor: Arc<dyn rbh_actions::ActionExecutor>,
     action_ctx: Arc<rbh_actions::ActionContext>, concurrency: usize,
@@ -584,6 +717,7 @@ mod tests {
     use lustre_api::LuFid;
     use rbh_entry_store::model::{EntryKind, EntryRow};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_entry() -> EntryRow {
         EntryRow {
@@ -609,6 +743,131 @@ mod tests {
             last_seen: 1_775_955_820,
             depth: 2,
         }
+    }
+
+    struct RetryableBackend {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl rbh_actions::BackendAction for RetryableBackend {
+        async fn purge(
+            &self, _entry: &rbh_entry_store::ScopedEntryRow,
+        ) -> Result<rbh_actions::BackendActionOutcome, rbh_actions::ActionError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(rbh_actions::BackendActionOutcome::Failed {
+                    error: "transient".into(),
+                    retryable: true,
+                })
+            } else {
+                Ok(rbh_actions::BackendActionOutcome::Success)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_purge_retries_only_retryable_failures() {
+        let entry = rbh_entry_store::ScopedEntryRow::from_lustre(
+            rbh_entry_store::FileSystemId::new("lustre").unwrap(),
+            &test_entry(),
+        );
+        let backend = Arc::new(RetryableBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let result = dispatch_backend_purge(
+            vec![entry],
+            backend.clone(),
+            1,
+            CancellationToken::new(),
+            7,
+            None,
+            None,
+            None,
+            Some(crate::model::RetryParams {
+                max_attempts: 2,
+                backoff_secs: 0,
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(result, (1, 0, 0));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct SuccessBackend;
+
+    #[async_trait]
+    impl rbh_actions::BackendAction for SuccessBackend {
+        async fn purge(
+            &self, _entry: &rbh_entry_store::ScopedEntryRow,
+        ) -> Result<rbh_actions::BackendActionOutcome, rbh_actions::ActionError> {
+            Ok(rbh_actions::BackendActionOutcome::Success)
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_purge_preserves_policy_rate_limits() {
+        let entry = rbh_entry_store::ScopedEntryRow::from_lustre(
+            rbh_entry_store::FileSystemId::new("lustre").unwrap(),
+            &test_entry(),
+        );
+        let limiter = crate::ratelimit::RateLimiter::from_spec(&crate::model::RateLimit {
+            max_per_sec: Some(1),
+            max_bytes_per_sec: None,
+        });
+        let started = std::time::Instant::now();
+        let result = dispatch_backend_purge(
+            vec![entry.clone(), entry],
+            Arc::new(SuccessBackend),
+            2,
+            CancellationToken::new(),
+            8,
+            None,
+            limiter,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(result, (2, 0, 0));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+    }
+
+    struct SlowBackend {
+        recorded: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl rbh_actions::BackendAction for SlowBackend {
+        async fn purge(
+            &self, _entry: &rbh_entry_store::ScopedEntryRow,
+        ) -> Result<rbh_actions::BackendActionOutcome, rbh_actions::ActionError> {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(rbh_actions::BackendActionOutcome::Success)
+        }
+
+        async fn record_retryable_failure(
+            &self, _entry: &rbh_entry_store::ScopedEntryRow, _error: &str,
+        ) -> Result<(), rbh_actions::ActionError> {
+            self.recorded.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_timeout_records_retryable_state_and_waits_for_completion() {
+        let entry = rbh_entry_store::ScopedEntryRow::from_lustre(
+            rbh_entry_store::FileSystemId::new("lustre").unwrap(),
+            &test_entry(),
+        );
+        let backend = Arc::new(SlowBackend {
+            recorded: AtomicUsize::new(0),
+        });
+        let outcome = execute_backend_purge_with_completion_barrier(backend.clone(), entry, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(outcome, rbh_actions::BackendActionOutcome::Success);
+        assert_eq!(backend.recorded.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -660,7 +919,6 @@ mod tests {
 
     // --- dispatch_workers tests -----------------------------------------
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     struct RecordingExecutor {

@@ -1926,14 +1926,19 @@ dependencies = [
  "async-trait",
  "bytes",
  "lustre-api",
+ "nix",
  "rbh-backup",
  "rbh-entry-store",
+ "rbh-namespace",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

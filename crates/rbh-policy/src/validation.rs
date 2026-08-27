@@ -65,9 +65,9 @@ pub fn validate_policy_for_filesystem(def: &PolicyDef, config: &FileSystemConfig
     }?;
     require(
         config,
-        config.backend == BackendKind::Lustre,
+        config.backend == BackendKind::Lustre || def.kind == PolicyKind::Purge,
         "action_backend",
-        "this delivery stage has no action adapter for JuiceFS; use a Lustre filesystem or disable the policy",
+        "this action has no JuiceFS backend adapter; only purge is currently supported",
     )
 }
 

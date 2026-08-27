@@ -10,7 +10,10 @@
 //! * `Alert`      → [`AlertExecutor`]         (webhook / tracing log)
 //! * `Backup`     → [`BackupExecutor`]        (external rbhext_tool protocol)
 
+mod backend;
 mod executor;
+
+pub use backend::{ActionBackend, BackendAction, BackendActionOutcome};
 
 pub use executor::{
     ActionContext, ActionExecutor, ActionOutcome, AlertExecutor, BackupExecutor, CmdExecutor, HsmArchiveExecutor,
@@ -32,4 +35,8 @@ pub enum ActionError {
     NotImplemented(String),
     #[error("entry has no path (parent_fid or name missing)")]
     NoPath,
+    #[error("backend capability error: {0}")]
+    Capability(String),
+    #[error("namespace action failed: {0}")]
+    Namespace(#[from] rbh_namespace::NamespaceError),
 }

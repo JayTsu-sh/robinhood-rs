@@ -9,6 +9,8 @@ description = "Action executors (Purge/HsmArchive/HsmRelease) + dispatch by Poli
 [dependencies]
 lustre-api = { path = "../lustre-api" }
 rbh-entry-store = { path = "../rbh-entry-store" }
+rbh-namespace = { path = "../rbh-namespace" }
+nix = { version = "0.29", features = ["fs"] }
 rbh-backup = { path = "../rbh-backup" }
 
 async-trait = { workspace = true }
@@ -18,7 +20,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 bytes = { workspace = true }
+sqlx = { workspace = true }
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt"] }
