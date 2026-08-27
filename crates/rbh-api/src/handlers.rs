@@ -706,24 +706,14 @@ async fn du_report(
     let root = match (q.fid.as_deref(), q.path.as_deref()) {
         (Some(value), None) => scoped_key_from_text(&state, q.filesystem.clone(), value).await?,
         (None, Some(p)) => {
-            let config = state
-                .entry_store
-                .get_filesystem(&q.filesystem)
+            let namespace = rbh_namespace::NamespaceAdapter::new(state.entry_store.clone(), q.filesystem.clone())
                 .await
-                .map_err(|e| ApiError::Internal(e.to_string()))?
-                .ok_or_else(|| ApiError::BadRequest(format!("unknown filesystem: {}", q.filesystem)))?;
-            if config.backend != rbh_entry_store::BackendKind::Lustre {
-                return Err(ApiError::BadRequest(
-                    "path lookup is only available for Lustre until Namespace adapters land".into(),
-                ));
-            }
-            let lustre = lustre_api::LustreApi;
-            let path = std::path::PathBuf::from(p);
-            let fid = tokio::task::spawn_blocking(move || lustre.path_to_fid(&path))
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            namespace
+                .resolve(rbh_namespace::NamespaceTarget::Path(std::path::PathBuf::from(p)))
                 .await
-                .map_err(|e| ApiError::Internal(format!("join: {e}")))?
-                .map_err(|e| ApiError::Internal(format!("path_to_fid: {e}")))?;
-            rbh_entry_store::EntryKey::new(q.filesystem.clone(), ObjectId::Lustre(fid))
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?
+                .key
         }
         _ => {
             return Err(ApiError::Internal("exactly one of fid / path must be provided".into()));
@@ -1139,6 +1129,7 @@ mod scoped_api_tests {
     use rbh_entry_store::{EntryKey, ScopedEntryRow};
     use sqlx::mysql::MySqlPoolOptions;
     use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use tokio::sync::{Mutex, RwLock};
 
@@ -1290,5 +1281,107 @@ mod scoped_api_tests {
             assert_eq!(report_body["rows"].as_array().unwrap().len(), 1);
             assert_eq!(report_body["rows"][0]["name"], expected_name);
         }
+    }
+
+    #[tokio::test]
+    async fn du_path_uses_juicefs_namespace_adapter() {
+        if !integration_enabled() {
+            return;
+        }
+        let store = rbh_entry_store::EntryStore::connect("mysql://root@localhost/rbh_entries_test")
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("juice");
+        std::fs::create_dir(&mount).unwrap();
+        let path = mount.join("du-file");
+        std::fs::write(&path, b"1234567").unwrap();
+        let filesystem = FileSystemId::new(format!("api-du-{}", std::process::id())).unwrap();
+        store
+            .register_filesystem(&rbh_entry_store::FileSystemConfig {
+                id: filesystem.clone(),
+                backend: rbh_entry_store::BackendKind::JuiceFs,
+                mount_path: mount.clone(),
+                capabilities: rbh_entry_store::BackendCapabilities {
+                    namespace: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let root = EntryKey::new(
+            filesystem.clone(),
+            ObjectId::JuiceFs(std::fs::metadata(&mount).unwrap().ino()),
+        );
+        let object_inode = std::fs::metadata(&path).unwrap().ino();
+        let object = EntryKey::new(filesystem.clone(), ObjectId::JuiceFs(object_inode));
+        for (key, parent, name, kind, size) in [
+            (root.clone(), None, b"".as_slice(), EntryKind::Directory, 0),
+            (
+                object.clone(),
+                Some(root.clone()),
+                b"du-file".as_slice(),
+                EntryKind::File,
+                7,
+            ),
+        ] {
+            store
+                .upsert_scoped_entry(&ScopedEntryRow {
+                    key,
+                    parent,
+                    name: Bytes::copy_from_slice(name),
+                    kind,
+                    size,
+                    blocks: 1,
+                    uid: 0,
+                    gid: 0,
+                    projid: 0,
+                    mode: 0o644,
+                    nlink: 1,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    stripe_count: None,
+                    stripe_size: None,
+                    stripe_items: Vec::new(),
+                    pool_name: None,
+                    sm_status: serde_json::json!({}),
+                    last_seen: 0,
+                    depth: if kind == EntryKind::File { 1 } else { 0 },
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .upsert_scoped_namespace_edge(&rbh_entry_store::model::ScopedNamespaceEdge {
+                filesystem: filesystem.clone(),
+                parent: *root.object(),
+                name: Bytes::from_static(b"du-file"),
+                object: *object.object(),
+            })
+            .await
+            .unwrap();
+        let pool = store.pool().clone();
+        let server = TestServer::new(crate::router(AppState {
+            policy_store: rbh_policy::PolicyStore::new(pool.clone()),
+            classifier_store: rbh_policy::ClassifierStore::new(pool),
+            classifier_cache: Arc::new(RwLock::new(Vec::new())),
+            entry_store: store,
+            scheduler: None,
+            scans: Arc::new(Mutex::new(HashMap::new())),
+        }))
+        .unwrap();
+        let response = server
+            .get(&format!(
+                "/api/reports/du?filesystem={filesystem}&path={}",
+                path.display()
+            ))
+            .await;
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["filesystem"], filesystem.as_str());
+        assert_eq!(body["object_id"], serde_json::json!({"juice_fs": object_inode}));
+        assert_eq!(body["file_count"], 1);
+        assert_eq!(body["total_bytes"], 7);
     }
 }

@@ -263,6 +263,57 @@ impl EntryStore {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Resolve one parent/name edge inside exactly one filesystem.
+    #[tracing::instrument(name = "store.lookup_scoped_namespace_child", skip(self, name), fields(filesystem = %filesystem))]
+    pub async fn lookup_scoped_namespace_child(
+        &self, filesystem: &FileSystemId, parent: ObjectId, name: &[u8],
+    ) -> Result<Option<EntryKey>> {
+        let (parent_kind, parent_id) = encode_object_id(parent);
+        let row = sqlx::query(
+            r"SELECT object_kind, object_id FROM scoped_namespace_edges
+              WHERE filesystem_id = ? AND parent_kind = ? AND parent_id = ? AND name = ?",
+        )
+        .bind(filesystem.as_str())
+        .bind(parent_kind)
+        .bind(parent_id.as_slice())
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(EntryKey::new(
+                filesystem.clone(),
+                decode_object_id(row.try_get("object_kind")?, &row.try_get::<Vec<u8>, _>("object_id")?)?,
+            ))
+        })
+        .transpose()
+    }
+
+    /// List every cataloged hard-link edge for one object, deterministically.
+    #[tracing::instrument(name = "store.list_scoped_object_edges", skip(self), fields(filesystem = %key.filesystem()))]
+    pub async fn list_scoped_object_edges(&self, key: &EntryKey) -> Result<Vec<ScopedNamespaceEdge>> {
+        let (object_kind, object_id) = encode_object_id(*key.object());
+        let rows = sqlx::query(
+            r"SELECT parent_kind, parent_id, name FROM scoped_namespace_edges
+              WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?
+              ORDER BY parent_kind, parent_id, name",
+        )
+        .bind(key.filesystem().as_str())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ScopedNamespaceEdge {
+                    filesystem: key.filesystem().clone(),
+                    parent: decode_object_id(row.try_get("parent_kind")?, &row.try_get::<Vec<u8>, _>("parent_id")?)?,
+                    name: bytes::Bytes::from(row.try_get::<Vec<u8>, _>("name")?),
+                    object: *key.object(),
+                })
+            })
+            .collect()
+    }
+
     /// Atomically add one hard-link edge and increment the inode link count.
     /// An exact replay leaves both records unchanged.
     #[tracing::instrument(name = "store.apply_scoped_hardlink", skip(self, edge), fields(filesystem = %edge.filesystem))]

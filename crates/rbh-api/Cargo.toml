@@ -12,6 +12,7 @@ rbh-policy = { path = "../rbh-policy" }
 rbh-fs-scan = { path = "../rbh-fs-scan" }
 rbh-predicate = { path = "../rbh-predicate" }
 rbh-observability = { path = "../rbh-observability" }
+rbh-namespace = { path = "../rbh-namespace" }
 lustre-api = { path = "../lustre-api" }
 scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", features = ["sqlx-mysql"] }
 
@@ -31,3 +32,4 @@ uuid = { version = "1", features = ["v4"] }
 axum-test = "17"
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile = "3"

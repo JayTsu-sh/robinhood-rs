@@ -1,0 +1,22 @@
+[package]
+name = "rbh-namespace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Filesystem-scoped path resolution and metadata adapters for Lustre and JuiceFS."
+
+[dependencies]
+lustre-api = { path = "../lustre-api" }
+rbh-entry-store = { path = "../rbh-entry-store" }
+
+bytes = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

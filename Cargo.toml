@@ -20,6 +20,7 @@ members = [
     "crates/rbh-entry-store",
     "crates/rbh-predicate",
     "crates/rbh-fs-scan",
+    "crates/rbh-namespace",
     "crates/rbh-policy",
     "crates/rbh-actions",
     "crates/rbh-api",

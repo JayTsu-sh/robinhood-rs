@@ -86,6 +86,12 @@ export RBH_CHANGELOG_USER=cl1            # register via `lctl changelog_register
 Catalog commands require `--filesystem ID` (or `RBH_FILESYSTEM=ID`); there is
 no implicit global catalog scope.
 
+Path lookup and stat use the filesystem-scoped `rbh-namespace` interface.
+Lustre adapters keep native `path2fid`/`fid2path` behavior; JuiceFS adapters
+walk the cataloged parent/name graph and verify the resulting inode through the
+configured mount. An adapter rejects keys and paths from another filesystem,
+and reports missing parents and stale catalog paths as distinct typed errors.
+
 | `rbh` subcommand | Purpose |
 |------------------|---------|
 | `find`          | find(1)-style catalog query (`--user --type --size --mtime --hsm-state --sort` etc.) |

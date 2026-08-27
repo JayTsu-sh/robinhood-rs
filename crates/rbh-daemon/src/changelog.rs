@@ -334,7 +334,13 @@ async fn apply_juicefs_change(
             ..
         } => {
             let parent_key = EntryKey::new(filesystem.clone(), *parent);
-            let path = juicefs_child_path(store, mount, &parent_key, name).await?;
+            let parent_path = rbh_namespace::NamespaceAdapter::new(store.clone(), filesystem.clone())
+                .await?
+                .resolve(rbh_namespace::NamespaceTarget::Object(parent_key.clone()))
+                .await?
+                .path;
+            use std::os::unix::ffi::OsStringExt;
+            let path = parent_path.join(std::ffi::OsString::from_vec(name.to_vec()));
             let live = tokio::fs::symlink_metadata(&path).await.ok();
             if let Some(live) = &live
                 && live.ino() != object_inode(object)?
@@ -429,7 +435,11 @@ async fn apply_juicefs_change(
                 .get_scoped_entry(&key)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("change references an uncataloged inode"))?;
-            let path = juicefs_object_path(store, mount, &key).await?;
+            let path = rbh_namespace::NamespaceAdapter::new(store.clone(), filesystem.clone())
+                .await?
+                .resolve(rbh_namespace::NamespaceTarget::Object(key.clone()))
+                .await?
+                .path;
             let live = tokio::fs::symlink_metadata(&path).await?;
             if live.ino() != object_inode(object)? {
                 anyhow::bail!("JuiceFS inode changed before metadata apply: {}", path.display());
@@ -470,39 +480,6 @@ fn object_inode(object: ObjectId) -> anyhow::Result<u64> {
         ObjectId::JuiceFs(inode) => Ok(inode),
         ObjectId::Lustre(_) => anyhow::bail!("expected JuiceFS inode"),
     }
-}
-
-async fn juicefs_child_path(
-    store: &EntryStore, mount: &Path, parent: &EntryKey, name: &Bytes,
-) -> anyhow::Result<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    Ok(juicefs_object_path(store, mount, parent)
-        .await?
-        .join(std::ffi::OsString::from_vec(name.to_vec())))
-}
-
-async fn juicefs_object_path(store: &EntryStore, mount: &Path, key: &EntryKey) -> anyhow::Result<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    let mut current = key.clone();
-    let mut names: Vec<Vec<u8>> = Vec::new();
-    for _ in 0..1024 {
-        if current.object() == &ObjectId::JuiceFs(1) {
-            let mut path = mount.to_path_buf();
-            for name in names.iter().rev() {
-                path.push(std::ffi::OsString::from_vec(name.clone()));
-            }
-            return Ok(path);
-        }
-        let entry = store
-            .get_scoped_entry(&current)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("missing JuiceFS namespace parent"))?;
-        names.push(entry.name.to_vec());
-        current = entry
-            .parent
-            .ok_or_else(|| anyhow::anyhow!("JuiceFS namespace chain has no root"))?;
-    }
-    anyhow::bail!("JuiceFS namespace chain exceeds 1024 parents")
 }
 
 /// Run all enabled classifiers against a single entry in-memory and write back any tags.

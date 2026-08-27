@@ -1948,6 +1948,7 @@ dependencies = [
  "nix",
  "rbh-entry-store",
  "rbh-fs-scan",
+ "rbh-namespace",
  "rbh-observability",
  "rbh-policy",
  "rbh-predicate",
@@ -1955,6 +1956,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower-http",
@@ -2042,6 +2044,7 @@ dependencies = [
  "rbh-change-source",
  "rbh-entry-store",
  "rbh-fs-scan",
+ "rbh-namespace",
  "rbh-observability",
  "rbh-policy",
  "rbh-predicate",
@@ -2082,6 +2085,21 @@ dependencies = [
  "lustre-api",
  "rbh-entry-store",
  "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rbh-namespace"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "lustre-api",
+ "rbh-entry-store",
+ "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror",
  "tokio",
