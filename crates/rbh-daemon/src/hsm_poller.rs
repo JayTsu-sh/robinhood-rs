@@ -28,12 +28,13 @@ use tokio_util::sync::CancellationToken;
 
 use lustre_api::LustreApi;
 use lustre_api::hsm::HsmState;
-use rbh_entry_store::model::{EntryKind, EntryRow};
+use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId};
 use rbh_entry_store::store::{EntryStore, QueryParam};
 
 pub struct HsmPoller {
     pub entry_store: EntryStore,
     pub lustre: LustreApi,
+    pub filesystem_id: FileSystemId,
     pub mount_path: std::path::PathBuf,
     pub tick: Duration,
     pub batch: u64,
@@ -44,6 +45,7 @@ pub struct HsmPoller {
 impl HsmPoller {
     pub async fn run(self) {
         tracing::info!(
+            filesystem = %self.filesystem_id,
             tick_secs = self.tick.as_secs(),
             batch = self.batch,
             pause_ms = self.pause_between_batches.as_millis() as u64,
@@ -58,6 +60,7 @@ impl HsmPoller {
             match self.one_cycle().await {
                 Ok(stats) => {
                     tracing::info!(
+                        filesystem = %self.filesystem_id,
                         scanned = stats.scanned,
                         reconciled = stats.reconciled,
                         errors = stats.errors,
@@ -66,7 +69,7 @@ impl HsmPoller {
                     rbh_observability::metrics::HSM_POLL_RECONCILED.inc_by(stats.reconciled);
                     rbh_observability::metrics::HSM_POLL_SCANNED.inc_by(stats.scanned);
                 }
-                Err(e) => tracing::warn!(error = %e, "hsm poller cycle error"),
+                Err(e) => tracing::warn!(filesystem = %self.filesystem_id, error = %e, "hsm poller cycle error"),
             }
 
             tokio::select! {

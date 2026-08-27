@@ -19,17 +19,17 @@ use tokio_util::sync::CancellationToken;
 
 use lustre_api::LustreApi;
 use lustre_changelog::{ChangelogEvent, EventAck, ListenerHandle};
-use rbh_entry_store::model::{EntryKind, EntryRow};
+use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId};
 use rbh_entry_store::store::EntryStore;
 
 /// Run the changelog ingest loop. Consumes batches from the listener,
 /// applies events to the entry store, and sends acks back.
 ///
 /// Exits when the listener channel closes or the cancel token fires.
-#[tracing::instrument(name = "changelog.ingest", skip_all)]
+#[tracing::instrument(name = "changelog.ingest", skip_all, fields(filesystem = %filesystem_id))]
 pub async fn ingest_loop(
-    mut handle: ListenerHandle, entry_store: EntryStore, mount_path: PathBuf, cancel: CancellationToken,
-    classifier_cache: std::sync::Arc<tokio::sync::RwLock<Vec<rbh_policy::ClassifierRow>>>,
+    mut handle: ListenerHandle, entry_store: EntryStore, filesystem_id: FileSystemId, mount_path: PathBuf,
+    cancel: CancellationToken, classifier_cache: std::sync::Arc<tokio::sync::RwLock<Vec<rbh_policy::ClassifierRow>>>,
 ) {
     tracing::info!("changelog ingest loop started");
 

@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+use rbh_entry_store::FileSystemId;
 use rbh_entry_store::store::{EntryStore, QueryParam};
 use rbh_policy::model::ThresholdTarget;
 use rbh_policy::{PolicyRow, PolicyRunTask, PolicyStore, TargetFilter, TriggerSpec, parse_trigger};
@@ -34,6 +35,7 @@ pub struct ThresholdChecker {
     pub entry_store: EntryStore,
     pub scheduler: Scheduler,
     pub lustre: lustre_api::LustreApi,
+    pub filesystem_id: FileSystemId,
     pub mount_path: std::path::PathBuf,
     /// Minimum sleep between cycles. Each trigger has its own
     /// `check_interval_secs`; the loop wakes at the shortest.
@@ -49,7 +51,7 @@ impl ThresholdChecker {
         // trigger should next be re-evaluated.
         let mut next_check: HashMap<(u64, u32), u64> = HashMap::new();
 
-        tracing::info!(tick_secs = self.tick.as_secs(), "threshold checker started");
+        tracing::info!(filesystem = %self.filesystem_id, tick_secs = self.tick.as_secs(), "threshold checker started");
 
         loop {
             if self.cancel.is_cancelled() {
@@ -58,7 +60,7 @@ impl ThresholdChecker {
             }
 
             if let Err(e) = self.one_cycle(&last_fired, &mut next_check).await {
-                tracing::warn!(error = %e, "threshold cycle error");
+                tracing::warn!(filesystem = %self.filesystem_id, error = %e, "threshold cycle error");
             }
 
             tokio::select! {

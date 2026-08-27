@@ -7,10 +7,10 @@
 
 mod changelog;
 mod hsm_poller;
+mod runtime;
 mod signals;
 mod thresholds;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -38,6 +38,21 @@ pub async fn run() -> anyhow::Result<()> {
     let entry_store = rbh_entry_store::store::EntryStore::connect(&db_url)
         .await
         .context("failed to initialize entry store")?;
+    let runtime_registry = runtime::RuntimeRegistry::from_env()?;
+    for filesystem in runtime_registry.iter() {
+        entry_store.register_filesystem(&filesystem.config).await?;
+    }
+    let lustre_runtime = runtime_registry.lustre().clone();
+    let filesystem_id = lustre_runtime.config.id.clone();
+    let mount_path = lustre_runtime.config.mount_path.clone();
+    let capabilities = lustre_runtime.config.capabilities;
+    tracing::info!(
+        filesystem = %filesystem_id,
+        backend = ?lustre_runtime.config.backend,
+        mount = %mount_path.display(),
+        ?capabilities,
+        "filesystem runtime selected"
+    );
     let policy_store = rbh_policy::PolicyStore::new(pool.clone());
     policy_store
         .check_schema()
@@ -52,15 +67,14 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!("database migrations complete");
 
     // 4. Initial fs-scan if catalog is empty.
-    let mount_path = std::env::var("RBH_LUSTRE_MOUNT").unwrap_or_else(|_| "/lustre".to_string());
     let count = entry_store.entry_count().await.unwrap_or(0);
     if count == 0 {
-        tracing::info!(mount = %mount_path, "catalog empty — running initial fs-scan");
-        run_initial_scan(&entry_store, &mount_path).await;
+        tracing::info!(filesystem = %filesystem_id, mount = %mount_path.display(), "catalog empty — running initial fs-scan");
+        run_initial_scan(&entry_store, &filesystem_id, &mount_path).await;
         let new_count = entry_store.entry_count().await.unwrap_or(0);
-        tracing::info!(entries = new_count, "initial scan complete");
+        tracing::info!(filesystem = %filesystem_id, entries = new_count, "initial scan complete");
     } else {
-        tracing::info!(entries = count, "catalog already populated");
+        tracing::info!(filesystem = %filesystem_id, entries = count, "catalog already populated");
     }
 
     // 5. Spawn one changelog listener per configured MDT.
@@ -91,18 +105,21 @@ pub async fn run() -> anyhow::Result<()> {
             {
                 Ok(handle) => {
                     tracing::info!(
+                        filesystem = %filesystem_id,
                         mdt = %mdt_name,
                         reader_id = %reader_id,
                         "changelog listener started"
                     );
                     let ingest_store = entry_store.clone();
-                    let ingest_mount = PathBuf::from(&mount_path);
+                    let ingest_mount = mount_path.clone();
+                    let ingest_filesystem = filesystem_id.clone();
                     let ingest_cancel = daemon_cancel.clone();
                     let classifier_cache_cl = classifier_cache.clone();
                     tokio::spawn(async move {
                         changelog::ingest_loop(
                             handle,
                             ingest_store,
+                            ingest_filesystem,
                             ingest_mount,
                             ingest_cancel,
                             classifier_cache_cl.clone(),
@@ -113,6 +130,7 @@ pub async fn run() -> anyhow::Result<()> {
                 Err(e) => {
                     // Isolate per-MDT failures — other MDTs keep running.
                     tracing::error!(
+                        filesystem = %filesystem_id,
                         mdt = %mdt_name,
                         reader_id = %reader_id,
                         error = %e,
@@ -144,7 +162,8 @@ pub async fn run() -> anyhow::Result<()> {
     rbh_policy::init_runtime(Arc::new(rbh_policy::PolicyRuntime {
         policy_store: policy_store.clone(),
         entry_store: entry_store.clone(),
-        mount_path: PathBuf::from(&mount_path),
+        filesystem_id: filesystem_id.clone(),
+        mount_path: mount_path.clone(),
     }));
 
     // Reconcile existing policies → scheduler schedules.
@@ -189,12 +208,13 @@ pub async fn run() -> anyhow::Result<()> {
         entry_store: entry_store.clone(),
         scheduler: scheduler.clone(),
         lustre: lustre_api::LustreApi,
-        mount_path: PathBuf::from(&mount_path),
+        filesystem_id: filesystem_id.clone(),
+        mount_path: mount_path.clone(),
         tick: std::time::Duration::from_secs(threshold_tick_secs),
         cancel: daemon_cancel.clone(),
     };
     tokio::spawn(checker.run());
-    tracing::info!(tick_secs = threshold_tick_secs, "threshold checker spawned");
+    tracing::info!(filesystem = %filesystem_id, tick_secs = threshold_tick_secs, "threshold checker spawned");
 
     // Active HSM state poller. Walks the catalog in small batches,
     // calls llapi_hsm_state_get, patches sm_status if the stored state
@@ -203,7 +223,7 @@ pub async fn run() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    if hsm_poll_secs > 0 {
+    if lustre_runtime.should_start_hsm_poller(hsm_poll_secs) {
         let hsm_batch = std::env::var("RBH_HSM_POLL_BATCH")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -216,7 +236,8 @@ pub async fn run() -> anyhow::Result<()> {
         let poller = hsm_poller::HsmPoller {
             entry_store: entry_store.clone(),
             lustre: lustre_api::LustreApi,
-            mount_path: PathBuf::from(&mount_path),
+            filesystem_id: filesystem_id.clone(),
+            mount_path: mount_path.clone(),
             tick: std::time::Duration::from_secs(hsm_poll_secs),
             batch: hsm_batch,
             pause_between_batches: std::time::Duration::from_millis(hsm_pause_ms),
@@ -224,13 +245,16 @@ pub async fn run() -> anyhow::Result<()> {
         };
         tokio::spawn(poller.run());
         tracing::info!(
+            filesystem = %filesystem_id,
             tick_secs = hsm_poll_secs,
             batch = hsm_batch,
             pause_ms = hsm_pause_ms,
             "hsm poller spawned"
         );
-    } else {
+    } else if hsm_poll_secs == 0 {
         tracing::info!("hsm poller disabled (RBH_HSM_POLL_SECS=0)");
+    } else {
+        tracing::info!(filesystem = %filesystem_id, "hsm poller disabled by backend capabilities");
     }
 
     // 7. Build router with scheduler for trigger reconciliation.
@@ -439,9 +463,12 @@ mod tests {
 }
 
 /// Drain an fs-scan into the entry store.
-async fn run_initial_scan(entry_store: &rbh_entry_store::store::EntryStore, mount_path: &str) {
+async fn run_initial_scan(
+    entry_store: &rbh_entry_store::store::EntryStore, filesystem_id: &rbh_entry_store::FileSystemId,
+    mount_path: &std::path::Path,
+) {
     let config = rbh_fs_scan::ScanConfig {
-        root: PathBuf::from(mount_path),
+        root: mount_path.to_path_buf(),
         concurrency: 4,
         max_depth: None,
         channel_size: 1024,
@@ -475,7 +502,7 @@ async fn run_initial_scan(entry_store: &rbh_entry_store::store::EntryStore, moun
     }
 
     let (scanned, errors, dirs) = progress.snapshot();
-    tracing::info!(scanned, errors, dirs, "fs-scan complete");
+    tracing::info!(filesystem = %filesystem_id, scanned, errors, dirs, "fs-scan complete");
 }
 
 /// Reconcile all enabled policies to scheduler-rs schedules on startup.

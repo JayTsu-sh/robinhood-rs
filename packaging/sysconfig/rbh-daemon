@@ -9,6 +9,14 @@ RBH_DATABASE_URL=mysql://robinhood:CHANGEME@127.0.0.1/rbh_entries
 # Mount point of the Lustre filesystem.
 RBH_LUSTRE_MOUNT=/lustre
 
+# Stable filesystem id used when translating the legacy single-mount config.
+RBH_FILESYSTEM_ID=lustre
+
+# Advanced registry configuration. When set, this JSON array replaces
+# RBH_LUSTRE_MOUNT / RBH_FILESYSTEM_ID and currently must contain exactly one
+# Lustre filesystem. Example (keep on one line):
+# RBH_FILESYSTEMS_JSON=[{"id":"lustre","backend":"lustre","mount_path":"/lustre","capabilities":{"changelog":true,"namespace":true,"purge":true,"hsm":true,"stripe":true,"ost":true}}]
+
 # Comma-separated MDT names for changelog consumption. Leave empty to disable
 # live changelog ingestion (catalog will only reflect the initial fs-scan).
 #   Example: RBH_MDTS=testfs-MDT0000,testfs-MDT0001

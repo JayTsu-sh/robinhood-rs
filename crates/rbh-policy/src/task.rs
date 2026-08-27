@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct PolicyRuntime {
     pub policy_store: crate::PolicyStore,
     pub entry_store: rbh_entry_store::store::EntryStore,
+    pub filesystem_id: rbh_entry_store::FileSystemId,
     pub mount_path: PathBuf,
 }
 
@@ -107,6 +108,7 @@ impl Task for PolicyRunTask {
         let pid_lbl = self.policy_id.to_string();
 
         tracing::info!(
+            filesystem = %rt.filesystem_id,
             policy_id = self.policy_id,
             execution_id = %ctx.execution_id.0,
             "policy run started"

@@ -125,13 +125,22 @@ SIGHUP):
 | Variable | Effect |
 |----------|--------|
 | `RBH_DATABASE_URL` | MariaDB connection string |
-| `RBH_LUSTRE_MOUNT` | Mount point for FID → path resolution |
+| `RBH_LUSTRE_MOUNT` | Legacy single-Lustre mount; translated to a filesystem runtime |
+| `RBH_FILESYSTEM_ID` | Stable id for the legacy single-Lustre runtime; default `lustre` |
+| `RBH_FILESYSTEMS_JSON` | Explicit filesystem registry as a JSON array; overrides the two legacy variables and currently requires exactly one Lustre entry |
 | `RBH_MDTS`         | Comma-separated MDT names (empty = no changelog) |
 | `RBH_CHANGELOG_USER` | Pre-registered reader id (`cl1` etc.); CSV for per-MDT |
 | `RBH_LISTEN_ADDR`  | REST bind, default `0.0.0.0:8080` |
 | `RBH_LOG`          | `tracing-subscriber` env-filter; **hot-reload via SIGHUP** |
 | `RBH_THRESHOLD_TICK_SECS` | Threshold poll cadence, default 30 |
 | `RBH_OTLP_ENDPOINT` | (Reserved; not yet wired) |
+
+For an explicit runtime, `RBH_FILESYSTEMS_JSON` contains serialized
+`FileSystemConfig` objects. Capabilities are declared per filesystem, so a
+Lustre runtime with `"hsm": false` never starts the HSM poller even when
+`RBH_HSM_POLL_SECS` is non-zero. Existing deployments can keep using only
+`RBH_LUSTRE_MOUNT`; it is translated to a fully capable Lustre runtime with id
+`RBH_FILESYSTEM_ID` (or `lustre` when unset).
 
 ## Signals
 
