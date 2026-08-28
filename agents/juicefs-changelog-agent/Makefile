@@ -1,6 +1,7 @@
 .PHONY: build test proto
 
 build:
+	mkdir -p bin
 	go build -tags fdb -trimpath -o bin/juicefs-changelog-agent ./cmd/juicefs-changelog-agent
 	go build -trimpath -o bin/changelog-receiver ./cmd/changelog-receiver
 

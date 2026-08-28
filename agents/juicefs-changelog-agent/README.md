@@ -29,17 +29,60 @@ JuiceFS VM remain required controls.
 
 ## Build
 
-The FoundationDB build tag and native client library are required. Match the
-JuiceFS deployment version; this module pins JuiceFS v1.4.1.
+The build host does **not** need a complete JuiceFS VM, a JuiceFS mount,
+FoundationDB Server, a cluster file, or connectivity to a live FoundationDB
+cluster. The minimum build requirements are:
+
+- Go 1.25 or newer (as declared by `go.mod`);
+- a C compiler and standard build tools for CGO;
+- the FoundationDB header `foundationdb/fdb_c.h`;
+- the FoundationDB client library `libfdb_c.so`.
+
+The JuiceFS Go source is downloaded by `go mod download`; this module pins it
+to v1.4.1. On the validated Ubuntu 24.04 runtime, the official
+`foundationdb-clients` 7.3.79 package provides both `fdb_c.h` and
+`libfdb_c.so`. Many Ubuntu installations must first configure FoundationDB's
+package repository or install its official client `.deb`.
 
 ```bash
-sudo apt install foundationdb-clients foundationdb-client-devel
+sudo apt-get update
+sudo apt-get install -y build-essential ca-certificates foundationdb-clients
+
+go version
+test -r /usr/include/foundationdb/fdb_c.h
+ldconfig -p | grep libfdb_c.so
+
+go mod download
+make test
 make build
 ```
 
-Distribution package names vary. The build host needs `fdb_c.h` and
-`libfdb_c.so`; the runtime host needs `libfdb_c.so` and the configured cluster
-file.
+Do not install `foundationdb-server` on a build-only host. Distribution package
+names vary outside Ubuntu/Debian; the required artifacts are the header and
+client library listed above. If they use non-system paths, build with:
+
+```bash
+CGO_CFLAGS="-I/opt/foundationdb/include" \
+CGO_LDFLAGS="-L/opt/foundationdb/lib -lfdb_c" \
+make build
+```
+
+The generated protobuf sources are committed, so `protoc` is not part of the
+minimum build. It is required only when changing `api/v1/changelog.proto` and
+running `make proto`.
+
+The runtime requirements are separate: the deployment host needs
+`libfdb_c.so`, a readable `/etc/foundationdb/fdb.cluster`, network access to
+FoundationDB, and changelog enabled for each configured JuiceFS volume. The
+Agent itself does not require a JuiceFS FUSE mount; Robinhood's baseline scan
+and namespace verification do.
+
+Common build failures:
+
+- `foundationdb/fdb_c.h: No such file or directory`: install the FoundationDB
+  client development files or correct `CGO_CFLAGS`.
+- `cannot find -lfdb_c`: install the FoundationDB client library or correct
+  `CGO_LDFLAGS`.
 
 ## Configure
 
