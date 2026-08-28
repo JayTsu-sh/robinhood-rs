@@ -203,8 +203,9 @@ impl<'a> RecView<'a> {
         unsafe { read_unaligned(addr_of!((*self.rec).cr_index)) }
     }
 
-    /// Timestamp — seconds since UNIX epoch (the kernel fills this from
-    /// `ktime_get_real_seconds`).
+    /// Raw packed Lustre timestamp (`seconds << 30 | nanoseconds`).
+    ///
+    /// Consumers must shift right by 30 bits when they need Unix seconds.
     #[inline]
     pub fn time(&self) -> u64 {
         unsafe { read_unaligned(addr_of!((*self.rec).cr_time)) }

@@ -35,6 +35,7 @@ const HSM_FLAGS_MASK: u16 = 0x0003; // 2 bits after shift
 pub trait RawRec {
     fn event_type(&self) -> ChangelogEventType;
     fn index(&self) -> u64;
+    /// Raw Lustre `cr_time` (`seconds << 30 | nanoseconds`).
     fn time(&self) -> u64;
     fn target_fid(&self) -> LuFid;
     fn parent_fid(&self) -> LuFid;
@@ -99,7 +100,11 @@ impl RawRec for RecView<'_> {
 /// versions may add new types that we don't handle yet.
 pub fn parse_event(mdt: &str, rec: &impl RawRec) -> Result<Option<ChangelogEventEnvelope>, ChangelogError> {
     let idx = rec.index();
-    let time = rec.time() as i64;
+    // Lustre packs changelog timestamps as seconds in the high 34 bits and
+    // nanoseconds in the low 30 bits. This is the same decoding used by
+    // `lfs changelog`; persisting the packed value as Unix seconds corrupts
+    // removal times and all other event timestamps.
+    let time = (rec.time() >> 30) as i64;
     let fid = rec.target_fid();
     let parent = rec.parent_fid();
     let name = Bytes::copy_from_slice(rec.name());
@@ -237,7 +242,7 @@ impl Default for FakeRec {
         Self {
             event_type: ChangelogEventType::Create,
             index: 1,
-            time: 1_775_955_820,
+            time: 1_775_955_820 << 30,
             target_fid: LuFid::new(0x200000401, 0x1a, 0),
             parent_fid: LuFid::new(0x200000401, 0x01, 0),
             name: b"test.txt".to_vec(),
@@ -322,6 +327,21 @@ mod tests {
             }
             other => panic!("expected Create, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_decodes_lustre_packed_timestamp_to_unix_seconds() {
+        // Captured from a real Lustre 2.16 UNLINK record. Lustre stores
+        // cr_time as seconds in the high 34 bits and nanoseconds in the low
+        // 30 bits; it is not itself a Unix-seconds value.
+        let rec = FakeRec {
+            time: 1_919_724_587_777_133_588,
+            ..Default::default()
+        };
+
+        let env = parse_event(MDT, &rec).unwrap().unwrap();
+
+        assert_eq!(env.time, 1_787_882_845);
     }
 
     #[test]
