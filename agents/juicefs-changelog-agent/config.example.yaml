@@ -1,0 +1,12 @@
+listen: 10.131.9.41:9443
+cursor_dir: /var/lib/juicefs-changelog-agent/cursors
+
+max_streams: 4
+
+# The RPC accepts only these logical names. It never accepts a caller-supplied
+# metadata URL, cluster file, or FoundationDB key range.
+volumes:
+  jfs-nfs:
+    meta_url: fdb:///etc/foundationdb/fdb.cluster?prefix=jfs_nfs
+  jfs-s3:
+    meta_url: fdb:///etc/foundationdb/fdb.cluster?prefix=jfs_s3

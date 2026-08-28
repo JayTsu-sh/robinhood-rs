@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package robinhood.juicefs.v1;
+
+option go_package = "github.com/JayTsu-sh/robinhood-rs/agents/juicefs-changelog-agent/internal/gen/changelogv1";
+
+// Changelog exposes only an allow-listed, read-only metadata change stream.
+service Changelog {
+  rpc Watch(WatchRequest) returns (stream ChangelogRecord);
+  rpc Ack(AckRequest) returns (AckResponse);
+}
+
+message WatchRequest {
+  // Logical volume name configured by the agent administrator. Metadata URLs
+  // are deliberately not accepted over RPC.
+  string volume = 1;
+
+}
+
+message ChangelogRecord {
+  string volume = 1;
+  int64 version = 2;
+  // Raw JuiceFS metadata operation, excluding the version prefix.
+  string entry = 3;
+}
+
+message AckRequest {
+  string volume = 1;
+  int64 version = 2;
+}
+
+message AckResponse {}
