@@ -1,0 +1,44 @@
+[Unit]
+Description=Read-only JuiceFS changelog gRPC agent
+After=network-online.target foundationdb.service juicefs-changelog-agent-firewall.service
+Wants=network-online.target juicefs-changelog-agent-firewall.service
+
+[Service]
+Type=simple
+User=juicefs-changelog-agent
+Group=juicefs-changelog-agent
+SupplementaryGroups=foundationdb
+ExecStart=/usr/sbin/juicefs-changelog-agent --config /etc/juicefs-changelog-agent/config.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+# Only the Agent-owned cursor directory is writable.
+StateDirectory=juicefs-changelog-agent
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/juicefs-changelog-agent
+ReadOnlyPaths=/etc/juicefs-changelog-agent /etc/foundationdb/fdb.cluster
+
+[Install]
+WantedBy=multi-user.target

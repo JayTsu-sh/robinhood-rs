@@ -3,7 +3,11 @@
 ```
 systemd/
 ├── rbh-daemon.service      → /usr/lib/systemd/system/rbh-daemon.service
-└── rbh-daemon@.service     → /usr/lib/systemd/system/rbh-daemon@.service
+├── rbh-daemon@.service     → /usr/lib/systemd/system/rbh-daemon@.service
+├── juicefs-changelog-agent.service → optional JuiceFS-side gRPC agent
+└── juicefs-changelog-agent-firewall.service → source-IP allowlist for the agent
+nftables/
+└── juicefs-changelog-agent.nft → allows 10.131.9.10/32 to TCP 9443
 sysconfig/
 └── rbh-daemon              → /etc/sysconfig/rbh-daemon (RHEL/SUSE)
                                or /etc/default/rbh-daemon (Debian)

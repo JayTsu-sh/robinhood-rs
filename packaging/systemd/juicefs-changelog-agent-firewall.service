@@ -1,0 +1,13 @@
+[Unit]
+Description=Network allowlist for JuiceFS changelog agent
+Before=juicefs-changelog-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table inet juicefs_changelog_agent
+ExecStart=/usr/sbin/nft -f /etc/juicefs-changelog-agent/firewall.nft
+ExecStop=-/usr/sbin/nft delete table inet juicefs_changelog_agent
+
+[Install]
+WantedBy=multi-user.target
