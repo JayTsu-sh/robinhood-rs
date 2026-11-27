@@ -748,6 +748,26 @@ impl EntryStore {
         Ok(query.fetch_one(&self.pool).await?)
     }
 
+    /// Count and sum the same set of matching objects in one statement.
+    #[tracing::instrument(skip(self, params), fields(filesystem = %filesystem))]
+    pub async fn scoped_totals_where(
+        &self, filesystem: &FileSystemId, where_clause: &str, params: &[QueryParam],
+    ) -> Result<(u64, u64)> {
+        let sql = format!(
+            "SELECT COUNT(*), CAST(COALESCE(SUM(size), 0) AS UNSIGNED) \
+             FROM scoped_entries AS entries WHERE filesystem_id = ? AND ({where_clause})"
+        );
+        let mut query = sqlx::query_as::<_, (i64, u64)>(&sql).bind(filesystem.as_str());
+        for param in params {
+            query = match param {
+                QueryParam::Int(value) => query.bind(*value),
+                QueryParam::Str(value) => query.bind(value.as_str()),
+            };
+        }
+        let (count, bytes) = query.fetch_one(&self.pool).await?;
+        Ok((count as u64, bytes))
+    }
+
     /// Aggregate a validated catalog column inside one filesystem.
     #[tracing::instrument(name = "store.aggregate_scoped_by", skip(self), fields(filesystem = %filesystem))]
     pub async fn aggregate_scoped_by(

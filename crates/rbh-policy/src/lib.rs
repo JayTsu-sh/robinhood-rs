@@ -12,6 +12,7 @@ pub mod classifier;
 pub mod model;
 pub mod ratelimit;
 pub mod reconcile;
+pub mod rev8;
 pub mod store;
 pub mod task;
 pub mod trigger_parser;
@@ -37,6 +38,10 @@ pub enum PolicyError {
     NotFound(u64),
     #[error("policy not found: name={0}")]
     NotFoundByName(String),
+    #[error("policy name already exists: {0}")]
+    NameConflict(String),
+    #[error("{0}")]
+    InvalidPolicy(String),
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
     #[error("migration error: {0}")]

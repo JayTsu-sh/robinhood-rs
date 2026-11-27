@@ -5,6 +5,7 @@
 //! * `GET /api/policies` — list all policies
 //! * `GET /api/policies/:id` — get policy by id
 //! * `PUT /api/policies/:id` — update policy
+//! * `POST /api/policies/:id/preview` — evaluate Rev.8 candidates
 //! * `DELETE /api/policies/:id` — delete policy
 //! * `GET /api/entries/count` — entry catalog count
 //! * `POST /api/scans` — start a filesystem scan

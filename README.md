@@ -121,13 +121,54 @@ and reports missing parents and stale catalog paths as distinct typed errors.
 | GET    | `/api/removed?filesystem=ID` | Filesystem-scoped removed objects |
 | DELETE | `/api/removed/{object}?filesystem=ID` | Forget one typed backend object |
 | GET / POST | `/api/policies`  | CRUD |
-| GET / PUT / DELETE | `/api/policies/{id}` | CRUD |
+| GET / PUT | `/api/policies/{id}` | Read or update a policy |
+| DELETE | `/api/policies/{id}` | Delete a legacy policy |
 | POST   | `/api/policies/{id}/run` | Manual one-shot run |
+| POST   | `/api/policies/{id}/preview` | Read-only Rev.8 candidate totals |
 | POST   | `/api/scans`         | Start an async scan |
 | GET    | `/api/scans[/{id}]`  | Scan progress |
 
 The unscoped Lustre dump, restore, orphan-sweep, and classifier-run surfaces
 are retained only under `/api/compat/lustre/` as an explicit migration boundary.
+
+### Rev.8 archive preview
+
+Send the following document to `POST /api/policies` as JSON, substituting the
+ID of a registered Lustre filesystem with HSM enabled.
+
+```json
+{
+  "apiVersion": "hsm.storage.io/v1alpha3",
+  "kind": "Policy",
+  "metadata": { "name": "archive-large-files" },
+  "spec": {
+    "target": { "filesystem": "lustre", "objectType": "file" },
+    "trigger": { "type": "manual" },
+    "objective": { "type": "exhaust" },
+    "rules": {
+      "entries": [{
+        "match": { "field": "object.size", "op": "gte", "value": "1GiB" },
+        "decision": "execute",
+        "action": { "type": "lustre.hsm.archive", "params": { "archiveId": 1 } }
+      }]
+    },
+    "execution": {
+      "profileRef": "builtin-preview",
+      "activation": { "mode": "preview" },
+      "budget": { "run": { "maxOperations": 100, "maxSubmitAttempts": 100, "maxObjectLogicalBytes": "1TiB" } }
+    },
+    "governance": { "authorizationRef": "builtin-preview", "approvalPolicyRef": "builtin-preview" }
+  }
+}
+```
+
+Use the returned `id` to send `POST /api/policies/{id}/preview` with no request
+body. The result gives the stored `revision`, the catalog `candidateCount`,
+and the total logical `estimatedBytes` before any execution budget is applied.
+`GET /api/policies/{id}` returns the stored document under `definition`.
+`PUT /api/policies/{id}` saves a new revision. This preview accepts indexed
+regular files, the built-in preview references, and first-match archive rules
+with size comparisons or boolean conditions.
 
 ## Configuration
 
