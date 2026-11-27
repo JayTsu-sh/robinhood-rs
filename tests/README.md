@@ -24,6 +24,18 @@ or a port already in use causes setup to fail before seeding. Set
 `RBH_E2E_KEEP_DB=1` to keep the schema for inspection. The script prints
 the daemon log path at startup.
 
+The GitHub Actions `Compose smoke` check builds and tests the development
+image for pull requests. Run the same check locally with Docker Compose
+and BuildKit.
+
+```sh
+bash tests/e2e-compose.sh
+```
+
+The runner uses an isolated MariaDB container and its loopback interface.
+The check publishes no host ports, resolves linked symbols at process
+startup, and prints the daemon log on failure.
+
 ## `e2e_lustre.sh` — needs a real Lustre mount
 
 Covers what `e2e.sh` deliberately skips: the changelog listener,

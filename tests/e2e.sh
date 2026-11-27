@@ -36,6 +36,7 @@ export NO_PROXY=127.0.0.1 no_proxy=127.0.0.1
 
 PID=""
 DB_CREATED=0
+LOG=""
 MOUNT=""
 
 test_sql() {
@@ -43,6 +44,7 @@ test_sql() {
 }
 
 cleanup() {
+    local status=$?
     if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
         echo "[cleanup] SIGTERM -> $PID"
         kill -TERM "$PID" || true
@@ -60,6 +62,9 @@ cleanup() {
     fi
     if [[ -n "$MOUNT" ]]; then
         rmdir "$MOUNT" || true
+    fi
+    if [[ "$status" != 0 && -n "$LOG" ]]; then
+        tail -n 100 "$LOG" >&2
     fi
 }
 trap cleanup EXIT
