@@ -8,15 +8,21 @@ for the REST and live Lustre deployment checks.
 
 ## `e2e.sh` — no Lustre required
 
-Spins up the daemon against a fresh MariaDB, seeds entries directly
-via SQL, and validates the REST + CLI surface (`find`, `report`,
-`undelete`, policy format rejection, metrics). Use this as the fast smoke
-test during normal development.
+Run against a disposable MariaDB reachable at `127.0.0.1:3306` as root
+without a password. The script creates a fresh schema, seeds the `lustre`
+catalog scope via SQL, and checks REST, `rbh find`, `rbh report`,
+`rbh undelete`, Rev.8 format rejection, metrics, and graceful shutdown.
 
 ```sh
-cargo build --release
+cargo build --locked --release -p robinhood-rs -p rbh-cli
 ./tests/e2e.sh
 ```
+
+The default schema is `rbh_e2e_<pid>` and the daemon listens on port 8088.
+Use `RBH_E2E_DB` and `RBH_E2E_PORT` to override them. An existing schema
+or a port already in use causes setup to fail before seeding. Set
+`RBH_E2E_KEEP_DB=1` to keep the schema for inspection. The script prints
+the daemon log path at startup.
 
 ## `e2e_lustre.sh` — needs a real Lustre mount
 

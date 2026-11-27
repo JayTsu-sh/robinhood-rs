@@ -470,7 +470,8 @@ endpoints.
 # Unit tests (no Lustre needed):
 cargo test --workspace --lib
 
-# End-to-end smoke (requires MariaDB reachable as root):
+# End-to-end smoke (requires a disposable local MariaDB):
+cargo build --locked --release -p robinhood-rs -p rbh-cli
 bash tests/e2e.sh
 
 # Full gate:
@@ -481,6 +482,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Local catalog and API stack without a Lustre mount
 cd dev/compose && docker compose up -d --build
 ```
+
+See the [integration test guide](tests/README.md) for smoke-test setup.
 
 ## Packaging
 
