@@ -8,6 +8,7 @@
 //! * `POST /api/policies/:id/preview` — evaluate Rev.8 candidates
 //! * `DELETE /api/policies/:id` — delete policy
 //! * `GET /api/entries/count` — entry catalog count
+//! * `GET /api/entries/{object_id}?filesystem=ID` — look up one catalog entry
 //! * `POST /api/scans` — start a filesystem scan
 //!
 //! No auth layer (trusted microservice). Uses `tower-http::TraceLayer` for

@@ -113,6 +113,7 @@ and reports missing parents and stale catalog paths as distinct typed errors.
 | GET    | `/api/health`        | Liveness |
 | GET    | `/api/metrics`       | Prometheus exposition |
 | GET    | `/api/entries/count?filesystem=ID` | Filesystem-scoped catalog row count |
+| GET    | `/api/entries/{object_id}?filesystem=ID` | Look up one Lustre FID or JuiceFS inode |
 | POST   | `/api/entries/query` | Generic predicate query; body requires `filesystem` |
 | POST   | `/api/reports/aggregate` | Group-by counts; body requires `filesystem` |
 | GET    | `/api/reports/top-size?filesystem=ID` | Filesystem-scoped Top-N by size |
@@ -194,6 +195,11 @@ Lustre runtime with `"hsm": false` never starts the HSM poller even when
 `RBH_HSM_POLL_SECS` is non-zero. Each Lustre runtime declares its own
 `lustre_changelog` array of `{ "mdt", "reader_id" }` objects; JuiceFS runtimes
 declare `changelog_agent`. A failed source is restarted independently.
+
+Include `LYOUT` in each Lustre reader's changelog mask to refresh catalog
+layouts after a change. Entry responses expose the pool in `pool_name` and
+concrete OST indices in `stripe_items`. A layout spanning several pools has
+a null pool name and still reports its allocated OSTs.
 
 `RBH_LUSTRE_MOUNT`, `RBH_FILESYSTEM_ID`, `RBH_MDTS`, and
 `RBH_CHANGELOG_USER` remain only as external configuration compatibility for a

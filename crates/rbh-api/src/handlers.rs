@@ -42,6 +42,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/policies/{id}/preview", post(preview_policy))
         .route("/entries/count", get(entry_count))
         .route("/entries/query", post(query_entries))
+        .route("/entries/{object_id}", get(get_entry))
         .route("/reports/aggregate", post(report_aggregate))
         .route("/reports/top-size", get(top_size))
         .route("/reports/oldest", get(oldest_entries))
@@ -342,6 +343,21 @@ async fn entry_count(
     Ok(Json(serde_json::json!({ "filesystem": q.filesystem, "count": count })))
 }
 
+#[tracing::instrument(skip(state))]
+async fn get_entry(
+    State(state): State<AppState>, Path(object_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<FilesystemQuery>,
+) -> Result<Json<EntryDto>, ApiError> {
+    let key = scoped_key_from_text(&state, q.filesystem, &object_id).await?;
+    let entry = state
+        .entry_store
+        .get_scoped_entry(&key)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("entry not found: {object_id}")))?;
+    Ok(Json(entry.into()))
+}
+
 // ---- /api/entries/query ----
 
 /// POST body for `/api/entries/query`.
@@ -402,6 +418,7 @@ pub struct EntryDto {
     pub ctime: i64,
     pub stripe_count: Option<u16>,
     pub stripe_size: Option<u32>,
+    pub stripe_items: Vec<u32>,
     pub pool_name: Option<String>,
     pub sm_status: serde_json::Value,
     pub last_seen: i64,
@@ -427,6 +444,7 @@ impl From<ScopedEntryRow> for EntryDto {
             ctime: r.ctime,
             stripe_count: r.stripe_count,
             stripe_size: r.stripe_size,
+            stripe_items: r.stripe_items,
             pool_name: r.pool_name,
             sm_status: r.sm_status,
             last_seen: r.last_seen,
@@ -1171,6 +1189,7 @@ async fn admin_sweep_orphans(
 enum ApiError {
     Policy(PolicyError),
     BadRequest(String),
+    NotFound(String),
     Unprocessable(String),
     Internal(String),
 }
@@ -1197,6 +1216,7 @@ impl IntoResponse for ApiError {
                 error @ (PolicyError::FilesystemMismatch { .. } | PolicyError::UnsupportedCapability { .. }),
             ) => (StatusCode::BAD_REQUEST, error.to_string()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::Unprocessable(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
             ApiError::Policy(e) => {
                 tracing::error!(error = %e, "policy error");

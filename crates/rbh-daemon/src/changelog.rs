@@ -9,6 +9,7 @@
 //! For Rename, we update parent_fid + name and handle rename-overwrite.
 //! For metadata events (Close, SetAttr, Truncate, MTime, CTime), we re-stat
 //! the file to refresh changed fields.
+//! For layout events, we reread the actual Lustre OST layout by FID.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -245,7 +246,8 @@ pub async fn ingest_loop(
                     tracing::warn!(
                         fid = %event.fid(),
                         kind = event.kind_name(),
-                        error = %e,
+                        mount = %mount_path.display(),
+                        error = %format_args!("{e:#}"),
                         "failed to apply changelog event"
                     );
                 }
@@ -825,9 +827,31 @@ async fn apply_event(
             hsm_error,
         } => apply_hsm_event(store, filesystem, fid, *hsm_event, *hsm_flags, *hsm_error).await,
 
-        // ── Events we skip for now ──
-        ChangelogEvent::XAttr { .. } | ChangelogEvent::Layout { .. } => Ok(false),
+        ChangelogEvent::Layout { fid } => refresh_lustre_layout(store, filesystem, mount, fid).await,
+        ChangelogEvent::XAttr { .. } => Ok(false),
     }
+}
+
+async fn refresh_lustre_layout(
+    store: &EntryStore, filesystem: &FileSystemId, mount: &Path, fid: &lustre_api::LuFid,
+) -> anyhow::Result<bool> {
+    let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
+    if !store
+        .get_scoped_entry(&key)
+        .await?
+        .is_some_and(|entry| entry.kind == EntryKind::File)
+    {
+        tracing::debug!(%fid, "layout event skipped for missing or non-file catalog entry");
+        return Ok(false);
+    }
+    let mount = mount.to_owned();
+    let object = *fid;
+    let layout = tokio::task::spawn_blocking(move || LustreApi.get_ost_layout_by_fid(&mount, &object)).await??;
+    let Some(layout) = layout else {
+        tracing::debug!(%fid, "file removed before layout refresh");
+        return Ok(false);
+    };
+    Ok(store.refresh_lustre_layout(filesystem, fid, layout).await?)
 }
 
 /// Translate a Lustre `hsm_event` + `hsm_flags` into a JSON patch and
@@ -1014,6 +1038,198 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn lustre_layout_changelog_updates_the_catalog_after_a_real_pool_migration() {
+        let Ok(database_url) = std::env::var("RBH_LAYOUT_TEST_DATABASE_URL") else {
+            return;
+        };
+        let mount = PathBuf::from(std::env::var_os("RBH_LUSTRE_MOUNT").expect("set the Lustre test mount"));
+        let store = EntryStore::connect(&database_url).await.unwrap();
+        let filesystem = FileSystemId::new(format!("layout-{}", std::process::id())).unwrap();
+        let other_filesystem = FileSystemId::new(format!("layout-other-{}", std::process::id())).unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix(".rbh-layout-")
+            .tempdir_in(&mount)
+            .unwrap();
+        let file = tmp.path().join("sample");
+        let run_lfs = |args: &[&str]| {
+            let result = std::process::Command::new("lfs")
+                .args(args)
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "lfs {args:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            String::from_utf8(result.stdout).unwrap().trim().to_owned()
+        };
+        run_lfs(&["setstripe", "-p", "hot", "-c", "1"]);
+        std::fs::write(&file, b"changelog layout test").unwrap();
+        let fid = LustreApi.path_to_fid(&file).unwrap();
+        for id in [&filesystem, &other_filesystem] {
+            store
+                .register_filesystem(&FileSystemConfig {
+                    id: id.clone(),
+                    backend: BackendKind::Lustre,
+                    mount_path: mount.clone(),
+                    capabilities: BackendCapabilities {
+                        changelog: true,
+                        stripe: true,
+                        ost: true,
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap();
+            crate::run_initial_scan(&store, id, tmp.path()).await.unwrap();
+            store
+                .patch_scoped_sm_status(
+                    &EntryKey::new(id.clone(), ObjectId::Lustre(fid)),
+                    &serde_json::json!({"hsm_state": "none", "xattr": {"class": "test"}}),
+                )
+                .await
+                .unwrap();
+        }
+        let pool = store.pool().clone();
+        let api = axum_test::TestServer::new(rbh_api::router(rbh_api::AppState {
+            entry_store: store.clone(),
+            policy_store: rbh_policy::PolicyStore::new(pool.clone()),
+            classifier_store: rbh_policy::ClassifierStore::new(pool),
+            classifier_cache: Default::default(),
+            scheduler: None,
+            scans: Default::default(),
+        }))
+        .unwrap();
+        let lookup = |id: FileSystemId| {
+            let api = &api;
+            async move {
+                let result = api.get(&format!("/api/entries/{fid}?filesystem={id}")).await;
+                result.assert_status_ok();
+                result.json::<serde_json::Value>()
+            }
+        };
+        let report = || async {
+            let result = api
+                .get(&format!("/api/reports/stripe-distribution?filesystem={filesystem}"))
+                .await;
+            result.assert_status_ok();
+            result.json::<serde_json::Value>()
+        };
+        let before = lookup(filesystem.clone()).await;
+        let mut stale_scan = store.get_lustre_entry(&filesystem, &fid).await.unwrap().unwrap();
+        stale_scan.layout_observed_at = LustreApi.get_ost_layout(&file).unwrap().observed_at;
+        stale_scan.sm_status = serde_json::json!({});
+        assert_eq!(before["pool_name"], "hot");
+        assert_eq!(before["sm_status"]["hsm_state"], "none");
+        let old_ost: u32 = run_lfs(&["getstripe", "-i"]).parse().unwrap();
+        run_lfs(&["migrate", "-b", "-p", "cold", "-c", "1"]);
+        assert_eq!(LustreApi.path_to_fid(&file).unwrap(), fid);
+        let new_ost: u32 = run_lfs(&["getstripe", "-i"]).parse().unwrap();
+        assert_ne!(old_ost, new_ost);
+
+        let batch = ChangeBatch {
+            filesystem: filesystem.clone(),
+            changes: vec![Change::Backend(BackendChange::LustreLayout {
+                object: ObjectId::Lustre(fid),
+                time: now_secs(),
+            })],
+            checkpoint: Checkpoint {
+                source: "lustre-MDT0000".into(),
+                position: 51,
+            },
+        };
+        let ingest = |mount: PathBuf| {
+            let store = store.clone();
+            let batch = batch.clone();
+            async move {
+                let (committed, ack) = oneshot::channel();
+                ingest_loop(
+                    Box::new(OneBatchSource {
+                        batch: Some(batch.clone()),
+                        committed: Some(committed),
+                    }),
+                    store,
+                    batch.filesystem,
+                    mount,
+                    CancellationToken::new(),
+                    Default::default(),
+                )
+                .await;
+                ack.await.ok()
+            }
+        };
+        assert_eq!(ingest(tmp.path().join("missing-mount")).await, None);
+        let unmounted = tempfile::tempdir().unwrap();
+        assert_eq!(ingest(unmounted.path().to_owned()).await, None);
+        assert_eq!(lookup(filesystem.clone()).await, before);
+
+        // Reject the OST write after the catalog row has been updated. This
+        // exercises rollback and redelivery at the database and source seams.
+        let trigger = format!("reject_layout_{}", std::process::id());
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON scoped_stripe_items FOR EACH ROW \
+             IF NEW.filesystem_id = '{filesystem}' THEN SIGNAL SQLSTATE '45000' \
+             SET MESSAGE_TEXT = 'injected layout failure'; END IF",
+        ))
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let failed_ack = ingest(mount.clone()).await;
+        sqlx::query(&format!("DROP TRIGGER {trigger}"))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(failed_ack, None);
+        assert_eq!(lookup(filesystem.clone()).await, before);
+        assert_eq!(report().await["rows"][0]["ost_index"], old_ost);
+
+        for _ in 0..2 {
+            assert_eq!(ingest(mount.clone()).await, Some(batch.checkpoint.clone()));
+            let after = lookup(filesystem.clone()).await;
+            assert_eq!(after["object_id"], serde_json::json!(ObjectId::Lustre(fid)));
+            assert_eq!(after["pool_name"], "cold");
+            assert_eq!(after["stripe_items"], serde_json::json!([new_ost]));
+            assert_eq!(after["name"], before["name"]);
+            assert_eq!(after["parent_object_id"], before["parent_object_id"]);
+            assert_eq!(after["sm_status"], before["sm_status"]);
+            let stripes = report().await;
+            assert_eq!(stripes["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(stripes["rows"][0]["ost_index"], new_ost);
+            assert_eq!(stripes["rows"][0]["file_count"], 1);
+        }
+        store
+            .upsert_lustre_scan_batch(&filesystem, &[stale_scan])
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup(filesystem.clone()).await["stripe_items"],
+            serde_json::json!([new_ost])
+        );
+        assert_eq!(report().await["rows"][0]["ost_index"], new_ost);
+        crate::run_initial_scan(&store, &filesystem, tmp.path()).await.unwrap();
+        assert_eq!(lookup(filesystem.clone()).await["sm_status"], before["sm_status"]);
+        let untouched = lookup(other_filesystem).await;
+        assert_eq!(untouched["pool_name"], "hot");
+        assert_eq!(untouched["stripe_items"], serde_json::json!([old_ost]));
+
+        run_lfs(&["migrate", "-b", "-p", "hot", "-c", "1"]);
+        let live_ost: u32 = run_lfs(&["getstripe", "-i"]).parse().unwrap();
+        assert_eq!(ingest(mount.clone()).await, Some(batch.checkpoint.clone()));
+        let replayed = lookup(filesystem.clone()).await;
+        assert_eq!(replayed["pool_name"], "hot");
+        assert_eq!(replayed["stripe_items"], serde_json::json!([live_ost]));
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(ingest(mount.clone()).await, Some(batch.checkpoint.clone()));
+        store.remove_lustre_entry(&filesystem, &fid, now_secs()).await.unwrap();
+        assert_eq!(ingest(mount).await, Some(batch.checkpoint));
+        api.get(&format!("/api/entries/{fid}?filesystem={filesystem}"))
+            .await
+            .assert_status(axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1467,18 +1683,11 @@ async fn stat_entry_by_fid(
         let kind = metadata_to_kind(&meta);
 
         // Stripe info for files.
-        let (stripe_count, stripe_size, stripe_items, pool_name) = if kind == EntryKind::File {
-            match lustre.get_stripe_info(&abs_path) {
-                Ok(info) => (
-                    Some(info.count as u16),
-                    Some(info.size as u32),
-                    info.ost_indices,
-                    info.pool,
-                ),
-                Err(_) => (None, None, Vec::new(), None),
-            }
+        let observed_at = now_secs();
+        let layout = if kind == EntryKind::File {
+            lustre.get_ost_layout(&abs_path).unwrap_or_default()
         } else {
-            (None, None, Vec::new(), None)
+            Default::default()
         };
 
         // Never store a zero parent_fid — some event types leave cr_pfid unpopulated.
@@ -1499,12 +1708,13 @@ async fn stat_entry_by_fid(
             atime: meta.atime(),
             mtime: meta.mtime(),
             ctime: meta.ctime(),
-            stripe_count,
-            stripe_size,
-            stripe_items,
-            pool_name,
+            stripe_count: layout.stripe_count,
+            stripe_size: layout.stripe_size,
+            stripe_items: layout.stripe_items,
+            layout_observed_at: layout.observed_at,
+            pool_name: layout.pool_name,
             sm_status: serde_json::json!({}),
-            last_seen: now_secs(),
+            last_seen: observed_at,
             depth: 0,
         })
     })

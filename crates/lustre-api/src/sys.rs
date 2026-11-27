@@ -130,6 +130,18 @@ unsafe extern "C" {
 
     pub(crate) fn llapi_layout_get_by_path(path: *const c_char, flags: u32) -> *mut c_void;
 
+    pub(crate) fn llapi_open_by_fid(path: *const c_char, fid: *const lu_fid, flags: c_int) -> c_int;
+
+    pub(crate) fn llapi_layout_get_by_fd(fd: c_int, flags: u32) -> *mut c_void;
+
+    pub(crate) fn llapi_layout_is_composite(layout: *mut c_void) -> bool;
+
+    pub(crate) fn llapi_layout_comp_flags_get(layout: *const c_void, flags: *mut u32) -> c_int;
+
+    pub(crate) fn llapi_layout_comp_use(layout: *mut c_void, pos: u32) -> c_int;
+
+    pub(crate) fn llapi_layout_pattern_get(layout: *const c_void, pattern: *mut u64) -> c_int;
+
     pub(crate) fn llapi_layout_stripe_count_get(layout: *const c_void, count: *mut u64) -> c_int;
 
     pub(crate) fn llapi_layout_stripe_size_get(layout: *const c_void, size: *mut u64) -> c_int;

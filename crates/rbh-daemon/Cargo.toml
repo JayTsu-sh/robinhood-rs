@@ -33,5 +33,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+axum-test = "17"
 rbh-actions = { path = "../rbh-actions" }
 tempfile = "3"

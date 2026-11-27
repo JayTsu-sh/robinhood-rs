@@ -59,13 +59,13 @@ impl AggregateKey {
     }
 }
 
-/// One row returned by [`EntryStore::legacy_lustre_stripe_distribution`].
+/// One OST's catalog distribution.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StripeDistRow {
     pub ost_index: u32,
     pub file_count: u64,
-    /// Approximate bytes physically on this OST, computed as
-    /// `SUM(file.size / file.stripe_count)`.
+    /// Approximate bytes attributed to this OST by dividing a file's logical
+    /// size evenly across its stripes.
     pub approx_bytes: u64,
 }
 
@@ -154,7 +154,7 @@ impl EntryStore {
         }
 
         let mut tx = self.pool.begin().await?;
-        upsert_scoped_entry_tx(&mut tx, entry).await?;
+        upsert_scoped_entry_tx(&mut tx, entry, None).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -182,7 +182,7 @@ impl EntryStore {
                     object: entry.key.object().backend(),
                 });
             }
-            upsert_scoped_entry_tx(&mut tx, entry).await?;
+            upsert_scoped_entry_tx(&mut tx, entry, None).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -203,17 +203,7 @@ impl EntryStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let entry_data: Vec<u8> = row.try_get("entry_data")?;
-        let entry: ScopedEntryRow = serde_json::from_slice(&entry_data)?;
-        if entry.key != *key {
-            return Err(StoreError::InvalidObjectIdentity(
-                "scoped entry key does not match its primary key",
-            ));
-        }
-        Ok(Some(entry))
+        row.map(|row| decode_scoped_entry(row, key)).transpose()
     }
 
     /// Delete one filesystem-scoped catalog entry. Repeating the deletion is
@@ -665,7 +655,8 @@ impl EntryStore {
     /// Merge status-manager metadata into one scoped object.
     #[tracing::instrument(name = "store.patch_scoped_sm_status", skip(self, patch), fields(filesystem = %key.filesystem()))]
     pub async fn patch_scoped_sm_status(&self, key: &EntryKey, patch: &serde_json::Value) -> Result<bool> {
-        let Some(mut entry) = self.get_scoped_entry(key).await? else {
+        let mut tx = self.pool.begin().await?;
+        let Some((mut entry, _)) = lock_scoped_entry(&mut tx, key).await? else {
             return Ok(false);
         };
         if let (Some(current), Some(delta)) = (entry.sm_status.as_object_mut(), patch.as_object()) {
@@ -679,7 +670,8 @@ impl EntryStore {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        self.upsert_scoped_entry(&entry).await?;
+        upsert_scoped_entry_tx(&mut tx, &entry, None).await?;
+        tx.commit().await?;
         Ok(true)
     }
 
@@ -688,7 +680,8 @@ impl EntryStore {
     pub async fn update_scoped_xattr(
         &self, key: &EntryKey, tags: &std::collections::HashMap<String, String>, clear_keys: &[String],
     ) -> Result<bool> {
-        let Some(mut entry) = self.get_scoped_entry(key).await? else {
+        let mut tx = self.pool.begin().await?;
+        let Some((mut entry, _)) = lock_scoped_entry(&mut tx, key).await? else {
             return Ok(false);
         };
         if entry
@@ -708,7 +701,8 @@ impl EntryStore {
         for (name, value) in tags {
             xattrs.insert(name.clone(), serde_json::Value::String(value.clone()));
         }
-        self.upsert_scoped_entry(&entry).await?;
+        upsert_scoped_entry_tx(&mut tx, &entry, None).await?;
+        tx.commit().await?;
         Ok(true)
     }
 
@@ -865,8 +859,11 @@ impl EntryStore {
     /// Per-OST distribution for one filesystem's scoped stripe metadata.
     #[tracing::instrument(name = "store.scoped_stripe_distribution", skip(self), fields(filesystem = %filesystem))]
     pub async fn scoped_stripe_distribution(&self, filesystem: &FileSystemId) -> Result<Vec<StripeDistRow>> {
-        let sql = r"SELECT stripe.ost_index, COUNT(*) AS n,
-                   CAST(COALESCE(SUM(entry.size / NULLIF(entry.stripe_count, 0)), 0) AS UNSIGNED) AS bytes
+        let sql = r"SELECT stripe.ost_index, COUNT(DISTINCT stripe.object_kind, stripe.object_id) AS n,
+                   CAST(COALESCE(SUM(entry.size / COALESCE(NULLIF(entry.stripe_count, 0),
+                       (SELECT COUNT(*) FROM scoped_stripe_items item
+                        WHERE item.filesystem_id = stripe.filesystem_id AND item.object_kind = stripe.object_kind
+                          AND item.object_id = stripe.object_id))), 0) AS UNSIGNED) AS bytes
                    FROM scoped_stripe_items stripe JOIN scoped_entries entry
                      ON entry.filesystem_id = stripe.filesystem_id
                     AND entry.object_kind = stripe.object_kind AND entry.object_id = stripe.object_id
@@ -1166,30 +1163,44 @@ impl EntryStore {
                 object: crate::model::BackendKind::Lustre,
             });
         }
+        let mut entries: Vec<_> = entries.iter().collect();
+        entries.sort_by_key(|entry| (entry.fid.seq, entry.fid.oid, entry.fid.ver));
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.write_lustre_entries(filesystem, &entries).await {
+                Err(StoreError::Sqlx(sqlx::Error::Database(error)))
+                    if attempt < 3 && error.code().as_deref() == Some("40001") =>
+                {
+                    tracing::debug!(attempt, %filesystem, "retrying a deadlocked Lustre catalog write");
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn write_lustre_entries(&self, filesystem: &FileSystemId, entries: &[&EntryRow]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for entry in entries {
             let fid_bin = fid_codec::encode(&entry.fid);
-            let scoped = ScopedEntryRow::from_lustre(filesystem.clone(), entry);
-            upsert_scoped_entry_tx(&mut tx, &scoped).await?;
-            sqlx::query(
-                "DELETE FROM scoped_stripe_items WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?",
-            )
-            .bind(filesystem.as_str())
-            .bind(fid_bin.as_slice())
-            .execute(&mut *tx)
-            .await?;
-            for (stripe_index, ost_index) in entry.stripe_items.iter().copied().enumerate() {
-                sqlx::query(
-                    r"INSERT INTO scoped_stripe_items
-                        (filesystem_id, object_kind, object_id, stripe_index, ost_index)
-                      VALUES (?, 0, ?, ?, ?)",
-                )
-                .bind(filesystem.as_str())
-                .bind(fid_bin.as_slice())
-                .bind(stripe_index as u16)
-                .bind(ost_index)
-                .execute(&mut *tx)
-                .await?;
+            let mut scoped = ScopedEntryRow::from_lustre(filesystem.clone(), entry);
+            let mut observation = entry.layout_observed_at;
+            let mut replace_stripes = true;
+            if let Some((existing, previous_observation)) = lock_scoped_entry(&mut tx, &scoped.key).await? {
+                scoped.sm_status = existing.sm_status;
+                replace_stripes = observation > previous_observation;
+                if !replace_stripes {
+                    scoped.stripe_count = existing.stripe_count;
+                    scoped.stripe_size = existing.stripe_size;
+                    scoped.pool_name = existing.pool_name;
+                    scoped.stripe_items = existing.stripe_items;
+                    observation = None;
+                }
+            }
+            upsert_scoped_entry_tx(&mut tx, &scoped, observation).await?;
+            if replace_stripes {
+                replace_lustre_stripes(&mut tx, filesystem, &fid_bin, &scoped.stripe_items).await?;
             }
             if let Some(parent) = entry.parent_fid {
                 let parent_id = fid_codec::encode(&parent);
@@ -1218,6 +1229,30 @@ impl EntryStore {
             .await
     }
 
+    /// Update a file's catalog layout and OST index in one transaction.
+    #[tracing::instrument(skip(self, layout), fields(%filesystem, %fid))]
+    pub async fn refresh_lustre_layout(
+        &self, filesystem: &FileSystemId, fid: &LuFid, layout: lustre_api::stripe::OstLayout,
+    ) -> Result<bool> {
+        let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
+        let mut tx = self.pool.begin().await?;
+        let Some((mut entry, previous_observation)) = lock_scoped_entry(&mut tx, &key).await? else {
+            return Ok(false);
+        };
+        if entry.kind != EntryKind::File || layout.observed_at <= previous_observation {
+            return Ok(false);
+        }
+        entry.stripe_count = layout.stripe_count;
+        entry.stripe_size = layout.stripe_size;
+        entry.pool_name = layout.pool_name;
+        entry.stripe_items = layout.stripe_items;
+        let fid_bin = fid_codec::encode(fid);
+        upsert_scoped_entry_tx(&mut tx, &entry, layout.observed_at).await?;
+        replace_lustre_stripes(&mut tx, filesystem, &fid_bin, &entry.stripe_items).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Load a Lustre object through its filesystem-scoped identity.
     #[tracing::instrument(name = "store.get_lustre_entry", skip(self), fields(filesystem = %filesystem, fid = %fid))]
     pub async fn get_lustre_entry(&self, filesystem: &FileSystemId, fid: &LuFid) -> Result<Option<EntryRow>> {
@@ -1232,12 +1267,11 @@ impl EntryStore {
     #[tracing::instrument(name = "store.remove_lustre_entry", skip(self), fields(filesystem = %filesystem, fid = %fid))]
     pub async fn remove_lustre_entry(&self, filesystem: &FileSystemId, fid: &LuFid, rm_time: i64) -> Result<()> {
         let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
-        let scoped = self.get_scoped_entry(&key).await?;
-        let Some(entry) = scoped else {
+        let mut tx = self.pool.begin().await?;
+        let Some((entry, _)) = lock_scoped_entry(&mut tx, &key).await? else {
             return Ok(());
         };
         let (object_kind, object_id) = encode_object_id(*key.object());
-        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM scoped_stripe_items WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
             .bind(filesystem.as_str())
             .bind(object_kind)
@@ -1301,18 +1335,7 @@ impl EntryStore {
             .bind(object_id.as_slice())
             .execute(&self.pool)
             .await?;
-        self.upsert_scoped_entry(&ScopedEntryRow::from_lustre(filesystem.clone(), entry))
-            .await?;
-        if let Some(parent) = entry.parent_fid {
-            self.upsert_scoped_namespace_edge(&ScopedNamespaceEdge {
-                filesystem: filesystem.clone(),
-                parent: ObjectId::Lustre(parent),
-                name: entry.name.clone(),
-                object: ObjectId::Lustre(entry.fid),
-            })
-            .await?;
-        }
-        Ok(())
+        self.upsert_lustre_entry(filesystem, entry).await
     }
 
     /// Look up an entry by (parent_fid, name). Returns the FID if found.
@@ -1781,7 +1804,64 @@ impl EntryStore {
     }
 }
 
-async fn upsert_scoped_entry_tx(tx: &mut sqlx::Transaction<'_, MySql>, entry: &ScopedEntryRow) -> Result<()> {
+fn decode_scoped_entry(row: sqlx::mysql::MySqlRow, key: &EntryKey) -> Result<ScopedEntryRow> {
+    let entry_data: Vec<u8> = row.try_get("entry_data")?;
+    let entry: ScopedEntryRow = serde_json::from_slice(&entry_data)?;
+    if entry.key != *key {
+        return Err(StoreError::InvalidObjectIdentity(
+            "scoped entry key does not match its primary key",
+        ));
+    }
+    Ok(entry)
+}
+
+async fn lock_scoped_entry(
+    tx: &mut sqlx::Transaction<'_, MySql>, key: &EntryKey,
+) -> Result<Option<(ScopedEntryRow, Option<i64>)>> {
+    let (kind, id) = encode_object_id(*key.object());
+    let row = sqlx::query(
+        "SELECT entry_data, layout_observed_at FROM scoped_entries \
+         WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
+    )
+    .bind(key.filesystem().as_str())
+    .bind(kind)
+    .bind(id.as_slice())
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|row| {
+        let layout_observed_at = row.try_get("layout_observed_at")?;
+        Ok((decode_scoped_entry(row, key)?, layout_observed_at))
+    })
+    .transpose()
+}
+
+async fn replace_lustre_stripes(
+    tx: &mut sqlx::Transaction<'_, MySql>, filesystem: &FileSystemId, fid_bin: &[u8], ost_indices: &[u32],
+) -> Result<()> {
+    sqlx::query("DELETE FROM scoped_stripe_items WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?")
+        .bind(filesystem.as_str())
+        .bind(fid_bin)
+        .execute(&mut **tx)
+        .await?;
+    for (stripe_index, ost_index) in ost_indices.iter().copied().enumerate() {
+        let stripe_index = u16::try_from(stripe_index).map_err(|_| StoreError::InvalidLayout("stripe index"))?;
+        sqlx::query(
+            r"INSERT INTO scoped_stripe_items (filesystem_id, object_kind, object_id, stripe_index, ost_index)
+              VALUES (?, 0, ?, ?, ?)",
+        )
+        .bind(filesystem.as_str())
+        .bind(fid_bin)
+        .bind(stripe_index)
+        .bind(ost_index)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn upsert_scoped_entry_tx(
+    tx: &mut sqlx::Transaction<'_, MySql>, entry: &ScopedEntryRow, layout_observed_at: Option<i64>,
+) -> Result<()> {
     let (object_kind, object_id) = encode_object_id(*entry.key.object());
     let (parent_kind, parent_id) = match entry.parent.as_ref() {
         Some(parent) => {
@@ -1805,8 +1885,8 @@ async fn upsert_scoped_entry_tx(tx: &mut sqlx::Transaction<'_, MySql>, entry: &S
         r"INSERT INTO scoped_entries
             (filesystem_id, object_kind, object_id, entry_data, parent_kind, parent_id, fid,
              name, kind, size, blocks, uid, gid, projid, mode, nlink, atime, mtime, ctime,
-             stripe_count, stripe_size, pool_name, sm_status, last_seen, depth)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             stripe_count, stripe_size, pool_name, sm_status, last_seen, depth, layout_observed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON DUPLICATE KEY UPDATE
             entry_data = VALUES(entry_data), parent_kind = VALUES(parent_kind), parent_id = VALUES(parent_id),
             fid = VALUES(fid), name = VALUES(name), kind = VALUES(kind), size = VALUES(size),
@@ -1814,7 +1894,7 @@ async fn upsert_scoped_entry_tx(tx: &mut sqlx::Transaction<'_, MySql>, entry: &S
             mode = VALUES(mode), nlink = VALUES(nlink), atime = VALUES(atime), mtime = VALUES(mtime),
             ctime = VALUES(ctime), stripe_count = VALUES(stripe_count), stripe_size = VALUES(stripe_size),
             pool_name = VALUES(pool_name), sm_status = VALUES(sm_status), last_seen = VALUES(last_seen),
-            depth = VALUES(depth)",
+            depth = VALUES(depth), layout_observed_at = COALESCE(VALUES(layout_observed_at), layout_observed_at)",
     )
     .bind(entry.key.filesystem().as_str())
     .bind(object_kind)
@@ -1841,6 +1921,7 @@ async fn upsert_scoped_entry_tx(tx: &mut sqlx::Transaction<'_, MySql>, entry: &S
     .bind(sm_status)
     .bind(entry.last_seen)
     .bind(entry.depth)
+    .bind(layout_observed_at)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1990,6 +2071,7 @@ fn row_to_entry(row: &sqlx::mysql::MySqlRow) -> Result<EntryRow> {
         stripe_count: row.try_get("stripe_count")?,
         stripe_size: row.try_get("stripe_size")?,
         stripe_items: Vec::new(),
+        layout_observed_at: None,
         pool_name: row.try_get("pool_name")?,
         sm_status,
         last_seen: row.try_get("last_seen")?,

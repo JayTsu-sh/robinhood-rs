@@ -683,6 +683,7 @@ mod tests {
             stripe_count: None,
             stripe_size: None,
             stripe_items: Vec::new(),
+            layout_observed_at: None,
             pool_name: None,
             sm_status: serde_json::json!({}),
             last_seen: 1_775_955_820,

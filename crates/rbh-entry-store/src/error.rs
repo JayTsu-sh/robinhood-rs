@@ -26,6 +26,9 @@ pub enum StoreError {
     #[error("invalid persisted object identity: {0}")]
     InvalidObjectIdentity(&'static str),
 
+    #[error("layout value out of range: {0}")]
+    InvalidLayout(&'static str),
+
     #[error("filesystem {0} is not registered")]
     UnknownFilesystem(crate::model::FileSystemId),
 
