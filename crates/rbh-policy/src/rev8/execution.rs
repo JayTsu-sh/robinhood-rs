@@ -2,7 +2,7 @@
 
 mod governance;
 
-use std::{ops::ControlFlow, os::unix::fs::MetadataExt, path::Path, sync::Arc};
+use std::{io, ops::ControlFlow, os::unix::fs::MetadataExt, path::Path, sync::Arc, thread};
 
 use async_trait::async_trait;
 use lustre_api::{HsmAction, HsmRequestBuilder, HsmState, HsmUserStateInfo, LuFid, LustreApi};
@@ -132,6 +132,11 @@ impl TerminalError {
 pub trait NativeHsm: Send + Sync {
     async fn filesystem_name(&self, mount: &Path) -> Result<String, String>;
     async fn observe(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String>;
+    /// Read the state for pool migration. This observation may outlive the
+    /// scheduler's bounded preflight wait.
+    async fn observe_for_migration(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
+        self.observe(mount, fid).await
+    }
     /// Apply the gate after blocking preparation and before issuing the request.
     async fn submit(
         &self, mount: &Path, fid: LuFid, invocation: Invocation, expected: &Generation, gate: SubmissionGate,
@@ -143,6 +148,40 @@ pub struct LustreHsm;
 // A cancelled async worker can leave a blocking ioctl alive. Retain
 // serialization in the local actuator until the actual system call returns.
 static NATIVE_SUBMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) async fn read_only_lustre<T: Send + 'static>(read: impl FnOnce() -> T + Send + 'static) -> io::Result<T> {
+    let (result, pending) = tokio::sync::oneshot::channel();
+    // Use a dedicated read-only worker so a stalled Lustre syscall cannot
+    // keep the Tokio runtime open when the daemon stops.
+    thread::Builder::new().name("rev8-lustre-read".into()).spawn(move || {
+        if result.send(read()).is_err() {
+            tracing::debug!("discarding observation after the preflight worker stopped");
+        }
+    })?;
+    pending.await.map_err(io::Error::other)
+}
+
+fn observe_fid(mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
+    let lookup = LustreApi
+        .hsm_lookup_fid(mount, fid)
+        .map_err(|error| format!("{error:?}"))?;
+    let mount_source_id = source_id(&lookup.mount_source);
+    let Some((metadata, state)) = lookup.file else {
+        return Ok(FidObservation::Missing { mount_source_id });
+    };
+    Ok(FidObservation::Present(Observation {
+        generation: Generation {
+            filesystem_name: lookup.filesystem_name,
+            mount_source_id: Some(mount_source_id),
+            size: metadata.size(),
+            mtime: metadata.mtime(),
+            mtime_nanos: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nanos: metadata.ctime_nsec(),
+        },
+        state,
+    }))
+}
 
 #[async_trait]
 impl NativeHsm for LustreHsm {
@@ -161,29 +200,17 @@ impl NativeHsm for LustreHsm {
 
     async fn observe(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
         let mount = mount.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let lookup = LustreApi
-                .hsm_lookup_fid(&mount, fid)
-                .map_err(|error| format!("{error:?}"))?;
-            let mount_source_id = source_id(&lookup.mount_source);
-            let Some((metadata, state)) = lookup.file else {
-                return Ok(FidObservation::Missing { mount_source_id });
-            };
-            Ok(FidObservation::Present(Observation {
-                generation: Generation {
-                    filesystem_name: lookup.filesystem_name,
-                    mount_source_id: Some(mount_source_id),
-                    size: metadata.size(),
-                    mtime: metadata.mtime(),
-                    mtime_nanos: metadata.mtime_nsec(),
-                    ctime: metadata.ctime(),
-                    ctime_nanos: metadata.ctime_nsec(),
-                },
-                state,
-            }))
-        })
-        .await
-        .map_err(|error| error.to_string())?
+        tokio::task::spawn_blocking(move || observe_fid(&mount, fid))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
+    #[tracing::instrument(skip_all, fields(mount = %mount.display(), %fid))]
+    async fn observe_for_migration(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
+        let mount = mount.to_owned();
+        read_only_lustre(move || observe_fid(&mount, fid))
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     async fn submit(

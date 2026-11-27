@@ -1,6 +1,9 @@
 //! Scheduler wakeup for Rev.8 policies.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use scheduler_rs::prelude::*;
@@ -29,6 +32,10 @@ fn runtime() -> &'static Arc<PolicyRuntime> {
 /// Wake the durable Rev.8 run queue and reconcile pending native operations.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Rev8TickTask;
+
+impl Rev8TickTask {
+    pub const INTERVAL: Duration = Duration::from_secs(1);
+}
 
 #[async_trait]
 impl Task for Rev8TickTask {

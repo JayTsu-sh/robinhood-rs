@@ -737,7 +737,7 @@ async fn ensure_rev8_schedule(scheduler: &Scheduler) -> Result<(), SchedulerErro
         .add_raw(
             rbh_policy::Rev8TickTask::TYPE_NAME.to_owned(),
             serde_json::Value::Null,
-            Box::new(IntervalTrigger::every(std::time::Duration::from_secs(1))),
+            Box::new(IntervalTrigger::every(rbh_policy::Rev8TickTask::INTERVAL)),
             config,
             Some(NAME.to_owned()),
         )

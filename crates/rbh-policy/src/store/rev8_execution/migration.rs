@@ -1,5 +1,8 @@
 use std::{
+    borrow::Cow,
+    ops::ControlFlow,
     path::PathBuf,
+    sync::Arc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -18,9 +21,19 @@ use sqlx::{MySql, QueryBuilder, Transaction, types::Json};
 
 use super::{
     BATCH_SIZE, Candidate, Dispatch, Generation, Invocation, PolicyError, PolicyStore, Rev8Operation, current_revision,
-    decode_fid, elapsed_ms, lock_permit, short_reason, verify_worker_permit,
+    decode_fid, elapsed_ms, lock_permit,
+    preflight::{PreflightKey, PreflightObservation, PreflightRequest, PreflightResult, PreflightWait},
+    short_reason, verify_worker_permit,
 };
-use crate::rev8::{ActionKind, BudgetLimits, heat, push_expression, resources::safety_matches};
+use crate::{
+    Rev8TickTask,
+    rev8::{
+        ActionKind, BudgetLimits,
+        execution::{Decision, FidObservation, NativeHsm, read_only_lustre},
+        heat, push_expression,
+        resources::safety_matches,
+    },
+};
 
 pub(in crate::store) struct PoolRecovery {
     operation: Rev8Operation,
@@ -33,36 +46,86 @@ pub(in crate::store) struct PoolRecovery {
 
 impl PolicyStore {
     pub(super) async fn admit_pool_migration(
-        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: &Invocation, generation: &Generation,
+        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: &Invocation,
         worker: &mut Transaction<'_, MySql>,
-    ) -> Result<(), PolicyError> {
+    ) -> Result<ControlFlow<&'static str>, PolicyError> {
         let options = invocation.migration.as_ref().expect("pool migration invocation");
-        if generation.size > options.max_file_bytes {
+        if candidate.size > options.max_file_bytes {
             return self
                 .record_deferred(dispatch, candidate, invocation, "migration_max_file_bytes")
-                .await;
-        }
-        let mount = dispatch.config.mount_path.clone();
-        let fid = decode_fid(&candidate.fid)?;
-        let source = {
-            let mount = mount.clone();
-            tokio::task::spawn_blocking(move || LustreApi.migration_source_layout(&mount, &fid))
                 .await
-                .map_err(|error| PolicyError::Store(error.to_string()))?
+                .map(ControlFlow::Continue);
+        }
+        let Some(deadline) = migration_deadline(dispatch) else {
+            return self
+                .record_deferred(dispatch, candidate, invocation, "migration_deadline_elapsed")
+                .await
+                .map(ControlFlow::Continue);
         };
-        let source = match source {
-            Ok(source) if source.pool.as_deref() == Some(&options.source_pool) => source,
-            Ok(_) => {
+        let filesystem = &dispatch.policy.filesystem;
+        if let Decision::Defer(reason) = dispatch.admission.authorize(filesystem.as_str(), invocation) {
+            return self
+                .record_deferred(dispatch, candidate, invocation, &reason)
+                .await
+                .map(ControlFlow::Continue);
+        }
+        let fid = decode_fid(&candidate.fid)?;
+        // Share one wait allowance across this page, starting at the first
+        // candidate that needs Lustre reads.
+        let tick_deadline = *dispatch
+            .preflight_until
+            .get_or_init(|| Instant::now() + Rev8TickTask::INTERVAL);
+        if Instant::now() >= tick_deadline {
+            return Ok(ControlFlow::Break("migration_preflight_tick_budget"));
+        }
+        let key = PreflightKey {
+            run: dispatch.run.id,
+            revision: dispatch.run.revision,
+            fid,
+            mount: dispatch.config.mount_path.clone(),
+            catalog_version: (candidate.size, candidate.mtime, candidate.ctime),
+        };
+        let request = PreflightRequest {
+            key: key.clone(),
+            tick_deadline,
+            run_deadline: deadline,
+        };
+        let backend = Arc::clone(&self.runtime.as_ref().expect("dispatch requires a runtime").hsm);
+        let (generation, source, deadline) = match self
+            .pool_preflights
+            .read(
+                &self.pool,
+                filesystem,
+                request,
+                observe_pool_source(backend, key, invocation.clone(), deadline),
+            )
+            .await?
+        {
+            PreflightResult::Observed(Ok((generation, source)), deadline) => (generation, source, deadline),
+            PreflightResult::Observed(Err(reason), _) => {
                 return self
-                    .record_deferred(dispatch, candidate, invocation, "source_pool_changed")
-                    .await;
+                    .record_deferred(dispatch, candidate, invocation, &reason)
+                    .await
+                    .map(ControlFlow::Continue);
             }
-            Err(error) => {
-                return self
-                    .record_deferred(dispatch, candidate, invocation, &error.to_string())
-                    .await;
+            PreflightResult::Waiting(wait @ PreflightWait::Pending) => {
+                return Ok(ControlFlow::Break(wait.reason()));
+            }
+            PreflightResult::Waiting(wait @ PreflightWait::Busy) if dispatch.policy.one_shot => {
+                return Ok(ControlFlow::Break(wait.reason()));
+            }
+            PreflightResult::Waiting(wait) => {
+                self.record_deferred(dispatch, candidate, invocation, wait.reason())
+                    .await?;
+                return Ok(ControlFlow::Continue(()));
             }
         };
+        if source.pool.as_deref() != Some(&options.source_pool) {
+            return self
+                .record_deferred(dispatch, candidate, invocation, "source_pool_changed")
+                .await
+                .map(ControlFlow::Continue);
+        }
         let plan = MigrationPlan {
             source_pool: options.source_pool.clone(),
             target_pool: options.target_pool.clone(),
@@ -80,23 +143,27 @@ impl PolicyStore {
         if let Some(profile) = dispatch.heat
             && let Some(reason) = profile.refresh_for_admission(&self.pool, fid).await?
         {
-            return self.record_deferred(dispatch, candidate, invocation, reason).await;
+            return self
+                .record_deferred(dispatch, candidate, invocation, reason)
+                .await
+                .map(ControlFlow::Continue);
         }
         let ownership = match MigrationOwnership::acquire(&generation.filesystem_name) {
             Ok(ownership) => ownership,
             Err(error) => {
                 return self
                     .record_deferred(dispatch, candidate, invocation, &error.to_string())
-                    .await;
+                    .await
+                    .map(ControlFlow::Continue);
             }
         };
         let operation = self
-            .reserve_operation(dispatch, candidate, invocation, generation, Some(&plan))
+            .reserve_operation(dispatch, candidate, invocation, &generation, Some(&plan))
             .await?;
         let mut tx = self.pool.begin().await?;
         let active = current_revision(&mut tx, dispatch.run).await?;
         if !lock_permit(&mut tx, operation).await? {
-            return Ok(());
+            return Ok(ControlFlow::Continue(()));
         }
         let result = if !active {
             Err(MigrationError::Deferred("policy_revision_inactive"))
@@ -106,8 +173,9 @@ impl PolicyStore {
             Err(MigrationError::Deferred("permit_store_requires_synchronous_commit"))
         } else if !dispatch.admission.window_open(Utc::now()) {
             Err(MigrationError::Deferred("admission_window_closed"))
-        } else if let Some(deadline) = migration_deadline(dispatch) {
-            let expected = file_version(generation);
+        } else if Instant::now() < deadline {
+            let expected = file_version(&generation);
+            let mount = dispatch.config.mount_path.clone();
             let limits = MigrationLimits {
                 deadline,
                 before_swap: dispatch.admission.window_check(),
@@ -137,7 +205,7 @@ impl PolicyStore {
                     &dispatch.policy.filesystem,
                     fid,
                     layout,
-                    file_version(generation),
+                    file_version(&generation),
                 )
                 .await
             }
@@ -145,7 +213,8 @@ impl PolicyStore {
             Err(error @ MigrationError::BeforeSwap(_)) => ("failed", Some(error.to_string()), None),
             Err(error @ MigrationError::Uncertain(_)) => ("unknown", Some(error.to_string()), None),
         };
-        finish_migration(self, operation, "submitting", state, reason, evidence).await
+        finish_migration(self, operation, "submitting", state, reason, evidence).await?;
+        Ok(ControlFlow::Continue(()))
     }
 
     pub(super) async fn start_pool_recovery(
@@ -289,6 +358,37 @@ impl PolicyStore {
         };
         finish_migration(self, operation.id, &operation.state, state, reason, evidence).await
     }
+}
+
+async fn observe_pool_source(
+    backend: Arc<dyn NativeHsm>, key: PreflightKey, invocation: Invocation, deadline: Instant,
+) -> PreflightObservation {
+    let PreflightKey {
+        fid,
+        mount,
+        catalog_version,
+        ..
+    } = key;
+    if Instant::now() >= deadline {
+        return Err(PreflightWait::TimedOut.reason().into());
+    }
+    let observation = backend.observe_for_migration(&mount, fid).await.map_err(Cow::Owned)?;
+    let FidObservation::Present(observation) = observation else {
+        return Err("fid_missing".into());
+    };
+    let generation = observation.generation;
+    if (generation.size, generation.mtime, generation.ctime) != catalog_version {
+        return Err("catalog_generation_changed".into());
+    }
+    invocation.precondition(&observation.state)?;
+    if Instant::now() >= deadline {
+        return Err(PreflightWait::TimedOut.reason().into());
+    }
+    let layout = read_only_lustre(move || LustreApi.migration_source_layout(&mount, &fid))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    Ok((generation, layout))
 }
 
 async fn candidate_deferral(

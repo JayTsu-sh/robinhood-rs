@@ -32,6 +32,7 @@ pub struct PolicyStore {
     read_heat: Arc<BTreeMap<FileSystemId, HeatProfile>>,
     configured_filesystems: Option<Arc<BTreeSet<FileSystemId>>>,
     pool_recoveries: Arc<tokio::sync::Mutex<BTreeMap<u64, rev8_execution::PoolRecovery>>>,
+    pool_preflights: rev8_execution::PoolPreflights,
 }
 
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
@@ -52,6 +53,7 @@ impl PolicyStore {
             read_heat: Arc::default(),
             configured_filesystems: None,
             pool_recoveries: Arc::default(),
+            pool_preflights: rev8_execution::PoolPreflights::default(),
         }
     }
 

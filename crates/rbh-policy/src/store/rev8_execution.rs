@@ -1,9 +1,12 @@
 mod migration;
+mod preflight;
 pub(super) use migration::PoolRecovery;
+pub(super) use preflight::PoolPreflights;
 
 use std::{
     collections::BTreeMap,
     ops::ControlFlow,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -163,6 +166,7 @@ struct Dispatch<'a> {
     admission: &'a Admission,
     config: &'a FileSystemConfig,
     heat: Option<&'a HeatProfile>,
+    preflight_until: OnceLock<Instant>,
 }
 
 impl PolicyStore {
@@ -440,6 +444,7 @@ impl PolicyStore {
             admission: &admission,
             config: &config,
             heat,
+            preflight_until: OnceLock::new(),
         };
         self.dispatch_batch(dispatch, worker).await
     }
@@ -534,6 +539,14 @@ impl PolicyStore {
             heat_deferrals = Some(Json(page));
         }
         for candidate in &candidates {
+            let recorded = sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_operations WHERE run_id = ? AND fid = ?")
+                .bind(run.id)
+                .bind(&candidate.fid)
+                .fetch_optional(&self.pool)
+                .await?;
+            if recorded.is_some() {
+                continue;
+            }
             if !dispatch.admission.window_open(Utc::now()) {
                 return self
                     .finish_run(run, "deferred", Some("admission_window_closed"), heat_deferrals)
@@ -565,7 +578,11 @@ impl PolicyStore {
                     .await?;
                 continue;
             }
-            self.admit_candidate(&dispatch, candidate, invocation, worker).await?;
+            if let ControlFlow::Break(reason) = self.admit_candidate(&dispatch, candidate, invocation, worker).await? {
+                // Revisit this page on the next tick. Recorded candidates
+                // are idempotent and heat counts move with the cursor.
+                return self.finish_run(run, "running", Some(reason), None).await;
+            }
         }
         // A stale batch without submissions must not consume a one-shot that
         // was rescheduled when its bound safety revision changed.
@@ -719,16 +736,8 @@ impl PolicyStore {
     async fn admit_candidate(
         &self, dispatch: &Dispatch<'_>, candidate: &Candidate, mut invocation: Invocation,
         worker: &mut Transaction<'_, MySql>,
-    ) -> Result<(), PolicyError> {
+    ) -> Result<ControlFlow<&'static str>, PolicyError> {
         let fs = dispatch.policy.filesystem.as_str();
-        let existing = sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_operations WHERE run_id = ? AND fid = ?")
-            .bind(dispatch.run.id)
-            .bind(&candidate.fid)
-            .fetch_optional(&self.pool)
-            .await?;
-        if existing.is_some() {
-            return Ok(());
-        }
         let in_flight =
             sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_operations WHERE filesystem = ? AND pending_fid = ?")
                 .bind(fs)
@@ -738,6 +747,12 @@ impl PolicyStore {
         if in_flight.is_some() {
             return self
                 .record_deferred(dispatch, candidate, &invocation, "unresolved_operation")
+                .await
+                .map(ControlFlow::Continue);
+        }
+        if invocation.migration.is_some() {
+            return self
+                .admit_pool_migration(dispatch, candidate, &invocation, worker)
                 .await;
         }
         let fid = decode_fid(&candidate.fid)?;
@@ -747,29 +762,37 @@ impl PolicyStore {
             Ok(FidObservation::Missing { .. }) => {
                 return self
                     .record_deferred(dispatch, candidate, &invocation, "fid_missing")
-                    .await;
+                    .await
+                    .map(ControlFlow::Continue);
             }
-            Err(error) => return self.record_deferred(dispatch, candidate, &invocation, &error).await,
+            Err(error) => {
+                return self
+                    .record_deferred(dispatch, candidate, &invocation, &error)
+                    .await
+                    .map(ControlFlow::Continue);
+            }
         };
         let seen = &snapshot.generation;
         if seen.size != candidate.size || seen.mtime != candidate.mtime || seen.ctime != candidate.ctime {
             return self
                 .record_deferred(dispatch, candidate, &invocation, "catalog_generation_changed")
-                .await;
+                .await
+                .map(ControlFlow::Continue);
         }
         if matches!(invocation.kind, ActionKind::Release | ActionKind::Restore) {
             invocation.archive_id = snapshot.state.archive_id;
         }
         if let Decision::Defer(reason) = dispatch.admission.authorize(fs, &invocation) {
-            return self.record_deferred(dispatch, candidate, &invocation, &reason).await;
+            return self
+                .record_deferred(dispatch, candidate, &invocation, &reason)
+                .await
+                .map(ControlFlow::Continue);
         }
         if let Err(reason) = invocation.precondition(&snapshot.state) {
-            return self.record_deferred(dispatch, candidate, &invocation, reason).await;
-        }
-        if invocation.migration.is_some() {
             return self
-                .admit_pool_migration(dispatch, candidate, &invocation, seen, worker)
-                .await;
+                .record_deferred(dispatch, candidate, &invocation, reason)
+                .await
+                .map(ControlFlow::Continue);
         }
         let operation = self
             .reserve_operation(dispatch, candidate, &invocation, seen, None)
@@ -780,7 +803,7 @@ impl PolicyStore {
         let mut tx = self.pool.begin().await?;
         let active = current_revision(&mut tx, dispatch.run).await?;
         if !lock_permit(&mut tx, operation).await? {
-            return Ok(());
+            return Ok(ControlFlow::Continue(()));
         }
         let (state, attempted, reason, terminal_class) = if !active || !dispatch.admission.window_open(Utc::now()) {
             ("deferred", false, Some("policy_or_window_inactive".into()), None)
@@ -826,7 +849,7 @@ impl PolicyStore {
         ).bind(state).bind(attempted).bind(reason.as_deref().map(short_reason)).bind(terminal_class)
             .bind(state).bind(state).bind(operation).execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     }
 
     async fn reserve_operation(
