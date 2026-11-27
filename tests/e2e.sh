@@ -9,7 +9,7 @@
 #      rbh report (fs-info / size-profile / top-users / dump), rbh undelete
 #      (list / forget), rejection of the previous policy format, and
 #      /api/metrics.
-#   5. Tears the daemon down with SIGTERM and asserts graceful exit.
+#   5. Verifies graceful SIGTERM and nonzero exit on scheduler failure.
 #
 # Requirements on the host:
 #   * Disposable MariaDB reachable at 127.0.0.1:3306 as root without a password.
@@ -38,6 +38,7 @@ PID=""
 DB_CREATED=0
 LOG=""
 MOUNT=""
+SCHEDULES_RENAMED=0
 
 test_sql() {
     mysql --no-defaults --host=127.0.0.1 --port=3306 --user=root --skip-password "$@"
@@ -56,6 +57,9 @@ cleanup() {
     fi
     if [[ -n "$PID" ]]; then
         wait "$PID" 2>/dev/null || true
+    fi
+    if [[ "$SCHEDULES_RENAMED" == 1 ]]; then
+        test_sql "$DB" -e 'RENAME TABLE schedules_e2e_fault TO schedules;' || true
     fi
     if [[ "$DB_CREATED" == 1 && "${RBH_E2E_KEEP_DB:-0}" != "1" ]]; then
         test_sql -e "DROP DATABASE $DB;" || true
@@ -91,38 +95,52 @@ command -v mysql >/dev/null 2>&1 || die "mysql CLI not found on PATH"
 if ( : </dev/tcp/127.0.0.1/"$PORT" ) 2>/dev/null; then
     die "test port $PORT is already in use"
 fi
-LOG="$(mktemp "${TMPDIR:-/tmp}/rbh-e2e.XXXXXX.log")"
 MOUNT="$(mktemp -d "${TMPDIR:-/tmp}/rbh-e2e-mount.XXXXXX")"
 
 # 1. bring up a fresh DB
-echo "[setup] creating DB $DB (daemon log: $LOG)"
+echo "[setup] creating DB $DB"
 test_sql -e "CREATE DATABASE $DB;" \
     || die "cannot create DB $DB (use a fresh name on a disposable MariaDB)"
 DB_CREATED=1
 
 # 2. launch daemon (migrations run on boot)
-echo "[setup] launching daemon on :$PORT"
-RBH_DATABASE_URL="mysql://root@127.0.0.1/$DB" \
-RBH_FILESYSTEMS_JSON="" \
-RBH_FILESYSTEM_ID="$FILESYSTEM" \
-RBH_LUSTRE_MOUNT="$MOUNT" \
-RBH_CHANGELOG_USER="" \
-RBH_LOG="info" \
-RBH_LISTEN_ADDR="127.0.0.1:$PORT" \
-    env -u RBH_REV8_WRITERS_FILE -u RBH_REV8_HSM_PRINCIPAL_FILE \
-    "$BIN_DAEMON" >"$LOG" 2>&1 &
-PID=$!
+start_daemon() {
+    LOG="$(mktemp "${TMPDIR:-/tmp}/rbh-e2e.XXXXXX.log")"
+    echo "[setup] launching daemon on :$PORT (log: $LOG)"
+    RBH_DATABASE_URL="mysql://root@127.0.0.1/$DB" \
+    RBH_FILESYSTEMS_JSON="" \
+    RBH_FILESYSTEM_ID="$FILESYSTEM" \
+    RBH_LUSTRE_MOUNT="$MOUNT" \
+    RBH_CHANGELOG_USER="" \
+    RBH_LOG="info" \
+    RBH_LISTEN_ADDR="127.0.0.1:$PORT" \
+        env -u RBH_REV8_WRITERS_FILE -u RBH_REV8_HSM_PRINCIPAL_FILE \
+        "$BIN_DAEMON" >"$LOG" 2>&1 &
+    PID=$!
 
-for i in $(seq 1 30); do
-    kill -0 "$PID" 2>/dev/null || die "daemon exited before becoming healthy (see $LOG)"
-    if grep -q 'HTTP server listening' "$LOG" &&
-        curl -fsS --max-time 1 "$API/api/health" >/dev/null 2>&1; then
-        break
+    for _ in $(seq 1 30); do
+        kill -0 "$PID" 2>/dev/null || die "daemon exited before becoming healthy (see $LOG)"
+        if grep -q 'HTTP server listening' "$LOG" &&
+            curl -fsS --max-time 1 "$API/api/health" >/dev/null 2>&1; then
+            echo "[setup] daemon healthy (pid $PID)"
+            return
+        fi
+        sleep 0.5
+    done
+    die "daemon never became healthy (see $LOG)"
+}
+
+wait_for_daemon_exit() {
+    for _ in $(seq 1 10); do
+        kill -0 "$PID" 2>/dev/null || return 0
+        sleep 0.5
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+        die "daemon did not exit within 5s of $1 (see $LOG)"
     fi
-    sleep 0.5
-    [[ $i == 30 ]] && die "daemon never became healthy (see $LOG)"
-done
-echo "[setup] daemon healthy (pid $PID)"
+}
+
+start_daemon
 
 # 3. Seed scoped rows with matching typed metadata for queries and JSON reads.
 echo "[seed] inserting scoped entries and one removed entry for $FILESYSTEM"
@@ -235,19 +253,27 @@ assert_contains "$metrics" 'rbh_catalog_entries{backend="lustre",filesystem="lus
 # 5. graceful shutdown
 echo "[teardown] SIGTERM"
 kill -TERM "$PID"
-for _ in $(seq 1 10); do
-    sleep 0.5
-    kill -0 "$PID" 2>/dev/null || break
-done
-if kill -0 "$PID" 2>/dev/null; then
-    die "daemon did not exit within 5s of SIGTERM"
-fi
+wait_for_daemon_exit SIGTERM
 wait "$PID" || die "daemon exited unsuccessfully (see $LOG)"
 PID=""
 
 # check log for the graceful-shutdown banner
 grep -q "robinhood-rs daemon stopped" "$LOG" \
     || die "daemon log missing 'daemon stopped' line (see $LOG)"
+
+# 6. Simulate a scheduler store error in the disposable schema.
+start_daemon
+echo "[fault] hiding the scheduler table"
+test_sql "$DB" -e 'RENAME TABLE schedules TO schedules_e2e_fault;'
+SCHEDULES_RENAMED=1
+wait_for_daemon_exit "scheduler store failure"
+status=0
+wait "$PID" || status=$?
+PID=""
+test_sql "$DB" -e 'RENAME TABLE schedules_e2e_fault TO schedules;'
+SCHEDULES_RENAMED=0
+[[ "$status" == 1 ]] || die "scheduler failure returned exit status $status (see $LOG)"
+grep -q "Rev.8 scheduler stopped" "$LOG" || die "daemon log missing scheduler failure (see $LOG)"
 
 echo "[done] all assertions passed"
 exit 0

@@ -11,7 +11,8 @@ for the REST and live Lustre deployment checks.
 Run against a disposable MariaDB reachable at `127.0.0.1:3306` as root
 without a password. The script creates a fresh schema, seeds the `lustre`
 catalog scope via SQL, and checks REST, `rbh find`, `rbh report`,
-`rbh undelete`, Rev.8 format rejection, metrics, and graceful shutdown.
+`rbh undelete`, Rev.8 format rejection, metrics, graceful shutdown, and
+nonzero exit when the scheduler loses access to its table.
 
 ```sh
 cargo build --locked --release -p robinhood-rs -p rbh-cli

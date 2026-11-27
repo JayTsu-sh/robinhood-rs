@@ -388,10 +388,6 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .context("register Rev.8 scheduler wakeup")?;
 
-    // Start the scheduler loop.
-    let _scheduler_handle = scheduler.spawn();
-    tracing::info!("scheduler started");
-
     // Active HSM state poller. Walks the catalog in small batches,
     // calls llapi_hsm_state_get, patches sm_status if the stored state
     // diverged from MDS truth. Disabled when RBH_HSM_POLL_SECS=0.
@@ -469,8 +465,22 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::debug!(error = %e, "sd_notify READY failed (likely not under systemd)");
     }
 
-    // 9. Signal supervisor. Blocks until SIGTERM/SIGINT, then flips cancel.
-    signals::supervise(obs_guard, daemon_cancel.clone(), None, None).await?;
+    // 9. Stop serving if the scheduler can no longer process queued work.
+    let scheduler_run = scheduler.start();
+    tokio::pin!(scheduler_run);
+    tracing::info!("scheduler started");
+    let outcome = tokio::select! {
+        signal = signals::supervise(obs_guard, daemon_cancel.clone(), None, None) => {
+            scheduler.shutdown();
+            signal.and(scheduler_run.await.context("Rev.8 scheduler shutdown failed"))
+        }
+        result = &mut scheduler_run => {
+            result
+                .and_then(|()| Err(SchedulerError::ExecutionError("unexpected scheduler exit".into())))
+                .context("Rev.8 scheduler stopped")
+        }
+    };
+    daemon_cancel.cancel();
 
     // Tell systemd we're stopping so it can update unit state before
     // the process exits and suppresses its own timeout warnings.
@@ -484,7 +494,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     tracing::info!("robinhood-rs daemon stopped");
-    Ok(())
+    outcome
 }
 
 /// External legacy configuration compatibility for a sole Lustre runtime.
