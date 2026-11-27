@@ -134,8 +134,14 @@ are retained only under `/api/compat/lustre/` as an explicit migration boundary.
 
 ### Rev.8 archive preview
 
-Send the following document to `POST /api/policies` as JSON, substituting the
-ID of a registered Lustre filesystem with HSM enabled.
+Set `RBH_REV8_WRITERS_FILE` to a server-side JSON map from writer principal
+names to the hex SHA-256 digests of their high-entropy bearer tokens. Send a
+configured token in the `Authorization: Bearer …` header for every Rev.8
+configuration write. Use a local connection or a TLS-terminating proxy for
+the token. The service records the principal from its configured allowlist.
+
+Send the following document to `POST /api/policies` as JSON, substituting
+the ID of a registered Lustre filesystem with HSM enabled.
 
 ```json
 {
@@ -170,6 +176,28 @@ and the total logical `estimatedBytes` before any execution budget is applied.
 `PUT /api/policies/{id}` saves a new revision. This preview accepts indexed
 regular files, the built-in preview references, and first-match archive rules
 with size comparisons or boolean conditions.
+
+### Rev.8 policy resources
+
+Manage `Selector`, `ExecutionProfile`, `AuthorizationPolicy`, `ApprovalPolicy`
+and `SystemSafetyPolicy` at `/api/selectors`, `/api/execution-profiles`,
+`/api/authorization-policies`, `/api/approval-policies` and
+`/api/system-safety-policies`. Submit a Rev.8 document with `POST` on the
+collection and use `GET`, `PUT` or `DELETE` at the resource name. The controls
+registered by the server are available at `GET /api/action-contracts` and
+`GET /api/action-contracts/{name}`.
+
+Use `selectorRef` inside a supported condition and set `profileRef`,
+`authorizationRef` and `approvalPolicyRef` to the names of saved resources.
+Matching system safety resources are bound by scope. Each policy revision
+pins the resolved resource revisions, including transitive selectors.
+Matching system safety changes create a new revision of affected enabled
+policies. Submit a new policy revision to adopt changes to named resources.
+Preview responses
+return the bindings in `resourceBindings`. Read the pinned definitions at
+`GET /api/{collection}/{name}/revisions/{revision}` or find the original
+policy binding at `GET /api/policies/{id}/revisions/{revision}`. References
+from enabled policies and from other selectors block resource deletion.
 
 ## Configuration
 

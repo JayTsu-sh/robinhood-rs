@@ -28,6 +28,15 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing::info!("robinhood-rs daemon starting");
 
+    let writers = if let Some(path) = std::env::var_os("RBH_REV8_WRITERS_FILE") {
+        let json = tokio::fs::read_to_string(path)
+            .await
+            .context("read RBH_REV8_WRITERS_FILE")?;
+        rbh_api::Rev8Writers::from_digest_json(&json).map_err(anyhow::Error::msg)?
+    } else {
+        rbh_api::Rev8Writers::default()
+    };
+
     // 2. Database connection.
     let db_url = std::env::var("RBH_DATABASE_URL").unwrap_or_else(|_| "mysql://root@127.0.0.1/rbh_entries".to_string());
     let pool = sqlx::MySqlPool::connect(&db_url)
@@ -439,7 +448,7 @@ pub async fn run() -> anyhow::Result<()> {
         scheduler: Some(scheduler.clone()),
         scans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
-    let app = rbh_api::router(state);
+    let app = rbh_api::router_with_writers(state, writers);
 
     // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
     let listen_addr = std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

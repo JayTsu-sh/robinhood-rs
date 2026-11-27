@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hsm.storage.io/v1alpha3/system-safety.schema.json",
+  "title": "LHPS SystemSafetyPolicy (hsm.storage.io/v1alpha3)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "hsm.storage.io/v1alpha3" },
+    "kind": { "const": "SystemSafetyPolicy" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", "minLength": 1, "maxLength": 253 },
+        "description": { "type": "string" }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope"],
+      "properties": {
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "filesystems": { "type": "array", "items": { "type": "string" } },
+            "actions": { "type": "array", "items": { "type": "string" } },
+            "effectCategories": {
+              "type": "array",
+              "items": { "enum": ["notify", "read_only_io", "metadata_mutation", "data_copy", "data_release", "destructive", "external_effect"] }
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxOperations": { "type": "integer", "minimum": 1 },
+            "maxSubmitAttempts": { "type": "integer", "minimum": 1 },
+            "maxObjectLogicalBytes": {
+              "oneOf": [
+                { "type": "integer", "minimum": 1 },
+                { "type": "string", "pattern": "^[1-9][0-9]*(B|KiB|MiB|GiB|TiB|PiB)$" }
+              ]
+            },
+            "maxArchiveCopies": { "type": "integer", "minimum": 1 },
+            "maxDuration": { "type": "string", "pattern": "^[1-9][0-9]*(ms|s|m|h|d)$" },
+            "maxUnknownOutstanding": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "effectRules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["effect", "minimumApproval", "allowAutoBreakerReset"],
+            "properties": {
+              "effect": { "enum": ["notify", "read_only_io", "metadata_mutation", "data_copy", "data_release", "destructive", "external_effect"] },
+              "minimumApproval": { "enum": ["none", "human"] },
+              "allowAutoBreakerReset": { "type": "boolean" }
+            }
+          }
+        },
+        "allowedActions": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

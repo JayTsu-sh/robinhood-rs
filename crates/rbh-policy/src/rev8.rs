@@ -1,6 +1,12 @@
 //! Compile the native HSM archive preview supported by the Rev.8 API.
 
-use std::num::NonZeroU64;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+};
+
+pub mod resources;
+use resources::{ResourceBinding, ResourceKind};
 
 use rbh_entry_store::store::{EntryStore, QueryParam};
 use rbh_entry_store::{BackendKind, EntryKind, FileSystemId};
@@ -10,12 +16,13 @@ use serde_json::Value as JsonValue;
 
 use crate::PolicyError;
 
-const API_VERSION: &str = "hsm.storage.io/v1alpha3";
-const BUILTIN_PREVIEW: &str = "builtin-preview";
+pub(crate) const API_VERSION: &str = "hsm.storage.io/v1alpha3";
+pub(crate) const BUILTIN_PREVIEW: &str = "builtin-preview";
 
 pub struct CompiledPolicy {
     pub name: String,
     pub filesystem: FileSystemId,
+    pub(crate) selectors: BTreeSet<String>,
     where_clause: String,
     params: Vec<QueryParam>,
 }
@@ -26,6 +33,7 @@ pub struct PreviewResult {
     pub revision: u64,
     pub candidate_count: u64,
     pub estimated_bytes: u64,
+    pub resource_bindings: Vec<ResourceBinding>,
 }
 
 /// Recognize versioned documents before attempting to parse the older API model.
@@ -36,7 +44,7 @@ pub fn is_versioned_document(document: &JsonValue) -> bool {
         || document.get("kind").and_then(JsonValue::as_str) == Some("Policy")
 }
 
-pub fn compile(document: &JsonValue) -> Result<CompiledPolicy, PolicyError> {
+pub(crate) fn parse(document: &JsonValue) -> Result<Policy, PolicyError> {
     if document.get("apiVersion").and_then(JsonValue::as_str) != Some(API_VERSION) {
         return Err(invalid(format!("apiVersion must be {API_VERSION}")));
     }
@@ -46,75 +54,92 @@ pub fn compile(document: &JsonValue) -> Result<CompiledPolicy, PolicyError> {
             "metadata.name must be a lowercase resource name of 1–253 characters",
         ));
     }
-    let spec = policy.spec;
-    if let Trigger::Periodic { interval } = &spec.trigger {
+    if let Trigger::Periodic { interval } = &policy.spec.trigger {
         duration_millis(interval).ok_or_else(|| invalid("spec.trigger.interval must be a positive Rev.8 duration"))?;
     }
-    for (path, reference) in [
-        ("spec.execution.profileRef", spec.execution.profile_ref.as_str()),
-        (
-            "spec.governance.authorizationRef",
-            spec.governance.authorization_ref.as_str(),
-        ),
-        (
-            "spec.governance.approvalPolicyRef",
-            spec.governance.approval_policy_ref.as_str(),
-        ),
-    ] {
-        if reference != BUILTIN_PREVIEW {
-            return Err(invalid(format!(
-                "{path} must reference {BUILTIN_PREVIEW} for this preview"
-            )));
-        }
+    policy.spec.execution.budget.run.validate()?;
+    Ok(policy)
+}
+
+impl Policy {
+    pub(crate) fn filesystem(&self) -> &FileSystemId {
+        &self.spec.target.filesystem
     }
-    spec.execution.budget.run.validate()?;
-    let target_condition = compile_condition(&spec.target.condition, "spec.target.where")?;
-    let files = Predicate::Cmp {
-        field: Field::Kind,
-        cmp: CmpOp::Eq,
-        value: Value::Num(EntryKind::File as i64),
-    };
-    let (mut where_clause, mut params) = rbh_predicate::to_sql(&Predicate::And {
-        children: vec![files, target_condition],
-    });
-    let (rules, rule_params) = spec.rules.compile()?;
-    where_clause.push_str(" AND ");
-    where_clause.push_str(&rules);
-    params.extend(rule_params);
-    Ok(CompiledPolicy {
-        name: policy.metadata.name,
-        filesystem: spec.target.filesystem,
-        where_clause,
-        params: params
-            .into_iter()
-            .map(|param| match param {
-                SqlParam::Num(value) => QueryParam::Int(value),
-                SqlParam::Str(value) => QueryParam::Str(value),
-            })
-            .collect(),
-    })
+
+    pub(crate) fn references(&self) -> [(ResourceKind, &str, &str); 3] {
+        [
+            (
+                ResourceKind::ExecutionProfile,
+                &self.spec.execution.profile_ref,
+                "spec.execution.profileRef",
+            ),
+            (
+                ResourceKind::AuthorizationPolicy,
+                &self.spec.governance.authorization_ref,
+                "spec.governance.authorizationRef",
+            ),
+            (
+                ResourceKind::ApprovalPolicy,
+                &self.spec.governance.approval_policy_ref,
+                "spec.governance.approvalPolicyRef",
+            ),
+        ]
+    }
+
+    pub(crate) fn compile(self, selectors: &BTreeMap<String, JsonValue>) -> Result<CompiledPolicy, PolicyError> {
+        let spec = self.spec;
+        let mut conditions = ConditionCompiler::new(selectors);
+        let target_condition = conditions.compile(&spec.target.condition, "spec.target.where")?;
+        let files = Predicate::Cmp {
+            field: Field::Kind,
+            cmp: CmpOp::Eq,
+            value: Value::Num(EntryKind::File as i64),
+        };
+        let (mut where_clause, mut params) = rbh_predicate::to_sql(&Predicate::And {
+            children: vec![files, target_condition],
+        });
+        let (rules, rule_params) = spec.rules.compile(&mut conditions)?;
+        where_clause.push_str(" AND ");
+        where_clause.push_str(&rules);
+        params.extend(rule_params);
+        Ok(CompiledPolicy {
+            name: self.metadata.name,
+            filesystem: spec.target.filesystem,
+            selectors: conditions.referenced,
+            where_clause,
+            params: params
+                .into_iter()
+                .map(|param| match param {
+                    SqlParam::Num(value) => QueryParam::Int(value),
+                    SqlParam::Str(value) => QueryParam::Str(value),
+                })
+                .collect(),
+        })
+    }
+}
+
+#[tracing::instrument(skip(entries))]
+pub(crate) async fn validate_filesystem(entries: &EntryStore, filesystem: &FileSystemId) -> Result<(), PolicyError> {
+    let config = entries
+        .get_filesystem(filesystem)
+        .await
+        .map_err(|error| PolicyError::Store(error.to_string()))?
+        .ok_or_else(|| invalid(format!("spec.target.filesystem is not registered: {}", filesystem)))?;
+    if config.backend != BackendKind::Lustre || !config.capabilities.hsm {
+        return Err(invalid(format!(
+            "spec.target.filesystem does not support Lustre HSM: {}",
+            filesystem
+        )));
+    }
+    Ok(())
 }
 
 impl CompiledPolicy {
-    #[tracing::instrument(skip_all, fields(filesystem = %self.filesystem))]
-    pub async fn validate_filesystem(&self, entries: &EntryStore) -> Result<(), PolicyError> {
-        let config = entries
-            .get_filesystem(&self.filesystem)
-            .await
-            .map_err(|error| PolicyError::Store(error.to_string()))?
-            .ok_or_else(|| invalid(format!("spec.target.filesystem is not registered: {}", self.filesystem)))?;
-        if config.backend != BackendKind::Lustre || !config.capabilities.hsm {
-            return Err(invalid(format!(
-                "spec.target.filesystem does not support Lustre HSM: {}",
-                self.filesystem
-            )));
-        }
-        Ok(())
-    }
-
     #[tracing::instrument(skip_all, fields(filesystem = %self.filesystem, revision))]
-    pub async fn preview(&self, entries: &EntryStore, revision: u64) -> Result<PreviewResult, PolicyError> {
-        self.validate_filesystem(entries).await?;
+    pub async fn preview(
+        &self, entries: &EntryStore, revision: u64, resource_bindings: Vec<ResourceBinding>,
+    ) -> Result<PreviewResult, PolicyError> {
+        validate_filesystem(entries, &self.filesystem).await?;
         let (candidate_count, estimated_bytes) = entries
             .scoped_totals_where(&self.filesystem, &self.where_clause, &self.params)
             .await
@@ -123,13 +148,14 @@ impl CompiledPolicy {
             revision,
             candidate_count,
             estimated_bytes,
+            resource_bindings,
         })
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Policy {
+pub(crate) struct Policy {
     #[serde(rename = "apiVersion")]
     _api_version: String,
     #[serde(rename = "kind")]
@@ -288,7 +314,7 @@ struct Rules {
 }
 
 impl Rules {
-    fn compile(self) -> Result<(String, Vec<SqlParam>), PolicyError> {
+    fn compile(self, conditions: &mut ConditionCompiler<'_>) -> Result<(String, Vec<SqlParam>), PolicyError> {
         if self.entries.is_empty() {
             return Err(invalid("spec.rules.entries must contain at least one rule"));
         }
@@ -304,7 +330,7 @@ impl Rules {
             .exclude
             .iter()
             .enumerate()
-            .map(|(i, condition)| compile_condition(condition, &format!("spec.rules.exclude[{i}]")))
+            .map(|(i, condition)| conditions.compile(condition, &format!("spec.rules.exclude[{i}]")))
             .collect::<Result<Vec<_>, _>>()?;
         let (exclude, mut params) = rbh_predicate::to_sql(&Predicate::Not {
             inner: Box::new(Predicate::Or { children: excludes }),
@@ -332,7 +358,7 @@ impl Rules {
                 Decision::Skip => false,
             };
             let (condition, rule_params) =
-                rbh_predicate::to_sql(&compile_condition(&rule.condition, &format!("{path}.match"))?);
+                rbh_predicate::to_sql(&conditions.compile(&rule.condition, &format!("{path}.match"))?);
             clauses.push(format!("WHEN {condition} THEN {}", u8::from(execute)));
             params.extend(rule_params);
         }
@@ -447,60 +473,116 @@ impl From<Comparison> for CmpOp {
     }
 }
 
-fn compile_condition(expr: &JsonValue, path: &str) -> Result<Predicate, PolicyError> {
-    if let Some(matches) = expr.as_bool() {
-        return Ok(if matches { Predicate::True } else { Predicate::False });
+pub(crate) fn validate_selector(name: &str, selectors: &BTreeMap<String, JsonValue>) -> Result<(), PolicyError> {
+    ConditionCompiler::new(selectors).compile(&serde_json::json!({"selectorRef": name}), "spec.where")?;
+    Ok(())
+}
+
+struct ConditionCompiler<'a> {
+    selectors: &'a BTreeMap<String, JsonValue>,
+    stack: Vec<String>,
+    referenced: BTreeSet<String>,
+    remaining: usize,
+}
+
+impl<'a> ConditionCompiler<'a> {
+    fn new(selectors: &'a BTreeMap<String, JsonValue>) -> Self {
+        Self {
+            selectors,
+            stack: Vec::new(),
+            referenced: BTreeSet::new(),
+            remaining: 4096,
+        }
     }
-    let fields = expr
-        .as_object()
-        .ok_or_else(|| invalid(format!("{path} must be a boolean or a condition object")))?;
-    if fields.contains_key("field") || fields.contains_key("op") || fields.contains_key("value") {
-        let condition: FieldCondition = serde_path_to_error::deserialize(expr).map_err(|error| {
-            let field = error.path().to_string();
-            let message = error.into_inner();
-            if field == "." {
-                invalid(format!("{path}: {message}"))
-            } else {
-                invalid(format!("{path}.{field}: {message}"))
+
+    fn compile(&mut self, expr: &JsonValue, path: &str) -> Result<Predicate, PolicyError> {
+        self.compile_node(expr, path, 0)
+    }
+
+    fn compile_node(&mut self, expr: &JsonValue, path: &str, depth: usize) -> Result<Predicate, PolicyError> {
+        if depth >= 128 {
+            return Err(invalid(format!("{path} exceeds the condition nesting limit")));
+        }
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or_else(|| invalid("condition expression is too large after resolving selectors"))?;
+
+        if let Some(matches) = expr.as_bool() {
+            return Ok(if matches { Predicate::True } else { Predicate::False });
+        }
+        let fields = expr
+            .as_object()
+            .ok_or_else(|| invalid(format!("{path} must be a boolean or a condition object")))?;
+        if fields.contains_key("field") || fields.contains_key("op") || fields.contains_key("value") {
+            let condition: FieldCondition = serde_path_to_error::deserialize(expr).map_err(|error| {
+                let field = error.path().to_string();
+                let message = error.into_inner();
+                if field == "." {
+                    invalid(format!("{path}: {message}"))
+                } else {
+                    invalid(format!("{path}.{field}: {message}"))
+                }
+            })?;
+            if condition.field != "object.size" {
+                return Err(invalid(format!("{path}.field is unsupported: {}", condition.field)));
             }
-        })?;
-        if condition.field != "object.size" {
-            return Err(invalid(format!("{path}.field is unsupported: {}", condition.field)));
+            let bytes = size_bytes(&condition.value)
+                .and_then(|size| i64::try_from(size).ok())
+                .ok_or_else(|| invalid(format!("{path}.value must be a size within the supported range")))?;
+            return Ok(Predicate::Cmp {
+                field: Field::Size,
+                cmp: condition.op.into(),
+                value: Value::Num(bytes),
+            });
         }
-        let bytes = size_bytes(&condition.value)
-            .and_then(|size| i64::try_from(size).ok())
-            .ok_or_else(|| invalid(format!("{path}.value must be a size within the supported range")))?;
-        return Ok(Predicate::Cmp {
-            field: Field::Size,
-            cmp: condition.op.into(),
-            value: Value::Num(bytes),
-        });
-    }
-    let Some((key, operand)) = fields.iter().next().filter(|_| fields.len() == 1) else {
-        return Err(invalid(format!("{path} must contain exactly one condition operator")));
-    };
-    let operator_path = format!("{path}.{key}");
-    match key.as_str() {
-        "not" => Ok(Predicate::Not {
-            inner: Box::new(compile_condition(operand, &operator_path)?),
-        }),
-        "all" | "any" => {
-            let conditions = operand
-                .as_array()
-                .filter(|conditions| !conditions.is_empty())
-                .ok_or_else(|| invalid(format!("{operator_path} must contain at least one condition")))?;
-            let children = conditions
-                .iter()
-                .enumerate()
-                .map(|(index, condition)| compile_condition(condition, &format!("{operator_path}[{index}]")))
-                .collect::<Result<_, _>>()?;
-            Ok(if key == "all" {
-                Predicate::And { children }
-            } else {
-                Predicate::Or { children }
-            })
+        let Some((key, operand)) = fields.iter().next().filter(|_| fields.len() == 1) else {
+            return Err(invalid(format!("{path} must contain exactly one condition operator")));
+        };
+        let operator_path = format!("{path}.{key}");
+        match key.as_str() {
+            "selectorRef" => {
+                let name = operand
+                    .as_str()
+                    .ok_or_else(|| invalid(format!("{operator_path} must be a selector name")))?;
+                if self.stack.iter().any(|node| node == name) {
+                    return Err(invalid(format!(
+                        "{operator_path} creates a selector cycle through {name}"
+                    )));
+                }
+                let condition = self
+                    .selectors
+                    .get(name)
+                    .ok_or_else(|| invalid(format!("{operator_path} references unknown Selector/{name}")))?;
+                self.referenced.insert(name.to_owned());
+                self.stack.push(name.to_owned());
+                let result = self.compile_node(condition, &format!("Selector/{name}.spec.where"), depth + 1);
+                self.stack.pop();
+                result
+            }
+            "not" => Ok(Predicate::Not {
+                inner: Box::new(self.compile_node(operand, &operator_path, depth + 1)?),
+            }),
+            "all" | "any" => {
+                let conditions = operand
+                    .as_array()
+                    .filter(|conditions| !conditions.is_empty())
+                    .ok_or_else(|| invalid(format!("{operator_path} must contain at least one condition")))?;
+                let children = conditions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, condition)| {
+                        self.compile_node(condition, &format!("{operator_path}[{index}]"), depth + 1)
+                    })
+                    .collect::<Result<_, _>>()?;
+                Ok(if key == "all" {
+                    Predicate::And { children }
+                } else {
+                    Predicate::Or { children }
+                })
+            }
+            _ => Err(invalid(format!("{operator_path} is an unsupported condition operator"))),
         }
-        _ => Err(invalid(format!("{operator_path} is an unsupported condition operator"))),
     }
 }
 
@@ -512,7 +594,7 @@ fn invalid(message: impl Into<String>) -> PolicyError {
     PolicyError::InvalidPolicy(message.into())
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     fn alphanumeric(byte: u8) -> bool {
         byte.is_ascii_lowercase() || byte.is_ascii_digit()
     }

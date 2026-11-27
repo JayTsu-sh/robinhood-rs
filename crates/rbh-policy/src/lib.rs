@@ -40,6 +40,10 @@ pub enum PolicyError {
     NotFoundByName(String),
     #[error("policy name already exists: {0}")]
     NameConflict(String),
+    #[error("resource not found: {0}")]
+    ResourceNotFound(String),
+    #[error("{0}")]
+    ResourceInUse(String),
     #[error("{0}")]
     InvalidPolicy(String),
     #[error("database error: {0}")]

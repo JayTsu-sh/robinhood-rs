@@ -5,8 +5,12 @@ use sqlx::{MySql, MySqlPool, Transaction, types::Json};
 
 use crate::PolicyError;
 use crate::model::{PolicyDef, PolicyRow};
-use crate::rev8::CompiledPolicy;
+use crate::rev8::{self, PreviewResult, resources::ResourceBinding};
+use rbh_entry_store::EntryStore;
+
+mod rev8_resources;
 use crate::trigger_parser::parse_trigger;
+pub use rev8_resources::ResourceRevision;
 
 /// MariaDB-backed action policy store.
 #[derive(Debug, Clone)]
@@ -15,10 +19,13 @@ pub struct PolicyStore {
 }
 
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Rev8PolicyRow {
     pub id: u64,
     pub revision: u64,
     pub definition: Json<serde_json::Value>,
+    pub resource_bindings: Option<Json<Vec<ResourceBinding>>>,
+    pub modified_by: Option<String>,
 }
 
 impl PolicyStore {
@@ -137,70 +144,86 @@ impl PolicyStore {
         Ok(())
     }
 
-    #[tracing::instrument(skip_all, fields(policy_name = %policy.name))]
-    pub async fn create_rev8(&self, policy: &CompiledPolicy, document: &serde_json::Value) -> Result<u64, PolicyError> {
-        let mut tx = self.pool.begin().await?;
-        let id = sqlx::query(
-            "INSERT INTO policies (name, kind, definition, enabled, revision) VALUES (?, 'Policy', ?, FALSE, 1)",
-        )
-        .bind(&policy.name)
-        .bind(Json(document))
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| policy_write_error(error, &policy.name))?
-        .last_insert_id();
-        record_revision(&mut tx, id).await?;
+    #[tracing::instrument(skip(self, entries, document))]
+    pub async fn save_rev8(
+        &self, entries: &EntryStore, id: Option<u64>, document: &serde_json::Value, actor: &str,
+    ) -> Result<u64, PolicyError> {
+        let input = rev8::parse(document)?;
+        rev8::validate_filesystem(entries, input.filesystem()).await?;
+        let mut tx = self.lock_configuration().await?;
+        let (policy, bindings) = Self::bind_policy(&mut tx, input).await?;
+        let id = if let Some(id) = id {
+            let result = sqlx::query(
+                "UPDATE policies SET name = ?, definition = ?, revision = revision + 1 WHERE id = ? AND revision IS NOT NULL",
+            ).bind(&policy.name).bind(Json(document)).bind(id).execute(&mut *tx).await
+                .map_err(|error| policy_write_error(error, &policy.name))?;
+            if result.rows_affected() == 0 {
+                return Err(PolicyError::NotFound(id));
+            }
+            id
+        } else {
+            sqlx::query(
+                "INSERT INTO policies (name, kind, definition, enabled, revision) VALUES (?, 'Policy', ?, FALSE, 1)",
+            )
+            .bind(&policy.name)
+            .bind(Json(document))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| policy_write_error(error, &policy.name))?
+            .last_insert_id()
+        };
+        record_rev8_revision(&mut tx, id, bindings, actor).await?;
         tx.commit().await?;
         Ok(id)
     }
 
-    #[tracing::instrument(skip_all, fields(id, policy_name = %policy.name))]
-    pub async fn update_rev8(
-        &self, id: u64, policy: &CompiledPolicy, document: &serde_json::Value,
-    ) -> Result<(), PolicyError> {
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE policies SET name = ?, definition = ?, revision = revision + 1 WHERE id = ? AND revision IS NOT NULL",
-        )
-        .bind(&policy.name)
-        .bind(Json(document))
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| policy_write_error(error, &policy.name))?;
-        if result.rows_affected() == 0 {
-            return Err(PolicyError::NotFound(id));
-        }
-        record_revision(&mut tx, id).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     #[tracing::instrument(skip(self))]
     pub async fn get_rev8(&self, id: u64) -> Result<Option<Rev8PolicyRow>, PolicyError> {
-        Ok(
-            sqlx::query_as("SELECT id, revision, definition FROM policies WHERE id = ? AND revision IS NOT NULL")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_as(
+            "SELECT r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.id = ?",
+        ).bind(id).fetch_optional(&self.pool).await?)
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn list_rev8(&self) -> Result<Vec<Rev8PolicyRow>, PolicyError> {
-        Ok(
-            sqlx::query_as("SELECT id, revision, definition FROM policies WHERE revision IS NOT NULL ORDER BY id")
-                .fetch_all(&self.pool)
-                .await?,
+        Ok(sqlx::query_as(
+            "SELECT r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision ORDER BY p.id",
+        ).fetch_all(&self.pool).await?)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn get_rev8_revision(&self, id: u64, revision: u64) -> Result<Rev8PolicyRow, PolicyError> {
+        sqlx::query_as(
+            "SELECT policy_id AS id, revision, definition, resource_bindings, modified_by
+             FROM rev8_policy_revisions WHERE policy_id = ? AND revision = ?",
         )
+        .bind(id)
+        .bind(revision)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(PolicyError::NotFound(id))
+    }
+
+    #[tracing::instrument(skip(self, entries))]
+    pub async fn preview_rev8(&self, entries: &EntryStore, id: u64) -> Result<PreviewResult, PolicyError> {
+        let row = self.get_rev8(id).await?.ok_or(PolicyError::NotFound(id))?;
+        let bindings = row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default();
+        let policy = self.compile_revision(&row.definition, &bindings).await?;
+        policy.preview(entries, row.revision, bindings).await
     }
 }
 
-async fn record_revision(tx: &mut Transaction<'_, MySql>, id: u64) -> Result<(), PolicyError> {
+async fn record_rev8_revision(
+    tx: &mut Transaction<'_, MySql>, id: u64, bindings: Vec<ResourceBinding>, actor: &str,
+) -> Result<(), PolicyError> {
     sqlx::query(
-        "INSERT INTO rev8_policy_revisions (policy_id, revision, definition) \
-         SELECT id, revision, definition FROM policies WHERE id = ?",
+        "INSERT INTO rev8_policy_revisions (policy_id, revision, definition, resource_bindings, modified_by)
+         SELECT id, revision, definition, ?, ? FROM policies WHERE id = ?",
     )
+    .bind(Json(bindings))
+    .bind(actor)
     .bind(id)
     .execute(&mut **tx)
     .await?;
