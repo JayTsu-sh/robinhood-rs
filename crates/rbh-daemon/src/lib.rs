@@ -6,6 +6,8 @@
 #![allow(clippy::items_after_test_module)]
 
 mod changelog;
+mod heat_agent;
+pub use heat_agent::{HeatAgentError, run_heat_agent};
 mod hsm_poller;
 mod runtime;
 mod signals;
@@ -58,7 +60,19 @@ pub async fn run() -> anyhow::Result<()> {
             "filesystem runtime registered"
         );
     }
+    let executor_mounts: Arc<[_]> = runtime_registry
+        .iter()
+        .filter(|runtime| runtime.config.backend == rbh_entry_store::BackendKind::Lustre)
+        .map(|runtime| runtime.config.mount_path.clone())
+        .collect();
     let mut policy_store = rbh_policy::PolicyStore::new(pool.clone());
+    for filesystem in runtime_registry.iter() {
+        if let Some(config) = &filesystem.read_heat {
+            policy_store = policy_store
+                .with_read_heat(filesystem.config.clone(), config.clone(), executor_mounts.clone())
+                .with_context(|| format!("read_heat configuration for {}", filesystem.config.id))?;
+        }
+    }
     if let Some(path) = std::env::var_os("RBH_REV8_HSM_PRINCIPAL_FILE") {
         use rbh_policy::rev8::execution::{LustreHsm, Principal, Runtime};
 
@@ -120,6 +134,27 @@ pub async fn run() -> anyhow::Result<()> {
     //   RBH_CHANGELOG_USER   — either a single reader id reused on every MDT,
     //                          or a comma-separated list matching RBH_MDTS 1:1.
     let daemon_cancel = CancellationToken::new();
+    for filesystem in runtime_registry.iter() {
+        let Some(config) = &filesystem.read_heat else { continue };
+        let interval = std::time::Duration::from_secs(u64::from(config.interval_seconds));
+        let filesystem = filesystem.config.id.clone();
+        let store = policy_store.clone();
+        let cancel = daemon_cancel.clone();
+        tokio::spawn(async move {
+            let mut sampler = rbh_policy::rev8::heat::HeatSampler::default();
+            let mut ticks = tokio::time::interval(interval);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticks.tick() => {}
+                }
+                if let Err(error) = store.sample_read_heat_batch(&filesystem, &mut sampler).await {
+                    tracing::warn!(%filesystem, %error, "Lustre read heat batch failed");
+                }
+            }
+        });
+    }
     for runtime in runtime_registry
         .iter()
         .filter(|runtime| runtime.config.backend == rbh_entry_store::BackendKind::Lustre)

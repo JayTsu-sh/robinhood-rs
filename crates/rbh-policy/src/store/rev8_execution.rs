@@ -322,7 +322,10 @@ impl PolicyStore {
         let bindings = row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default();
         let policy = self.compile_revision(&row.definition, &bindings).await?;
         let preview = if run.candidate_count.is_none() {
-            match policy.preview(entries, row.revision, bindings.clone()).await {
+            match self
+                .preview_compiled(entries, &policy, row.revision, bindings.clone(), None)
+                .await
+            {
                 Ok(preview) => Some(preview),
                 Err(PolicyError::InvalidPolicy(reason)) => {
                     return self.finish_run(run.id, "deferred", Some(&reason)).await;

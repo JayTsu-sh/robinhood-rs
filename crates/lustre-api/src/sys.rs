@@ -131,6 +131,7 @@ unsafe extern "C" {
     pub(crate) fn llapi_layout_get_by_path(path: *const c_char, flags: u32) -> *mut c_void;
 
     pub(crate) fn llapi_open_by_fid(path: *const c_char, fid: *const lu_fid, flags: c_int) -> c_int;
+    pub(crate) fn llapi_getname(path: *const c_char, name: *mut c_char, len: usize) -> c_int;
 
     pub(crate) fn llapi_layout_get_by_fd(fd: c_int, flags: u32) -> *mut c_void;
 

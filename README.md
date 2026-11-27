@@ -289,6 +289,72 @@ A completed operation includes the actual pool and OSTs from a fresh open by
 FID. If the catalog write fails, the pending operation retains the slot and
 the restarted daemon reconciles the live layout before any new migration.
 
+### Rev.8 Lustre read heat
+
+Add a `read_heat` block to a Lustre filesystem in `RBH_FILESYSTEMS_JSON`.
+Each client entry names a business Lustre mount or a heat agent endpoint.
+Business mounts must be separate client instances mounted from the same
+Lustre source as the executor's `mount_path`. The daemon checks client
+identity across hosts and rejects shared instances, including bind mounts
+of an executor client. Enable `file_heat` and use matching
+`heat_period_second` and `heat_decay_percentage` on the business clients.
+
+```json
+{
+  "read_heat": {
+    "clients": {
+      "reader-a": "/mnt/business-a",
+      "reader-b": {
+        "endpoint": "https://business-b.example.com/sample",
+        "token_file": "/etc/robinhood/reader-b.token"
+      }
+    },
+    "decay": {"period_seconds": 60, "percentage": 80},
+    "interval_seconds": 2,
+    "max_age_seconds": 120,
+    "batch_size": 128
+  }
+}
+```
+
+On a separate business host, run `robinhood heat-agent` with
+`RBH_HEAT_AGENT_MOUNT` set to the mount used by the application and
+`RBH_HEAT_AGENT_TOKEN_FILE` set to a private file containing the same
+random bearer token as the controller's `token_file`. The agent binds to
+`127.0.0.1:9184` by default. Set `RBH_HEAT_AGENT_LISTEN` to change the
+loopback address or port. Expose `/sample` through an HTTPS proxy or
+forward a controller loopback port to the agent over SSH. The controller
+accepts plain HTTP endpoints only on loopback. Keep the controller and
+agent clocks synchronized. The agent serves bounded read-only samples on
+request and runs without a database connection. The sampling process needs
+`CAP_DAC_READ_SEARCH` for Lustre's FID handle open. Use the standalone agent
+for local business mounts too when the controller runs as the unprivileged
+packaged service.
+
+Submit heat conditions through the Rev.8 policy API. For example, use
+`{"field":"lustre.heat.readsample","op":"gte","value":20}` in a rule for
+`lustre.pool_migrate` with `sourcePool: cold` and `targetPool: hot`.
+The supported fields are `lustre.heat.readsample` and `lustre.heat.readbyte`.
+Each is the maximum decayed score for that counter across the configured
+clients. Heat conditions currently require preview activation.
+
+The daemon samples up to `batch_size` FIDs per interval on a filesystem with
+an enabled heat policy. It rotates through such policies and their eligible
+FIDs. Set the sample lifetime to cover the rotation through the candidate
+set. Per-client heat comes from the open inode on that client and can reset
+when the client evicts the inode. The collector opens by FID and calls
+`llapi_heat_get` without reading payload data.
+
+`POST /api/policies/{id}/preview` includes `readHeat.clients`,
+`readHeat.decay`, `readHeat.maxAgeSeconds`, and `readHeat.deferredByReason`.
+Append `?heatFid=0x200000401:0x1a:0x0` to include the latest observation for
+that FID on each configured client. Each observation includes the time,
+scores, measured decay and status. The query parameter leaves the policy
+totals scoped to the entire policy. All configured clients must have
+fresh observations with the requested decay profile. An observed zero
+participates in the comparison. Missing samples, expired samples and
+incompatible decay defer decisions that depend on the unavailable value.
+
 ## Configuration
 
 All runtime knobs are environment variables (hot-reloadable subset via

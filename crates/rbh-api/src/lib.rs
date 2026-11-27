@@ -19,6 +19,8 @@ mod rev8_auth;
 #[cfg(test)]
 mod rev8_execution_tests;
 mod rev8_handlers;
+#[cfg(test)]
+mod rev8_heat_tests;
 pub mod state;
 
 pub use rev8_auth::Rev8Writers;

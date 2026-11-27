@@ -31,6 +31,7 @@ mod sys;
 pub mod changelog;
 pub mod error;
 pub mod fid;
+pub mod heat;
 pub mod hsm;
 pub mod mdt;
 pub mod migration;

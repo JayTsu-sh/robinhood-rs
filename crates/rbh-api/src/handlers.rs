@@ -223,11 +223,22 @@ async fn update_policy(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewQuery {
+    heat_fid: Option<lustre_api::LuFid>,
+}
+
 #[tracing::instrument(skip(state))]
 async fn preview_policy(
-    State(state): State<AppState>, Path(id): Path<u64>,
+    State(state): State<AppState>, Path(id): Path<u64>, axum::extract::Query(query): axum::extract::Query<PreviewQuery>,
 ) -> Result<Json<rev8::PreviewResult>, ApiError> {
-    Ok(Json(state.policy_store.preview_rev8(&state.entry_store, id).await?))
+    Ok(Json(
+        state
+            .policy_store
+            .preview_rev8_with_heat(&state.entry_store, id, query.heat_fid)
+            .await?,
+    ))
 }
 
 #[tracing::instrument(skip(state))]

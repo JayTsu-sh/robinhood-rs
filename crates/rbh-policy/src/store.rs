@@ -1,17 +1,25 @@
 //! `PolicyStore` — CRUD for action policy rows in `rbh_entries.policies`.
 
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+
 use chrono::{DateTime, Utc};
 use sqlx::{MySql, MySqlPool, Transaction, types::Json};
 
 use crate::PolicyError;
 use crate::model::{PolicyDef, PolicyRow};
-use crate::rev8::{self, PreviewResult, resources::ResourceBinding};
-use rbh_entry_store::EntryStore;
+use crate::rev8::{
+    self, CompiledPolicy, PreviewResult,
+    heat::{HeatProfile, ReadHeatConfig},
+    resources::ResourceBinding,
+};
+use rbh_entry_store::{EntryStore, FileSystemConfig, FileSystemId};
 
 mod rev8_execution;
+mod rev8_heat;
 mod rev8_resources;
 use crate::trigger_parser::parse_trigger;
 pub use rev8_execution::{Rev8Operation, Rev8Run};
+pub use rev8_heat::HeatSampler;
 pub use rev8_resources::ResourceRevision;
 
 /// MariaDB-backed action policy store.
@@ -19,6 +27,7 @@ pub use rev8_resources::ResourceRevision;
 pub struct PolicyStore {
     pool: MySqlPool,
     runtime: Option<rev8::execution::Runtime>,
+    read_heat: Arc<BTreeMap<FileSystemId, HeatProfile>>,
 }
 
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
@@ -33,12 +42,25 @@ pub struct Rev8PolicyRow {
 
 impl PolicyStore {
     pub fn new(pool: MySqlPool) -> Self {
-        Self { pool, runtime: None }
+        Self {
+            pool,
+            runtime: None,
+            read_heat: Arc::default(),
+        }
     }
 
     pub fn with_rev8_runtime(mut self, runtime: rev8::execution::Runtime) -> Self {
         self.runtime = Some(runtime);
         self
+    }
+
+    pub fn with_read_heat(
+        mut self, filesystem: FileSystemConfig, config: ReadHeatConfig, executor_mounts: Arc<[PathBuf]>,
+    ) -> Result<Self, PolicyError> {
+        let id = filesystem.id.clone();
+        let profile = HeatProfile::new(filesystem, config, executor_mounts)?;
+        Arc::make_mut(&mut self.read_heat).insert(id, profile);
+        Ok(self)
     }
 
     pub async fn check_schema(&self) -> Result<(), PolicyError> {
@@ -192,15 +214,17 @@ impl PolicyStore {
             Self::compile_admission(&mut tx, &policy, &bindings, principal).await?;
         }
         let next_run = next_run.filter(|_| policy.enabled);
+        let heat_filesystem = policy.uses_read_heat.then_some(policy.filesystem.as_str());
         let id = if let Some(id) = id {
             let result = sqlx::query(
-                "UPDATE policies SET name = ?, definition = ?, revision = revision + 1, enabled = ?, rev8_next_run = ?
+                "UPDATE policies SET name = ?, definition = ?, revision = revision + 1, enabled = ?, rev8_next_run = ?, rev8_heat_filesystem = ?
                  WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL",
             )
             .bind(&policy.name)
             .bind(Json(document))
             .bind(policy.enabled)
             .bind(next_run)
+            .bind(heat_filesystem)
             .bind(id)
             .execute(&mut *tx)
             .await
@@ -211,12 +235,13 @@ impl PolicyStore {
             id
         } else {
             sqlx::query(
-                "INSERT INTO policies (name, kind, definition, enabled, revision, rev8_next_run) VALUES (?, 'Policy', ?, ?, 1, ?)",
+                "INSERT INTO policies (name, kind, definition, enabled, revision, rev8_next_run, rev8_heat_filesystem) VALUES (?, 'Policy', ?, ?, 1, ?, ?)",
             )
             .bind(&policy.name)
             .bind(Json(document))
             .bind(policy.enabled)
             .bind(next_run)
+            .bind(heat_filesystem)
             .execute(&mut *tx)
             .await
             .map_err(|error| policy_write_error(error, &policy.name))?
@@ -275,10 +300,37 @@ impl PolicyStore {
 
     #[tracing::instrument(skip(self, entries))]
     pub async fn preview_rev8(&self, entries: &EntryStore, id: u64) -> Result<PreviewResult, PolicyError> {
+        self.preview_rev8_with_heat(entries, id, None).await
+    }
+
+    #[tracing::instrument(skip(self, entries))]
+    pub async fn preview_rev8_with_heat(
+        &self, entries: &EntryStore, id: u64, fid: Option<lustre_api::LuFid>,
+    ) -> Result<PreviewResult, PolicyError> {
         let row = self.get_rev8(id).await?.ok_or(PolicyError::NotFound(id))?;
         let bindings = row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default();
         let policy = self.compile_revision(&row.definition, &bindings).await?;
-        policy.preview(entries, row.revision, bindings).await
+        self.preview_compiled(entries, &policy, row.revision, bindings, fid)
+            .await
+    }
+
+    async fn preview_compiled(
+        &self, entries: &EntryStore, policy: &CompiledPolicy, revision: u64, bindings: Vec<ResourceBinding>,
+        fid: Option<lustre_api::LuFid>,
+    ) -> Result<PreviewResult, PolicyError> {
+        if policy.uses_read_heat {
+            rev8::heat::preview(
+                entries,
+                policy,
+                self.read_heat.get(&policy.filesystem),
+                revision,
+                bindings,
+                fid,
+            )
+            .await
+        } else {
+            policy.preview(entries, revision, bindings).await
+        }
     }
 }
 

@@ -6,6 +6,7 @@ use std::{
 };
 
 pub mod execution;
+pub mod heat;
 pub mod resources;
 mod tiering;
 use resources::{ResourceBinding, ResourceKind};
@@ -27,6 +28,7 @@ pub struct CompiledPolicy {
     pub name: String,
     pub filesystem: FileSystemId,
     pub(crate) selectors: BTreeSet<String>,
+    pub(crate) uses_read_heat: bool,
     pub(crate) where_clause: String,
     pub(crate) params: Vec<QueryParam>,
     pub(crate) actions: Vec<Invocation>,
@@ -46,6 +48,8 @@ pub struct PreviewResult {
     pub candidate_count: u64,
     pub estimated_bytes: u64,
     pub resource_bindings: Vec<ResourceBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_heat: Option<heat::PreviewHeat>,
 }
 
 /// Recognize versioned documents before attempting to parse the older API model.
@@ -144,21 +148,32 @@ impl Policy {
             cmp: CmpOp::Eq,
             value: Value::Num(EntryKind::File as i64),
         };
-        let (mut where_clause, params) = rbh_predicate::to_sql(&Predicate::And {
-            children: vec![files, target_condition],
-        });
-        let rules = spec.rules.compile(&mut conditions)?;
-        let mut params = query_params(params);
-        if let Some(migration) = rules
-            .actions
-            .iter()
-            .find_map(|invocation| invocation.migration.as_ref())
-        {
+        let CompiledRules {
+            excludes,
+            decision,
+            params: decision_params,
+            actions,
+            uses_read_heat,
+        } = spec.rules.compile(&mut conditions)?;
+        let scope = Condition::join("AND", vec![Condition::indexed(files), target_condition, excludes]);
+        let uses_read_heat = uses_read_heat || scope.uses_read_heat;
+        let mut where_clause = scope.sql;
+        if uses_read_heat && !scope.uses_read_heat {
+            where_clause = format!("({where_clause}) IS TRUE");
+        }
+        let enforced = spec
+            .execution
+            .activation
+            .is_some_and(|activation| activation.mode == ActivationMode::Enforced);
+        if uses_read_heat && enforced {
+            return Err(invalid("read heat conditions currently require preview activation"));
+        }
+        let mut params = query_params(scope.params);
+        if let Some(migration) = actions.iter().find_map(|invocation| invocation.migration.as_ref()) {
             if !matches!(spec.trigger, Trigger::Periodic { .. }) {
                 return Err(invalid("lustre.pool_migrate requires a periodic trigger"));
             }
-            if rules
-                .actions
+            if actions
                 .iter()
                 .any(|invocation| invocation.migration.as_ref() != Some(migration))
             {
@@ -166,26 +181,20 @@ impl Policy {
                     "a tiering policy requires one source pool, destination pool and set of migration parameters",
                 ));
             }
-            where_clause.push_str(" AND CAST(pool_name AS BINARY) = CAST(? AS BINARY)");
+            where_clause.push_str(" AND (CAST(pool_name AS BINARY) = CAST(? AS BINARY)) IS TRUE");
             params.push(QueryParam::Str(migration.source_pool.clone()));
         }
-        where_clause.push_str(" AND ");
-        where_clause.push_str(&rules.excludes);
-        let decision_params = query_params(rules.params);
-        params.extend(query_params(rules.exclude_params));
         Ok(CompiledPolicy {
             name: self.metadata.name,
             filesystem: spec.target.filesystem,
             selectors: conditions.referenced,
             where_clause,
-            actions: rules.actions,
-            decision: rules.decision,
-            decision_params,
+            actions,
+            decision,
+            decision_params: query_params(decision_params),
+            uses_read_heat,
             enabled: spec.enabled.unwrap_or(true),
-            enforced: spec
-                .execution
-                .activation
-                .is_some_and(|activation| activation.mode == ActivationMode::Enforced),
+            enforced,
             one_shot: matches!(spec.mode, Some(RunMode::OneShot)),
             window: spec.execution.admission_window,
             budget: spec.execution.budget.run.limits(),
@@ -253,6 +262,7 @@ impl CompiledPolicy {
             candidate_count,
             estimated_bytes,
             resource_bindings,
+            read_heat: None,
         })
     }
 }
@@ -431,10 +441,10 @@ struct Rules {
 }
 
 struct CompiledRules {
-    excludes: String,
+    excludes: Condition,
     decision: String,
     params: Vec<SqlParam>,
-    exclude_params: Vec<SqlParam>,
+    uses_read_heat: bool,
     actions: Vec<Invocation>,
 }
 
@@ -458,9 +468,8 @@ impl Rules {
             .enumerate()
             .map(|(i, condition)| conditions.compile(condition, &format!("spec.rules.exclude[{i}]")))
             .collect::<Result<Vec<_>, _>>()?;
-        let (exclude, exclude_params) = rbh_predicate::to_sql(&Predicate::Not {
-            inner: Box::new(Predicate::Or { children: excludes }),
-        });
+        let excludes = Condition::join("OR", excludes).negate();
+        let mut uses_read_heat = false;
         let mut clauses = vec!["CASE".to_owned()];
         let mut actions = Vec::new();
         let mut params = Vec::new();
@@ -497,17 +506,27 @@ impl Rules {
                 }
                 Decision::Skip => 0,
             };
-            let (condition, rule_params) =
-                rbh_predicate::to_sql(&conditions.compile(&rule.condition, &format!("{path}.match"))?);
-            clauses.push(format!("WHEN {condition} THEN {branch}"));
-            params.extend(rule_params);
+            let condition = conditions.compile(&rule.condition, &format!("{path}.match"))?;
+            if condition.uses_read_heat {
+                // An earlier unknown rule could override the remainder of
+                // first_match, so it must defer instead of falling through.
+                uses_read_heat = true;
+                clauses.push(format!(
+                    "WHEN ({0}) IS NOT FALSE THEN CASE WHEN {0} THEN {branch} END",
+                    condition.sql
+                ));
+                params.extend(condition.params.iter().cloned());
+            } else {
+                clauses.push(format!("WHEN {} THEN {branch}", condition.sql));
+            }
+            params.extend(condition.params);
         }
         clauses.push("ELSE 0 END".to_owned());
         Ok(CompiledRules {
-            excludes: exclude,
+            excludes,
             decision: clauses.join(" "),
             params,
-            exclude_params,
+            uses_read_heat,
             actions,
         })
     }
@@ -784,6 +803,56 @@ pub(crate) fn validate_selector(name: &str, selectors: &BTreeMap<String, JsonVal
     Ok(())
 }
 
+struct Condition {
+    sql: String,
+    params: Vec<SqlParam>,
+    uses_read_heat: bool,
+}
+
+impl Condition {
+    fn indexed(predicate: Predicate) -> Self {
+        let (sql, params) = rbh_predicate::to_sql(&predicate);
+        Self {
+            sql,
+            params,
+            uses_read_heat: false,
+        }
+    }
+
+    fn negate(mut self) -> Self {
+        self.sql = format!("NOT ({})", self.sql);
+        self
+    }
+
+    fn join(operator: &str, conditions: Vec<Self>) -> Self {
+        if conditions.is_empty() {
+            return Self::indexed(if operator == "AND" {
+                Predicate::True
+            } else {
+                Predicate::False
+            });
+        }
+        let uses_read_heat = conditions.iter().any(|condition| condition.uses_read_heat);
+        let mut parts = Vec::with_capacity(conditions.len());
+        let mut params = Vec::new();
+        for condition in conditions {
+            // A missing indexed attribute is a non-match at the boundary with a
+            // heat expression. Only unavailable heat propagates as SQL NULL.
+            parts.push(if uses_read_heat && !condition.uses_read_heat {
+                format!("({}) IS TRUE", condition.sql)
+            } else {
+                condition.sql
+            });
+            params.extend(condition.params);
+        }
+        Self {
+            sql: format!("({})", parts.join(&format!(" {operator} "))),
+            params,
+            uses_read_heat,
+        }
+    }
+}
+
 struct ConditionCompiler<'a> {
     selectors: &'a BTreeMap<String, JsonValue>,
     stack: Vec<String>,
@@ -803,11 +872,11 @@ impl<'a> ConditionCompiler<'a> {
         }
     }
 
-    fn compile(&mut self, expr: &JsonValue, path: &str) -> Result<Predicate, PolicyError> {
+    fn compile(&mut self, expr: &JsonValue, path: &str) -> Result<Condition, PolicyError> {
         self.compile_node(expr, path, 0)
     }
 
-    fn compile_node(&mut self, expr: &JsonValue, path: &str, depth: usize) -> Result<Predicate, PolicyError> {
+    fn compile_node(&mut self, expr: &JsonValue, path: &str, depth: usize) -> Result<Condition, PolicyError> {
         if depth >= 128 {
             return Err(invalid(format!("{path} exceeds the condition nesting limit")));
         }
@@ -817,7 +886,11 @@ impl<'a> ConditionCompiler<'a> {
             .ok_or_else(|| invalid("condition expression is too large after resolving selectors"))?;
 
         if let Some(matches) = expr.as_bool() {
-            return Ok(if matches { Predicate::True } else { Predicate::False });
+            return Ok(Condition::indexed(if matches {
+                Predicate::True
+            } else {
+                Predicate::False
+            }));
         }
         let fields = expr
             .as_object()
@@ -832,7 +905,19 @@ impl<'a> ConditionCompiler<'a> {
                     invalid(format!("{path}.{field}: {message}"))
                 }
             })?;
-            return condition.compile(path, self.now);
+            if let Some(column) = heat::score_column(&condition.field) {
+                let value = condition
+                    .value
+                    .as_i64()
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| invalid(format!("{path}.value must be a non-negative heat score")))?;
+                return Ok(Condition {
+                    sql: format!("read_heat.{column} {} ?", condition.op.ordinal(path)?.sql()),
+                    params: vec![SqlParam::Num(value)],
+                    uses_read_heat: true,
+                });
+            }
+            return condition.compile(path, self.now).map(Condition::indexed);
         }
         let Some((key, operand)) = fields.iter().next().filter(|_| fields.len() == 1) else {
             return Err(invalid(format!("{path} must contain exactly one condition operator")));
@@ -858,9 +943,7 @@ impl<'a> ConditionCompiler<'a> {
                 self.stack.pop();
                 result
             }
-            "not" => Ok(Predicate::Not {
-                inner: Box::new(self.compile_node(operand, &operator_path, depth + 1)?),
-            }),
+            "not" => Ok(self.compile_node(operand, &operator_path, depth + 1)?.negate()),
             "all" | "any" => {
                 let conditions = operand
                     .as_array()
@@ -873,11 +956,7 @@ impl<'a> ConditionCompiler<'a> {
                         self.compile_node(condition, &format!("{operator_path}[{index}]"), depth + 1)
                     })
                     .collect::<Result<_, _>>()?;
-                Ok(if key == "all" {
-                    Predicate::And { children }
-                } else {
-                    Predicate::Or { children }
-                })
+                Ok(Condition::join(if key == "all" { "AND" } else { "OR" }, children))
             }
             _ => Err(invalid(format!("{operator_path} is an unsupported condition operator"))),
         }
