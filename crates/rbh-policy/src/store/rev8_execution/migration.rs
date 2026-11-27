@@ -20,8 +20,8 @@ use serde_json::json;
 use sqlx::{MySql, QueryBuilder, Transaction, types::Json};
 
 use super::{
-    BATCH_SIZE, Candidate, Dispatch, Generation, Invocation, PolicyError, PolicyStore, Rev8Operation, current_revision,
-    decode_fid, elapsed_ms, lock_permit,
+    BATCH_SIZE, Candidate, Dispatch, Generation, Invocation, OPERATION_FIELDS, PolicyError, PolicyStore, Rev8Operation,
+    current_revision, decode_fid, elapsed_ms, exclude_recovery_ids, lock_permit,
     preflight::{PreflightKey, PreflightObservation, PreflightRequest, PreflightResult, PreflightWait},
     short_reason, verify_worker_permit,
 };
@@ -217,7 +217,40 @@ impl PolicyStore {
         Ok(ControlFlow::Continue(()))
     }
 
-    pub(super) async fn start_pool_recovery(
+    pub(super) async fn start_pending_pool_recoveries(&self, entries: &EntryStore) -> Result<(), PolicyError> {
+        let mut query = QueryBuilder::new(format!(
+            "SELECT {OPERATION_FIELDS} FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id
+             WHERE o.pending_migration_fs IS NOT NULL"
+        ));
+        let mut slots = {
+            let recoveries = self.pool_recoveries.lock().await;
+            let slots = BATCH_SIZE.saturating_sub(recoveries.len());
+            if slots == 0 {
+                return Ok(());
+            }
+            if !recoveries.is_empty() {
+                exclude_recovery_ids(&mut query, recoveries.keys().copied());
+            }
+            slots
+        };
+        query
+            .push(" ORDER BY o.checked_at, o.id LIMIT ")
+            .push_bind(BATCH_SIZE as u32);
+        let pending: Vec<Rev8Operation> = query.build_query_as().fetch_all(&self.pool).await?;
+        for operation in pending {
+            let filesystem =
+                FileSystemId::new(&operation.filesystem).map_err(|error| PolicyError::Store(error.to_string()))?;
+            if self.start_pool_recovery(entries, filesystem, operation).await? {
+                slots -= 1;
+                if slots == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_pool_recovery(
         &self, entries: &EntryStore, filesystem: FileSystemId, operation: Rev8Operation,
     ) -> Result<bool, PolicyError> {
         let fid = decode_fid(&operation.fid)?;

@@ -1,6 +1,8 @@
 mod migration;
+mod native_recovery;
 mod preflight;
 pub(super) use migration::PoolRecovery;
+pub(super) use native_recovery::NativeRecovery;
 pub(super) use preflight::PoolPreflights;
 
 use std::{
@@ -11,7 +13,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use lustre_api::{HsmState, LuFid, migration::MigrationPlan};
+use lustre_api::{LuFid, migration::MigrationPlan};
 use rbh_entry_store::{EntryStore, FileSystemConfig, fid_codec};
 use serde::Serialize;
 use serde_json::Value;
@@ -538,6 +540,7 @@ impl PolicyStore {
             }
             heat_deferrals = Some(Json(page));
         }
+        let mut awaiting_predecessor = false;
         for candidate in &candidates {
             let recorded = sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_operations WHERE run_id = ? AND fid = ?")
                 .bind(run.id)
@@ -567,10 +570,18 @@ impl PolicyStore {
                     .finish_run(run, "finished", Some("policy_run_budget"), heat_deferrals)
                     .await;
             }
-            if let Some(block) = self
+            let block = self
                 .block_reason(&dispatch, invocation.kind, candidate.size, &stats)
-                .await?
+                .await?;
+            if block.as_ref().is_none_or(AdmissionBlock::is_capacity)
+                && self
+                    .awaiting_native_predecessor(policy.filesystem.as_str(), &candidate.fid, invocation.kind)
+                    .await?
             {
+                awaiting_predecessor = true;
+                continue;
+            }
+            if let Some(block) = block {
                 if policy.one_shot && block.is_capacity() {
                     return self.finish_run(run, "running", Some(block.reason()), None).await;
                 }
@@ -583,6 +594,11 @@ impl PolicyStore {
                 // are idempotent and heat counts move with the cursor.
                 return self.finish_run(run, "running", Some(reason), None).await;
             }
+        }
+        if awaiting_predecessor {
+            return self
+                .finish_run(run, "running", Some("native_hsm_reconciliation_pending"), None)
+                .await;
         }
         // A stale batch without submissions must not consume a one-shot that
         // was rescheduled when its bound safety revision changed.
@@ -898,139 +914,22 @@ impl PolicyStore {
 
     async fn reconcile_operations(&self, entries: &EntryStore) -> Result<(), PolicyError> {
         self.finish_pool_recoveries(entries).await?;
-        let mut query = QueryBuilder::new(format!(
-            "SELECT {OPERATION_FIELDS} FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id
-             WHERE o.pending_fid IS NOT NULL"
-        ));
-        let mut recovery_slots = {
-            let recoveries = self.pool_recoveries.lock().await;
-            let slots = BATCH_SIZE.saturating_sub(recoveries.len());
-            if slots == 0 {
-                query.push(" AND o.pending_migration_fs IS NULL");
-            } else if !recoveries.is_empty() {
-                let mut ids = query.push(" AND o.id NOT IN (").separated(", ");
-                for id in recoveries.keys().copied() {
-                    ids.push_bind(id);
-                }
-                ids.push_unseparated(")");
-            }
-            slots
-        };
-        query
-            .push(" ORDER BY o.checked_at, o.id LIMIT ")
-            .push_bind(BATCH_SIZE as u32);
-        let pending: Vec<Rev8Operation> = query.build_query_as().fetch_all(&self.pool).await?;
-        for operation in pending {
-            let filesystem = rbh_entry_store::FileSystemId::new(&operation.filesystem)
-                .map_err(|error| PolicyError::Store(error.to_string()))?;
-            if operation.action == ActionKind::PoolMigrate.name() {
-                if recovery_slots > 0 && self.start_pool_recovery(entries, filesystem, operation).await? {
-                    recovery_slots -= 1;
-                }
-                continue;
-            }
-            let action =
-                ActionKind::from_name(&operation.action).ok_or_else(|| invalid("unknown persisted HSM action"))?;
-            let invocation = Invocation {
-                kind: action,
-                archive_id: operation.archive_id,
-                requires_human: false,
-                migration: None,
-            };
-            let fid = decode_fid(&operation.fid)?;
-            let config = match rev8::validate_filesystem(entries, &filesystem).await {
-                Ok(config) => Some(config),
-                Err(PolicyError::InvalidPolicy(_)) => None,
-                Err(error) => return Err(error),
-            };
-            let mut observation = None;
-            let mut confirmed_idle = false;
-            if let Some(config) = config {
-                let backend = self.backend();
-                let observe = || async {
-                    backend.observe(&config.mount_path, fid).await.inspect_err(|error| {
-                        tracing::debug!(%filesystem, %fid, operation_id = operation.id, %error, "HSM observation unavailable");
-                    }).ok()
-                };
-                observation = observe().await;
-                if operation.state == "submitted"
-                    && let (Some(generation), Some(FidObservation::Present(observed))) =
-                        (&operation.generation, &observation)
-                    && generation.mount_source_id.is_some()
-                    && generation.same_content(&observed.generation)
-                    && observed.state.coordinator_idle()
-                    && !invocation.completed(&observed.state)
-                {
-                    // The first flags could predate completion because the current
-                    // action is queried last. Reread flags after the idle observation.
-                    observation = observe().await;
-                    confirmed_idle = true;
-                }
-            }
-            let mut state = operation.state.as_str();
-            let mut reason = operation.reason.as_deref();
-            let mut evidence = None;
-            match (&operation.generation, observation) {
-                (Some(generation), Some(FidObservation::Present(observed)))
-                    if generation.same_content(&observed.generation) =>
-                {
-                    let source = if invocation.completed(&observed.state) {
-                        state = "completed";
-                        reason = None;
-                        Some("lustre_hsm_state")
-                    } else if confirmed_idle
-                        && observed.state.coordinator_idle()
-                        && consistent_hsm_flags(observed.state.states)
-                    {
-                        state = "failed";
-                        reason = Some("hsm_target_state_not_reached");
-                        Some("lustre_hsm_current_action")
-                    } else {
-                        None
-                    };
-                    evidence = source.map(|source| {
-                        Json(serde_json::json!({
-                            "source": source, "observedAt": Utc::now(),
-                            "state": observed.state, "generation": observed.generation,
-                        }))
-                    });
-                }
-                (Some(generation), Some(FidObservation::Missing { mount_source_id }))
-                    if state == "submitted" && generation.mount_source_id.as_deref() == Some(&mount_source_id) =>
-                {
-                    state = "failed";
-                    reason = Some("fid_missing");
-                    evidence = Some(Json(serde_json::json!({
-                        "source": "lustre_fid_lookup", "observedAt": Utc::now(), "mountSourceId": mount_source_id,
-                    })));
-                }
-                _ => {}
-            }
-            // An interrupted ioctl may still be in progress even if the coordinator looks idle.
-            if state == "submitting" {
-                state = "unknown";
-                reason = Some("interrupted_submission");
-            }
-            sqlx::query(
-                "UPDATE rev8_operations SET state = ?, reason = ?, checked_at = UTC_TIMESTAMP(6),
-                 finished_at = CASE WHEN ? IN ('completed', 'failed') THEN UTC_TIMESTAMP(6) ELSE NULL END,
-                 completion_evidence = ?, attempted = TRUE WHERE id = ? AND state = ? AND pending_fid IS NOT NULL",
-            )
-            .bind(state)
-            .bind(reason)
-            .bind(state)
-            .bind(evidence)
-            .bind(operation.id)
-            .bind(&operation.state)
-            .execute(&self.pool)
-            .await?;
-        }
-        Ok(())
+        self.finish_native_recoveries().await?;
+        self.start_pending_pool_recoveries(entries).await?;
+        self.start_pending_native_recoveries(entries).await
     }
 
     fn backend(&self) -> &dyn NativeHsm {
         self.runtime.as_ref().map_or(&LustreHsm, |runtime| runtime.hsm.as_ref())
     }
+}
+
+fn exclude_recovery_ids(query: &mut QueryBuilder<'_, MySql>, ids: impl Iterator<Item = u64>) {
+    let mut excluded = query.push(" AND o.id NOT IN (").separated(", ");
+    for id in ids {
+        excluded.push_bind(id);
+    }
+    excluded.push_unseparated(")");
 }
 
 async fn lock_permit(tx: &mut Transaction<'_, MySql>, operation: u64) -> Result<bool, PolicyError> {
@@ -1087,14 +986,6 @@ fn elapsed_ms(run: &Rev8Run) -> u64 {
     (Utc::now() - run.started_at.expect("run started"))
         .num_milliseconds()
         .max(0) as u64
-}
-
-fn consistent_hsm_flags(flags: HsmState) -> bool {
-    use HsmState as S;
-    HsmState::from_bits(flags.bits()).is_some()
-        && (!flags.contains(S::DIRTY) || flags.contains(S::EXISTS) && !flags.contains(S::RELEASED))
-        && (!flags.contains(S::RELEASED) || flags.contains(S::ARCHIVED))
-        && (!flags.contains(S::LOST) || flags.contains(S::ARCHIVED))
 }
 
 fn native_submission_gate(dispatch: &Dispatch<'_>, action: ActionKind) -> SubmissionGate {

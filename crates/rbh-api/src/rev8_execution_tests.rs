@@ -6,6 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use axum::http::StatusCode;
@@ -251,6 +252,28 @@ impl Scenario {
         self.stores.process_rev8(&self.entries).await.unwrap();
     }
 
+    async fn reconcile_until(&self, store: &PolicyStore, mut observed: impl AsyncFnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                store.process_rev8(&self.entries).await.unwrap();
+                if observed().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reconciliation did not publish the expected observation");
+    }
+
+    async fn checked(&self, operation: &Value) -> bool {
+        sqlx::query_scalar("SELECT checked_at IS NOT NULL FROM rev8_operations WHERE id = ?")
+            .bind(operation["id"].as_u64().unwrap())
+            .fetch_one(self.entries.pool())
+            .await
+            .unwrap()
+    }
+
     fn submitted(&self) -> Vec<(LuFid, ActionKind, u32)> {
         self.hsm.submitted.lock().unwrap().clone()
     }
@@ -381,10 +404,47 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     assert_eq!(operations[1]["reason"], "system_safety_outstanding_limit");
     assert_eq!(env.submitted(), vec![(first, ActionKind::Archive, 17)]);
 
+    // A stalled read of a previously accepted request must leave the worker
+    // available to another scope and keep the original FID reserved.
+    let plain = FileSystemId::new(format!("{}-plain", env.filesystem)).unwrap();
+    env.entries
+        .register_filesystem(&FileSystemConfig {
+            id: plain.clone(),
+            backend: BackendKind::Lustre,
+            mount_path: "/lustre-fixture".into(),
+            capabilities: BackendCapabilities {
+                hsm: true,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let mut plain_preview = rev8_archive_policy(plain.as_str(), plain.as_str());
+    plain_preview["spec"]["trigger"] = json!({"type": "manual"});
+    let plain_policy = env.create(&plain_preview).await;
+    let plain_run = env.queue(plain_policy).await;
+    *env.hsm.hold_observation.lock().unwrap() = Some(first);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        env.tick().await;
+        env.hsm.observation_started.notified().await;
+        env.tick().await;
+    })
+    .await
+    .expect("native HSM reconciliation blocked the scheduling tick");
+    let plain_runs = server
+        .get(&format!("/api/policies/{plain_policy}/runs"))
+        .await
+        .json::<Vec<Value>>();
+    assert_eq!(plain_runs[0]["id"], plain_run);
+    assert_eq!(plain_runs[0]["state"], "previewed");
+    assert_eq!(env.operations(id, run).await[0]["state"], "submitted");
+    env.hsm.resume_observation.notify_one();
+
     safety["spec"]["limits"]["maxUnknownOutstanding"] = 2.into();
     server.put(&safety_url).json(&safety).await.assert_status_ok();
     let limited = env.queue(id).await;
-    env.tick().await;
+    env.reconcile_until(&env.stores, async || env.operations(id, limited).await.len() == 2)
+        .await;
     assert!(
         env.operations(id, limited)
             .await
@@ -420,10 +480,11 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
         archive_id: 17,
         ..Default::default()
     };
-    fresh.process_rev8(&env.entries).await.unwrap();
-    fresh.process_rev8(&env.entries).await.unwrap();
-    let once_status = server.get(&once_url).await.json::<Vec<Value>>();
-    assert_eq!(once_status[0]["state"], "finished");
+    env.reconcile_until(&fresh, async || {
+        let runs = server.get(&once_url).await.json::<Vec<Value>>();
+        runs[0]["state"] == "finished"
+    })
+    .await;
     assert_eq!(
         env.operations(once, once_run).await[0]["reason"],
         "hsm_state_ineligible"
@@ -506,7 +567,9 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     server.put(&approval_url).json(&approval).await.assert_status_ok();
 
     let release_id = env.create(&release_policy).await;
-    let restore_id = env.create(&env.policy("restore", restore)).await;
+    let mut restore_policy = env.policy("restore", restore);
+    restore_policy["spec"]["rules"]["entries"][0]["match"] = json!({"field": "object.size", "op": "eq", "value": 128});
+    let restore_id = env.create(&restore_policy).await;
     let release_run = env.queue(release_id).await;
     env.hsm.sent.notified().await;
     env.hsm.interrupt_request.store(true, Ordering::SeqCst);
@@ -523,8 +586,10 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     env.hsm.interrupt_request.store(false, Ordering::SeqCst);
 
     let reopened = open_policy_store(&env.entries, env.hsm.clone());
-    reopened.process_rev8(&env.entries).await.unwrap();
-    assert_eq!(env.operations(release_id, release_run).await[0]["state"], "unknown");
+    env.reconcile_until(&reopened, async || {
+        env.operations(release_id, release_run).await[0]["state"] == "unknown"
+    })
+    .await;
     assert_eq!(
         env.submitted(),
         vec![(first, ActionKind::Archive, 17), (first, ActionKind::Release, 17)]
@@ -532,14 +597,45 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     env.hsm.files.lock().unwrap().get_mut(&first).unwrap().state.states = copies | HsmState::RELEASED;
 
     let restore_run = env.queue(restore_id).await;
+    let inconclusive_hsm = Arc::new(HsmFixture::default());
+    inconclusive_hsm.missing_on_other_source.store(true, Ordering::SeqCst);
+    let inconclusive_worker = open_policy_store(&env.entries, inconclusive_hsm);
+    let release_op = env.operations(release_id, release_run).await[0]["id"].as_u64().unwrap();
+    env.reconcile_until(&inconclusive_worker, async || {
+        sqlx::query_scalar(
+            "SELECT o.checked_at >= r.created_at FROM rev8_operations o JOIN rev8_runs r ON r.id = ? WHERE o.id = ?",
+        )
+        .bind(restore_run)
+        .bind(release_op)
+        .fetch_one(env.entries.pool())
+        .await
+        .unwrap()
+    })
+    .await;
+    assert!(env.operations(restore_id, restore_run).await.is_empty());
+    let reopened = open_policy_store(&env.entries, env.hsm.clone());
     reopened.process_rev8(&env.entries).await.unwrap();
+    assert!(env.operations(restore_id, restore_run).await.is_empty());
+    let restore_runs = server
+        .get(&format!("/api/policies/{restore_id}/runs"))
+        .await
+        .json::<Vec<Value>>();
+    assert_eq!(restore_runs[0]["reason"], "native_hsm_reconciliation_pending");
+    env.reconcile_until(&reopened, async || {
+        env.operations(restore_id, restore_run)
+            .await
+            .first()
+            .is_some_and(|op| op["state"] == "submitted")
+    })
+    .await;
     assert_eq!(env.operations(release_id, release_run).await[0]["state"], "completed");
-    assert_eq!(env.operations(restore_id, restore_run).await[0]["state"], "submitted");
     assert_eq!(env.submitted()[2], (first, ActionKind::Restore, 17));
 
     env.hsm.files.lock().unwrap().get_mut(&first).unwrap().state.states = copies;
-    reopened.process_rev8(&env.entries).await.unwrap();
-    assert_eq!(env.operations(restore_id, restore_run).await[0]["state"], "completed");
+    env.reconcile_until(&reopened, async || {
+        env.operations(restore_id, restore_run).await[0]["state"] == "completed"
+    })
+    .await;
 
     env.hsm.reject_request.store(true, Ordering::SeqCst);
     let failed_run = env.queue(release_id).await;
@@ -630,6 +726,11 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
         archive_id: 17,
         ..Default::default()
     };
+    let racing_run = racing_runs[1]["id"].as_u64().unwrap();
+    env.reconcile_until(&env.stores, async || {
+        env.operations(racing_id, racing_run).await[0]["state"] == "completed"
+    })
+    .await;
     let late = env.file(4, 1024, HsmState::empty(), 0).await;
     let mut budgeted = env.policy("budgeted", archive);
     budgeted["spec"]["execution"]["budget"]["run"]["maxDuration"] = "2s".into();
@@ -667,7 +768,9 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
         state.in_progress_state = HPS_WAITING;
         state.in_progress_action = HUA_ARCHIVE;
     }
-    env.tick().await;
+    let pending = &env.operations(budgeted_id, next_run).await[0];
+    env.reconcile_until(&env.stores, async || env.checked(pending).await)
+        .await;
     assert_eq!(env.operations(budgeted_id, next_run).await[0]["state"], "submitted");
 
     // A later query reports NOOP and the requested archive is still absent.
@@ -680,7 +783,10 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
         .state
         .in_progress_action = HUA_NONE;
     let fresh = open_policy_store(&env.entries, env.hsm.clone());
-    fresh.process_rev8(&env.entries).await.unwrap();
+    env.reconcile_until(&fresh, async || {
+        env.operations(budgeted_id, next_run).await[0]["state"] == "failed"
+    })
+    .await;
     let terminal = &env.operations(budgeted_id, next_run).await[0];
     assert_eq!(terminal["state"], "failed");
     assert_eq!(terminal["reason"], "hsm_target_state_not_reached");
@@ -692,10 +798,15 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     assert_eq!(env.operations(budgeted_id, retry).await[0]["state"], "submitted");
     env.hsm.files.lock().unwrap().remove(&late).unwrap();
     env.hsm.missing_on_other_source.store(true, Ordering::SeqCst);
-    env.tick().await;
+    let pending = &env.operations(budgeted_id, retry).await[0];
+    env.reconcile_until(&env.stores, async || env.checked(pending).await)
+        .await;
     assert_eq!(env.operations(budgeted_id, retry).await[0]["state"], "submitted");
     env.hsm.missing_on_other_source.store(false, Ordering::SeqCst);
-    env.tick().await;
+    env.reconcile_until(&env.stores, async || {
+        env.operations(budgeted_id, retry).await[0]["state"] == "failed"
+    })
+    .await;
     let missing = &env.operations(budgeted_id, retry).await[0];
     assert_eq!(missing["state"], "failed");
     assert_eq!(missing["reason"], "fid_missing");
@@ -727,6 +838,27 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
             ..idle
         },
     ));
+    env.tick().await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while env.hsm.finish_after_observation.lock().unwrap().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background recovery did not observe the archive completing");
+
+    // A worker with only an unrelated mount can advance the polling cursor
+    // while the original worker holds authoritative evidence.
+    let other_hsm = Arc::new(HsmFixture::default());
+    other_hsm.missing_on_other_source.store(true, Ordering::SeqCst);
+    let other_worker = open_policy_store(&env.entries, other_hsm);
+    let pending = &env.operations(confirming_id, confirming_run).await[0];
+    env.reconcile_until(&other_worker, async || env.checked(pending).await)
+        .await;
+    assert_eq!(
+        env.operations(confirming_id, confirming_run).await[0]["state"],
+        "submitted"
+    );
     env.tick().await;
     assert_eq!(
         env.operations(confirming_id, confirming_run).await[0]["state"],

@@ -132,9 +132,12 @@ impl TerminalError {
 pub trait NativeHsm: Send + Sync {
     async fn filesystem_name(&self, mount: &Path) -> Result<String, String>;
     async fn observe(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String>;
-    /// Read the state for pool migration. This observation may outlive the
-    /// scheduler's bounded preflight wait.
+    /// Read the state for pool migration, which may outlive a preflight wait.
     async fn observe_for_migration(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
+        self.observe_in_background(mount, fid).await
+    }
+    /// Read FID state for work that may outlive the scheduler tick.
+    async fn observe_in_background(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
         self.observe(mount, fid).await
     }
     /// Apply the gate after blocking preparation and before issuing the request.
@@ -155,7 +158,7 @@ pub(crate) async fn read_only_lustre<T: Send + 'static>(read: impl FnOnce() -> T
     // keep the Tokio runtime open when the daemon stops.
     thread::Builder::new().name("rev8-lustre-read".into()).spawn(move || {
         if result.send(read()).is_err() {
-            tracing::debug!("discarding observation after the preflight worker stopped");
+            tracing::debug!("discarding observation after the background worker stopped");
         }
     })?;
     pending.await.map_err(io::Error::other)
@@ -206,7 +209,7 @@ impl NativeHsm for LustreHsm {
     }
 
     #[tracing::instrument(skip_all, fields(mount = %mount.display(), %fid))]
-    async fn observe_for_migration(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
+    async fn observe_in_background(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
         let mount = mount.to_owned();
         read_only_lustre(move || observe_fid(&mount, fid))
             .await
