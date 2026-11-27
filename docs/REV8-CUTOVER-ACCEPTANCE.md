@@ -23,9 +23,12 @@
 | 并发修改、重命名和删除 | 在源文件加锁前从另一客户端写入、改名或解除最后一个链接。三项均因 `source_generation_changed` 暂缓。保留文件的实时 FID 与内容符合业务操作的结果，已解除链接的文件未恢复。 |
 | 目标池空间不足 | 在目标 volatile file 创建边界注入 `ENOSPC`，REST 记录交换前失败。原池、FID 和内容保持原样。 |
 | 读取热度与重放 | MariaDB 和真实 Lustre 的 REST 集成用例覆盖零热度、缺失或过期样本、客户端独立观测和真实周期升温。上一阶段 [#21](https://github.com/JayTsu-sh/robinhood-rs/issues/21) 真机验收中，必需采集端离线使先前达标的 FID 在提交前以 `heat_client_unavailable` 暂缓，恢复后同一修订版完成升温。迁移复制和执行器核对读取没有提高业务客户端的零热度。布局集成用例在真实迁移后重放 `LYOUT`，断言数据库失败时游标不确认，重放后目录池名及 OST 正确。 |
+| 开发 Compose | 构建 Linux x86-64 的 daemon 和 CLI 镜像，确认加载 Lustre 2.16.1 用户态库。通过 Compose 网络和容器内的 API 核对健康状态、四种 ActionContract、按 FID 查询和目录指标。带认证的 Rev.8 Archive 预览命中一个 2 GiB 样本，运行历史为空。核对 CLI 目录计数和 daemon 正常退出。 |
 
 ## 验收边界
 
 两个 Lustre 作用域使用同一个物理文件系统的不同客户端挂载。该环境用于确认配置、采样和目录按作用域隔离，独立物理文件系统同时迁移仍需对应的测试环境。空间不足通过注入 `ENOSPC` 验证，现有 OST 容量配置未调整。Archive、Release 和 Restore 使用临时归档目录和独立 archive ID，属于原生 HSM 路径的验收。
+
+测试机上 Docker 发布到宿主机回环地址的端口请求超时，独立 Nginx 容器复现了同样现象。Compose API 检查通过项目网络和容器内回环地址完成。
 
 策略队列串行派发。执行预算限制了等待迁移工作线程的时间，实时预检和恢复对账都仍依赖 Lustre 调用返回。

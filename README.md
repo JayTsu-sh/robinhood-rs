@@ -53,9 +53,12 @@ sources.
 # Native (requires lustre-client for liblustreapi):
 cargo build --release
 
-# Or: use the compose stack with a stub liblustreapi:
+# Local stack for catalog and API checks
 cd dev/compose && docker compose up -d --build
 ```
+
+See the [development Compose guide](dev/compose/README.md) for prerequisites,
+catalog seeding, and API smoke checks.
 
 ## Quick start
 
@@ -475,7 +478,7 @@ cargo check --workspace --all-targets
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Local stack in containers (no Lustre; stub liblustreapi):
+# Local catalog and API stack without a Lustre mount
 cd dev/compose && docker compose up -d --build
 ```
 

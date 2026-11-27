@@ -10,7 +10,7 @@
 #   open http://localhost:3000     (grafana admin/admin)
 #
 # To seed data, run the daemon against a live mount from the host, or
-# insert rows into the `entries` table manually — the /api endpoints
+# insert rows into the scoped catalog manually — the /api endpoints
 # and Grafana dashboard react to what's in the DB.
 
 services:
@@ -30,6 +30,7 @@ services:
       retries: 12
 
   rbh-daemon:
+    platform: linux/amd64
     # Image is built from the repo root — see Dockerfile in this dir.
     build:
       context: ../..
@@ -45,9 +46,6 @@ services:
         condition: service_healthy
     ports:
       - "8080:8080"
-    # The daemon tries to stat RBH_LUSTRE_MOUNT on boot; point it at a
-    # scratch dir inside the container so startup doesn't fail.
-    command: ["sh", "-c", "mkdir -p /tmp/fake-mount && exec /usr/sbin/robinhood"]
 
   prometheus:
     image: prom/prometheus:v3.0.1
