@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 # notify: systemd blocks in `activating` until the daemon calls
 # sd_notify(READY=1), which happens right after the HTTP listener
-# binds and scheduler/threshold checker/changelog listeners are up.
+# binds and Rev.8 scheduler and changelog listeners are up.
 Type=notify
 NotifyAccess=main
 User=robinhood

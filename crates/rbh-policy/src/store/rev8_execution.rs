@@ -326,8 +326,14 @@ impl PolicyStore {
                 .finish_run(run.id, "cancelled", Some("policy_revision_inactive"), None)
                 .await;
         }
+        let policy = rev8::parse(&row.definition)?;
+        if self.ensure_configured(policy.filesystem()).is_err() {
+            return self
+                .finish_run(run.id, "deferred", Some("filesystem_not_configured"), None)
+                .await;
+        }
         let bindings = row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default();
-        let policy = self.compile_revision(&row.definition, &bindings).await?;
+        let policy = self.compile_revision(policy, &bindings).await?;
         let preview = if run.candidate_count.is_none() {
             match self
                 .preview_compiled(entries, &policy, row.revision, bindings.clone(), None)

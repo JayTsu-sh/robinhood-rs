@@ -1402,7 +1402,6 @@ impl EntryStore {
 
     /// Query entries matching a SQL WHERE clause with positional `?` params.
     ///
-    /// Used by PolicyRunTask to push predicate scope down to MariaDB.
     /// Params are `(i64 | String)` bound in order.
     #[tracing::instrument(name = "store.legacy_lustre_query_where", skip(self, params), fields(sql = %where_clause))]
     pub async fn legacy_lustre_query_where(

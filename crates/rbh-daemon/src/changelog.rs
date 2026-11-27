@@ -1100,7 +1100,6 @@ mod tests {
             policy_store: rbh_policy::PolicyStore::new(pool.clone()),
             classifier_store: rbh_policy::ClassifierStore::new(pool),
             classifier_cache: Default::default(),
-            scheduler: None,
             scans: Default::default(),
         }))
         .unwrap();
@@ -1526,18 +1525,6 @@ mod tests {
                     .unwrap(),
                 BackendActionOutcome::Success
             );
-        }
-        for (filesystem, backend) in [(&lustre_id, BackendKind::Lustre), (&juice_id, BackendKind::JuiceFs)] {
-            let definition: rbh_policy::PolicyDef = serde_json::from_value(serde_json::json!({
-                "name": format!("alert-{filesystem}"),
-                "filesystem": filesystem,
-                "kind": "alert",
-                "trigger": "1h"
-            }))
-            .unwrap();
-            let config = store.get_filesystem(filesystem).await.unwrap().unwrap();
-            assert_eq!(config.backend, backend);
-            rbh_policy::validate_policy_for_filesystem(&definition, &config).unwrap();
         }
         let metrics = rbh_observability::metrics::render().unwrap();
         assert!(metrics.contains(&format!("filesystem=\"{lustre_id}\"")));

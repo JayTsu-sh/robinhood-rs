@@ -39,7 +39,6 @@ services:
       RBH_LUSTRE_MOUNT: "/tmp/fake-mount"
       RBH_LISTEN_ADDR: "0.0.0.0:8080"
       RBH_LOG: "info"
-      RBH_THRESHOLD_TICK_SECS: "15"
       # Intentionally no RBH_MDTS / RBH_CHANGELOG_USER — Lustre is absent.
     depends_on:
       mariadb:

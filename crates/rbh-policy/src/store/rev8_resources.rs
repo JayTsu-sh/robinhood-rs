@@ -276,7 +276,7 @@ impl PolicyStore {
     }
 
     pub(super) async fn compile_revision(
-        &self, document: &Value, bindings: &[ResourceBinding],
+        &self, policy: Policy, bindings: &[ResourceBinding],
     ) -> Result<CompiledPolicy, PolicyError> {
         let mut selectors = BTreeMap::new();
         for binding in bindings.iter().filter(|binding| binding.kind == ResourceKind::Selector) {
@@ -288,7 +288,7 @@ impl PolicyStore {
                 .ok_or_else(|| not_found(binding.kind, &binding.name))?;
             selectors.insert(binding.name.clone(), definition["spec"]["where"].clone());
         }
-        rev8::parse(document)?.compile(&selectors)
+        policy.compile(&selectors)
     }
 }
 

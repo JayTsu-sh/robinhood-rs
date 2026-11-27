@@ -55,18 +55,18 @@ pub struct PreviewResult {
     pub read_heat: Option<heat::PreviewHeat>,
 }
 
-/// Recognize versioned documents before attempting to parse the older API model.
-pub fn is_versioned_document(document: &JsonValue) -> bool {
-    ["apiVersion", "metadata", "spec"]
-        .iter()
-        .any(|key| document.get(key).is_some())
-        || document.get("kind").and_then(JsonValue::as_str) == Some("Policy")
+/// Reject legacy and unsupported document versions at the REST boundary.
+pub fn validate_policy_version(document: &JsonValue) -> Result<(), PolicyError> {
+    if document.get("apiVersion").and_then(JsonValue::as_str) != Some(API_VERSION) {
+        return Err(invalid(format!(
+            "apiVersion must be {API_VERSION}. Submit a Rev.8 Policy document with kind, metadata and spec."
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse(document: &JsonValue) -> Result<Policy, PolicyError> {
-    if document.get("apiVersion").and_then(JsonValue::as_str) != Some(API_VERSION) {
-        return Err(invalid(format!("apiVersion must be {API_VERSION}")));
-    }
+    validate_policy_version(document)?;
     let policy: Policy = serde_path_to_error::deserialize(document).map_err(|error| invalid(format!("{error}")))?;
     if !valid_name(&policy.metadata.name) {
         return Err(invalid(

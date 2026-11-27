@@ -27,8 +27,7 @@ The Grafana dashboard is provisioned automatically from
 - **Lustre.** The daemon's `liblustreapi` symbols are fulfilled by a stub
   that returns `-1` on every call. FS-scan and changelog would fail —
   the compose stack keeps `RBH_MDTS` / `RBH_CHANGELOG_USER` unset so the
-  listener never starts. You can still hit the REST API, create policies,
-  exercise the threshold checker, and watch metrics accrue.
+  listener never starts. You can still query the REST catalog and preview Rev.8 policy candidates.
 - **OSS hosts.** No simulated OSTs; `OnOst` predicates return empty.
 
 For a real end-to-end run, run the daemon binary on a node that has

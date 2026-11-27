@@ -7,7 +7,7 @@
 #   3. Seeds a handful of entries + one removed_entry directly via mysql.
 #   4. Exercises: /api/health, /api/entries/count, rbh find (multiple forms),
 #      rbh report (fs-info / top-size / size-profile / dump), rbh undelete
-#      (list / forget), a threshold policy that fires immediately, and
+#      (list / forget), rejection of the previous policy format, and
 #      /api/metrics.
 #   5. Tears the daemon down with SIGTERM and asserts graceful exit.
 #
@@ -78,7 +78,6 @@ RBH_DATABASE_URL="mysql://root@127.0.0.1/$DB" \
 RBH_LUSTRE_MOUNT="/tmp/rbh-e2e-fake" \
 RBH_LOG="info" \
 RBH_LISTEN_ADDR="127.0.0.1:$PORT" \
-RBH_THRESHOLD_TICK_SECS="2" \
     nohup "$BIN_DAEMON" >"$LOG" 2>&1 &
 PID=$!
 mkdir -p /tmp/rbh-e2e-fake
@@ -187,40 +186,14 @@ assert_http "$http" "404" "DELETE /api/removed unknown"
 out="$(curl -sS "$API/api/removed")"
 assert_eq "$out" "[]" "removed list empty after forget"
 
-# 4h. threshold fire + metrics
-echo "--- threshold policy"
-id="$(curl -sS -X POST "$API/api/policies" -H 'content-type: application/json' \
-  -d '{"name":"e2e_threshold","kind":"alert","scope":{"op":"true"},"rules":[],
-       "default_action":{"max_count":1},
-       "triggers":[{"type":"threshold_count","check_interval_secs":2,
-                    "high_count":3,"low_count":0,"post_trigger_wait_secs":999,
-                    "target":{"kind":"fs"}}]}' \
-   | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')"
-[[ -n "$id" ]] || die "threshold policy creation returned no id"
-
-# wait up to 10s for the fire counter to bump. `grep -F` + `|| true`
-# prevents `set -e -o pipefail` from killing the script on a miss.
-hit=""
-needle="rbh_threshold_fires_total{policy_id=\"$id\"}"
-for _ in $(seq 1 20); do
-    sleep 0.5
-    val="$(curl -sS "$API/api/metrics" | grep -F "$needle" | awk '{print $NF}' | head -1 || true)"
-    if [[ -n "${val:-}" && "${val:-}" != "0" ]]; then
-        hit="$val"
-        break
-    fi
-done
-[[ -n "$hit" ]] || die "threshold never fired within 10s"
-echo "    -> threshold fired (count=$hit)"
-
-# metrics must include at least these families
-metrics="$(curl -sS "$API/api/metrics")"
-for fam in rbh_catalog_entries rbh_threshold_fires_total rbh_policy_runs_total; do
-    assert_contains "$metrics" "$fam" "/metrics contains $fam"
-done
-
-# cleanup policy
-curl -sS -X DELETE "$API/api/policies/$id" >/dev/null
+# 4h. policy format and metrics
+legacy_error="$(curl -sS -X POST "$API/api/policies" -H 'Content-Type: application/json' \
+    -d '{"name":"e2e_threshold","kind":"alert","filesystem":"lustre","trigger":"count > 3"}' \
+    -w '\n%{http_code}')"
+assert_http "${legacy_error##*$'\n'}" "400" "legacy policy rejected"
+assert_contains "$legacy_error" "hsm.storage.io/v1alpha3" "policy format error identifies Rev.8"
+metrics="$(curl -fsS "$API/api/metrics")"
+assert_contains "$metrics" "rbh_catalog_entries" "/metrics contains catalog count"
 
 # 5. graceful shutdown
 echo "[teardown] SIGTERM"

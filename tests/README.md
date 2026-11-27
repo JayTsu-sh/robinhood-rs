@@ -2,13 +2,15 @@
 
 Two tiers of end-to-end coverage. Per-crate integration tests are under
 `crates/<crate>/tests/integration.rs`; this directory holds the
-top-level scripts that exercise the deployed binaries.
+top-level scripts that exercise the deployed binaries. See the
+[Rev.8 cutover acceptance report](../docs/REV8-CUTOVER-ACCEPTANCE.md)
+for the REST and live Lustre deployment checks.
 
 ## `e2e.sh` — no Lustre required
 
 Spins up the daemon against a fresh MariaDB, seeds entries directly
 via SQL, and validates the REST + CLI surface (`find`, `report`,
-`undelete`, threshold fires, metrics). Use this as the fast smoke
+`undelete`, policy format rejection, metrics). Use this as the fast smoke
 test during normal development.
 
 ```sh
@@ -19,7 +21,7 @@ cargo build --release
 ## `e2e_lustre.sh` — needs a real Lustre mount
 
 Covers what `e2e.sh` deliberately skips: the changelog listener,
-fs-scan, orphan sweep, dump/restore round-trip, dry-run policy,
+fs-scan, orphan sweep, dump/restore round-trip, policy format rejection,
 stripe-distribution, and `rbh du`.
 
 Prerequisites:

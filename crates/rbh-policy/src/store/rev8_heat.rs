@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use rbh_entry_store::FileSystemId;
 
 use super::PolicyStore;
-use crate::PolicyError;
+use crate::{PolicyError, rev8};
+
+const ACTIVE_HEAT_POLICY: &str = "revision IS NOT NULL AND enabled AND name IS NOT NULL";
 
 #[derive(Default)]
 pub struct HeatSampler {
@@ -22,6 +24,26 @@ impl HeatSampler {
 }
 
 impl PolicyStore {
+    /// Scope daemon sampling jobs to deployed profiles used by enabled policies.
+    #[tracing::instrument(skip(self))]
+    pub async fn active_read_heat_filesystems(&self) -> Result<Vec<FileSystemId>, PolicyError> {
+        if self.read_heat.is_empty() {
+            return Ok(Vec::new());
+        }
+        let active: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT DISTINCT rev8_heat_filesystem FROM policies
+             WHERE rev8_heat_filesystem IS NOT NULL AND {ACTIVE_HEAT_POLICY}",
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(self
+            .read_heat
+            .keys()
+            .filter(|filesystem| active.iter().any(|id| id == filesystem.as_str()))
+            .cloned()
+            .collect())
+    }
+
     /// Sample one bounded, keyset-paginated batch on this filesystem. The
     /// daemon keeps a separate sampler per configured filesystem.
     #[tracing::instrument(skip(self, sampler))]
@@ -31,9 +53,9 @@ impl PolicyStore {
         let Some(profile) = self.read_heat.get(filesystem) else {
             return Ok(0);
         };
-        let active: Vec<u64> = sqlx::query_scalar(
-            "SELECT id FROM policies WHERE rev8_heat_filesystem = ? AND enabled AND name IS NOT NULL ORDER BY id",
-        )
+        let active: Vec<u64> = sqlx::query_scalar(&format!(
+            "SELECT id FROM policies WHERE rev8_heat_filesystem = ? AND {ACTIVE_HEAT_POLICY} ORDER BY id",
+        ))
         .bind(filesystem.as_str())
         .fetch_all(&self.pool)
         .await?;
@@ -46,7 +68,7 @@ impl PolicyStore {
             return Ok(0);
         };
         let bindings = row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default();
-        let policy = self.compile_revision(&row.definition, &bindings).await?;
+        let policy = self.compile_revision(rev8::parse(&row.definition)?, &bindings).await?;
         if !policy.enabled || !policy.uses_read_heat || &policy.filesystem != filesystem {
             return Ok(0);
         }

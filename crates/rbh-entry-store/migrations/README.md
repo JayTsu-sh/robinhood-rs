@@ -48,3 +48,4 @@ NNN_short_description.sql
 | `015_rev8_pool_migration.sql` | persistent pool migration plan and one pending migration per filesystem |
 | `016_rev8_read_heat.sql` | business-client heat observations and sampling policy index |
 | `017_rev8_pool_residence.sql` | pool residence clock and run heat deferral counts |
+| `018_retire_legacy_policies.sql` | retire unversioned policy heads and restrict heat sampling to tiering policies |

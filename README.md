@@ -4,12 +4,9 @@ A Rust rewrite of the [Robinhood Policy Engine](https://github.com/cea-hpc/robin
 for Lustre filesystems. Policies are stored in a database and managed
 via REST; an operator-facing `rbh` CLI wraps the REST surface.
 
-> **Status.** Pre-1.0. The catalog, policy engine, HSM event
-> tracking, threshold triggers, and operator tooling are all
-> implemented; disaster-recovery, the full `backup` module, and the
-> Web GUI from robinhood-C are not. See
-> [`docs/C-VS-RUST-GAP-ANALYSIS.md`](docs/C-VS-RUST-GAP-ANALYSIS.md)
-> for the tracked delta.
+The daemon uses Rev.8 policies for native Lustre HSM and optional online
+tiering. It maintains its catalog through scans and filesystem change
+sources.
 
 ---
 
@@ -20,7 +17,6 @@ via REST; an operator-facing `rbh` CLI wraps the REST surface.
               │  rbh-daemon (binary)   │
               │ ─────────────────────  │
               │ signals.rs   SIGHUP    │
-              │ thresholds.rs          │
               │ changelog.rs ingest    │
               └────┬─────────┬─────────┘
                    │         │
@@ -40,8 +36,8 @@ via REST; an operator-facing `rbh` CLI wraps the REST surface.
                      └───────┬───────┘
                              ▼
                      ┌───────────────┐
-                     │ rbh-policy    │ PolicyRunTask
-                     │ + rbh-actions │ → Purge / HSM archive/release
+                     │ rbh-policy    │ durable Rev.8 runs
+                     │               │ → Lustre HSM and pool migration
                      └───────┬───────┘
                              │
                              ▼
@@ -102,7 +98,7 @@ and reports missing parents and stale catalog paths as distinct typed errors.
 | `diff --mount`  | Walk a mount and diff `(name, size)` against the catalog |
 | `policy-list`   | List policies |
 | `policy-show <id>` | Show one policy |
-| `policy-run <id>` | Manual one-shot run, optional `--target-ost N` / `--target-pool NAME` / `--target-user UID` |
+| `policy-run <id>` | Queue a Rev.8 run with `--token-file PATH` or `RBH_REV8_TOKEN_FILE`. Use `--dry-run` to preview. |
 | `status --filesystem ID` | `/api/entries/count?filesystem=ID` |
 | `health`        | `/api/health` |
 
@@ -123,7 +119,7 @@ and reports missing parents and stale catalog paths as distinct typed errors.
 | DELETE | `/api/removed/{object}?filesystem=ID` | Forget one typed backend object |
 | GET / POST | `/api/policies`  | CRUD |
 | GET / PUT | `/api/policies/{id}` | Read or update a policy |
-| DELETE | `/api/policies/{id}` | Delete a legacy policy |
+| DELETE | `/api/policies/{id}` | Stop scheduling and retire the Rev.8 policy |
 | POST   | `/api/policies/{id}/run` | Manual one-shot run |
 | POST   | `/api/policies/{id}/preview` | Read-only Rev.8 candidate totals |
 | POST   | `/api/scans`         | Start an async scan |
@@ -131,6 +127,23 @@ and reports missing parents and stale catalog paths as distinct typed errors.
 
 The unscoped Lustre dump, restore, orphan-sweep, and classifier-run surfaces
 are retained only under `/api/compat/lustre/` as an explicit migration boundary.
+
+### Upgrading policy configuration
+
+Stop the previous daemon before starting the upgraded version against its
+catalog. The upgrade retires unversioned policies and frees their names.
+Their submitted JSON remains in `policies.definition` on rows with a null
+`revision`. The new daemon pauses persisted legacy jobs before the
+scheduler starts and retains their execution history. Rev.8 policy heads,
+revisions, periodic schedules and the operation journal survive the upgrade.
+Existing requests submitted to Lustre before the upgrade remain under the
+Lustre coordinator's control.
+
+Submit policies through REST as `hsm.storage.io/v1alpha3` documents with
+`kind: Policy`, `metadata` and `spec`. Legacy submissions return HTTP 400.
+Resubmit any policies you still need using the Rev.8 resources and action
+contracts documented below. Catalog operations and classifiers continue to
+use their existing endpoints.
 
 ### Rev.8 native Lustre HSM
 
@@ -297,7 +310,10 @@ the restarted daemon reconciles the live layout before any new migration.
 ### Rev.8 Lustre read heat
 
 Add a `read_heat` block to a Lustre filesystem in `RBH_FILESYSTEMS_JSON`.
-Each client entry names a business Lustre mount or a heat agent endpoint.
+A sampler starts for that filesystem when an enabled pool-migration
+policy depends on read heat, and stops when the last such policy is disabled
+or deleted. Each client entry names a business Lustre mount or a heat agent
+endpoint.
 Business mounts must be separate client instances mounted from the same
 Lustre source as the executor's `mount_path`. The daemon checks client
 identity across hosts and rejects shared instances, including bind mounts
@@ -398,7 +414,6 @@ SIGHUP):
 | `RBH_CHANGELOG_USER` | Legacy single-Lustre reader id (`cl1` etc.); CSV for per-MDT |
 | `RBH_LISTEN_ADDR`  | REST bind, default `0.0.0.0:8080` |
 | `RBH_LOG`          | `tracing-subscriber` env-filter; **hot-reload via SIGHUP** |
-| `RBH_THRESHOLD_TICK_SECS` | Threshold poll cadence, default 30 |
 | `RBH_OTLP_ENDPOINT` | (Reserved; not yet wired) |
 
 For explicit runtimes, `RBH_FILESYSTEMS_JSON` contains filesystem configuration
@@ -434,26 +449,13 @@ lookups, and actions use filesystem-scoped native identities.
 | Metric | Labels | Meaning |
 |--------|--------|---------|
 | `rbh_catalog_entries` | — | Current catalog row count |
-| `rbh_policy_runs_total` | `policy_id`, `outcome` | Policy runs completed |
-| `rbh_policy_run_duration_seconds` | `policy_id` | Histogram |
-| `rbh_threshold_fires_total` | `policy_id` | Threshold trigger fires |
 | `rbh_changelog_events_total` | `mdt`, `event_type` | Per-MDT per-type ingest rate |
-| `rbh_actions_total` | `policy_id`, `outcome` | Per-entry action outcomes |
 
 See [`packaging/grafana/robinhood-rs.json`](packaging/grafana/robinhood-rs.json)
 for a ready-to-import dashboard.
 
-## Migrating from robinhood-C
-
-```bash
-cargo run -p rbh-config-import -- /path/to/old-robinhood.conf --pretty
-# or POST directly:
-cargo run -p rbh-config-import -- old.conf --post http://127.0.0.1:8080
-```
-
-The importer recognises a useful subset of the C DSL (see source for
-scope); anything it can't translate is logged as a warning so the
-resulting JSON is hand-editable.
+Query Rev.8 policy runs and file-level actions through the REST history
+endpoints.
 
 ## Development
 

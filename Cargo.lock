@@ -2205,7 +2205,6 @@ dependencies = [
  "rbh-observability",
  "rbh-policy",
  "rbh-predicate",
- "scheduler-rs",
  "serde",
  "serde_json",
  "sha2",
@@ -2269,20 +2268,6 @@ dependencies = [
  "tokio",
  "urlencoding",
  "walkdir",
-]
-
-[[package]]
-name = "rbh-config-import"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "rbh-policy",
- "rbh-predicate",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -2390,9 +2375,7 @@ dependencies = [
  "libc",
  "lustre-api",
  "rbh-actions",
- "rbh-backup",
  "rbh-entry-store",
- "rbh-observability",
  "rbh-predicate",
  "reqwest",
  "scheduler-rs",

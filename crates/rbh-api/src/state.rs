@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use rbh_entry_store::store::EntryStore;
 use rbh_policy::{ClassifierRow, ClassifierStore, PolicyStore};
-use scheduler_rs::prelude::Scheduler;
 use tokio::sync::{Mutex, RwLock};
 
 /// Shared state injected into all axum handlers.
@@ -18,7 +17,6 @@ pub struct AppState {
     /// picks up changes without a daemon restart.
     pub classifier_cache: Arc<RwLock<Vec<ClassifierRow>>>,
     pub entry_store: EntryStore,
-    pub scheduler: Option<Scheduler>,
     /// In-memory registry of scans started via POST /api/scans. Lives
     /// for the daemon process lifetime; cleared on restart. The mutex
     /// covers a small HashMap, contention is negligible.

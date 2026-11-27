@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow};
 use rbh_entry_store::store::{AggregateKey, AggregateSort, QueryParam};
-use rbh_policy::{PolicyDef, PolicyError, rev8, store::Rev8PolicyRow};
+use rbh_policy::{PolicyError, rev8, store::Rev8PolicyRow};
 use rbh_predicate::{Predicate, SortKey, SqlParam, to_sql};
 
 use crate::{
@@ -101,100 +101,37 @@ async fn metrics_endpoint(State(state): State<AppState>) -> axum::response::Resp
 // Policies
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-struct LegacyPolicyResponse {
-    id: u64,
-    name: String,
-    kind: String,
-    enabled: bool,
-    definition: PolicyDef,
-}
-
-impl From<rbh_policy::PolicyRow> for LegacyPolicyResponse {
-    fn from(row: rbh_policy::PolicyRow) -> Self {
-        let kind = row.kind().as_str().to_string();
-        Self {
-            id: row.id,
-            name: row.name,
-            kind,
-            enabled: row.enabled,
-            definition: row.definition,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum PolicyResponse {
-    Legacy(Box<LegacyPolicyResponse>),
-    Rev8(Rev8PolicyRow),
-}
-
-impl PolicyResponse {
-    fn id(&self) -> u64 {
-        match self {
-            Self::Legacy(row) => row.id,
-            Self::Rev8(row) => row.id,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CreatePolicyRequest {
-    #[serde(flatten)]
-    definition: PolicyDef,
-}
-
 #[tracing::instrument(skip_all)]
 async fn create_policy(
     State(state): State<AppState>, Extension(writers): Extension<crate::Rev8Writers>, headers: HeaderMap,
     Json(document): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    if rev8::is_versioned_document(&document) {
-        let actor = writers.authorize(&headers)?;
-        let id = state
+    rev8::validate_policy_version(&document)?;
+    let actor = writers.authorize(&headers)?;
+    let id = state
+        .policy_store
+        .save_rev8(&state.entry_store, None, &document, actor)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "revision": 1 })),
+    ))
+}
+
+#[tracing::instrument(skip(state))]
+async fn list_policies(State(state): State<AppState>) -> Result<Json<Vec<Rev8PolicyRow>>, ApiError> {
+    Ok(Json(state.policy_store.list_rev8().await?))
+}
+
+#[tracing::instrument(skip(state))]
+async fn get_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Result<Json<Rev8PolicyRow>, ApiError> {
+    Ok(Json(
+        state
             .policy_store
-            .save_rev8(&state.entry_store, None, &document, actor)
-            .await?;
-        return Ok((
-            StatusCode::CREATED,
-            Json(serde_json::json!({ "id": id, "revision": 1 })),
-        ));
-    }
-    let body: CreatePolicyRequest =
-        serde_json::from_value(document).map_err(|error| ApiError::Unprocessable(error.to_string()))?;
-    validate_policy_request(&state, &body.definition).await?;
-    let id = state.policy_store.create(&body.definition).await?;
-    // Reconcile triggers → scheduler-rs schedules.
-    if let Some(ref scheduler) = state.scheduler
-        && let Err(e) =
-            rbh_policy::reconcile_triggers(scheduler, id, &body.definition.trigger, body.definition.enabled).await
-    {
-        tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
-    }
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
-}
-
-#[tracing::instrument(skip(state))]
-async fn list_policies(State(state): State<AppState>) -> Result<Json<Vec<PolicyResponse>>, ApiError> {
-    let legacy = state.policy_store.list().await?;
-    let rev8 = state.policy_store.list_rev8().await?;
-    let mut rows: Vec<_> = legacy
-        .into_iter()
-        .map(|row| PolicyResponse::Legacy(Box::new(row.into())))
-        .chain(rev8.into_iter().map(PolicyResponse::Rev8))
-        .collect();
-    rows.sort_by_key(PolicyResponse::id);
-    Ok(Json(rows))
-}
-
-#[tracing::instrument(skip(state))]
-async fn get_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Result<Json<PolicyResponse>, ApiError> {
-    if let Some(row) = state.policy_store.get_rev8(id).await? {
-        return Ok(Json(PolicyResponse::Rev8(row)));
-    }
-    let row = state.policy_store.get(id).await?;
-    Ok(Json(PolicyResponse::Legacy(Box::new(row.into()))))
+            .get_rev8(id)
+            .await?
+            .ok_or(PolicyError::NotFound(id))?,
+    ))
 }
 
 #[tracing::instrument(skip_all, fields(id))]
@@ -202,24 +139,12 @@ async fn update_policy(
     State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
     headers: HeaderMap, Json(document): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    if rev8::is_versioned_document(&document) {
-        let actor = writers.authorize(&headers)?;
-        state
-            .policy_store
-            .save_rev8(&state.entry_store, Some(id), &document, actor)
-            .await?;
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    let body: CreatePolicyRequest =
-        serde_json::from_value(document).map_err(|error| ApiError::Unprocessable(error.to_string()))?;
-    validate_policy_request(&state, &body.definition).await?;
-    state.policy_store.update(id, &body.definition).await?;
-    if let Some(ref scheduler) = state.scheduler
-        && let Err(e) =
-            rbh_policy::reconcile_triggers(scheduler, id, &body.definition.trigger, body.definition.enabled).await
-    {
-        tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
-    }
+    rev8::validate_policy_version(&document)?;
+    let actor = writers.authorize(&headers)?;
+    state
+        .policy_store
+        .save_rev8(&state.entry_store, Some(id), &document, actor)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -248,16 +173,11 @@ async fn get_policy_revision(
     Ok(Json(state.policy_store.get_rev8_revision(id, revision).await?))
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct RunRequest {
-    /// Optional run narrowing. Identical JSON shape to
-    /// `rbh_policy::TargetFilter`. When absent, runs against the whole FS.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunRequest {
     #[serde(default)]
-    pub target: Option<rbh_policy::TargetFilter>,
-    /// Skip executor; log what would happen. Useful for validating a
-    /// new policy before pulling the trigger.
-    #[serde(default)]
-    pub dry_run: bool,
+    dry_run: bool,
 }
 
 #[derive(Deserialize)]
@@ -291,90 +211,22 @@ async fn list_rev8_operations(
     ))
 }
 
-/// Fire a one-shot policy run via an `ImmediateTrigger` schedule. The
-/// response returns the generated schedule id so operators can cancel
-/// or observe it. Requires the scheduler to be present in `AppState`.
+/// Queue a run bound to the current persisted policy revision.
 #[tracing::instrument(skip_all, fields(id))]
 async fn run_policy_now(
     State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
-    headers: HeaderMap, request: Option<Json<RunRequest>>,
+    headers: HeaderMap, body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    use scheduler_rs::prelude::{MisfirePolicy, ScheduleConfig, Task};
-    use scheduler_rs::trigger::ImmediateTrigger;
-
-    if state.policy_store.get_rev8(id).await?.is_some() {
-        let req = request.map(|Json(request)| request).unwrap_or_default();
-        let actor = writers.authorize(&headers)?;
-        if req.target.is_some() {
-            return Err(ApiError::BadRequest(
-                "Rev.8 runs use the target bound to the policy revision".into(),
-            ));
-        }
-        if req.dry_run {
+    let actor = writers.authorize(&headers)?;
+    if !body.is_empty() {
+        let request: RunRequest = serde_json::from_slice(&body)
+            .map_err(|error| ApiError::BadRequest(format!("invalid Rev.8 run request: {error}")))?;
+        if request.dry_run {
             return Ok(Json(state.policy_store.preview_rev8(&state.entry_store, id).await?).into_response());
         }
-        let run = state.policy_store.request_rev8_run(id, actor).await?;
-        return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"runId": run}))).into_response());
     }
-    let Json(req) = request.ok_or_else(|| ApiError::BadRequest("expected a JSON run request".into()))?;
-    // Verify the legacy policy exists first.
-    let row = state.policy_store.get(id).await?;
-    let config = validate_policy_request(&state, &row.definition).await?;
-
-    let target = req.target.unwrap_or(rbh_policy::TargetFilter::Fs);
-    rbh_policy::validate_target_for_filesystem(&target, &config)?;
-
-    let scheduler = state
-        .scheduler
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("scheduler not configured".into()))?;
-
-    let task = rbh_policy::PolicyRunTask {
-        policy_id: id,
-        trigger_idx: u32::MAX, // sentinel: manual run, no trigger bound
-        target,
-        dry_run: req.dry_run,
-    };
-    let task_data = serde_json::to_value(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let config = ScheduleConfig {
-        misfire_policy: MisfirePolicy::Coalesce,
-        max_instances: 1,
-        ..Default::default()
-    };
-    // Use a UUID suffix so same-second manual runs don't collide on
-    // the unique-name constraint (scheduler-rs keys on the UUID id but
-    // the name is what shows up in logs and DB queries).
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let short = &suffix[..8];
-    let name = format!("rbh.policy.{id}.manual.{short}");
-    let schedule_id = scheduler
-        .add_raw(
-            rbh_policy::PolicyRunTask::TYPE_NAME.to_string(),
-            task_data,
-            Box::new(ImmediateTrigger::new()),
-            config,
-            Some(name.clone()),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("scheduler add_raw: {e}")))?;
-    Ok(Json(serde_json::json!({
-        "schedule_id": schedule_id.0.to_string(),
-        "name": name,
-    }))
-    .into_response())
-}
-
-async fn validate_policy_request(
-    state: &AppState, definition: &PolicyDef,
-) -> Result<rbh_entry_store::FileSystemConfig, ApiError> {
-    let config = state
-        .entry_store
-        .get_filesystem(&definition.filesystem)
-        .await
-        .map_err(|error| ApiError::Internal(error.to_string()))?
-        .ok_or_else(|| ApiError::BadRequest(format!("unknown filesystem: {}", definition.filesystem)))?;
-    rbh_policy::validate_policy_for_filesystem(definition, &config)?;
-    Ok(config)
+    let run = state.policy_store.request_rev8_run(id, actor).await?;
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"runId": run}))).into_response())
 }
 
 #[tracing::instrument(skip_all, fields(id))]
@@ -382,15 +234,8 @@ async fn delete_policy(
     State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    if state.policy_store.get_rev8(id).await?.is_some() {
-        writers.authorize(&headers)?;
-        state.policy_store.delete_rev8(id).await?;
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    if let Some(ref scheduler) = state.scheduler {
-        let _ = rbh_policy::reconcile::remove_policy_schedule(scheduler, id).await;
-    }
-    state.policy_store.delete(id).await?;
+    writers.authorize(&headers)?;
+    state.policy_store.delete_rev8(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1269,7 +1114,6 @@ pub(crate) enum ApiError {
     Unauthorized,
     BadRequest(String),
     NotFound(String),
-    Unprocessable(String),
     Internal(String),
 }
 
@@ -1285,9 +1129,6 @@ impl IntoResponse for ApiError {
             ApiError::Policy(PolicyError::NotFound(id)) => {
                 (StatusCode::NOT_FOUND, format!("policy not found: id={id}"))
             }
-            ApiError::Policy(PolicyError::NotFoundByName(name)) => {
-                (StatusCode::NOT_FOUND, format!("policy not found: name={name}"))
-            }
             ApiError::Policy(PolicyError::InvalidTrigger(msg)) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Policy(PolicyError::InvalidPolicy(msg)) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Policy(error @ PolicyError::NameConflict(_)) => (StatusCode::CONFLICT, error.to_string()),
@@ -1301,12 +1142,8 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
-            ApiError::Policy(
-                error @ (PolicyError::FilesystemMismatch { .. } | PolicyError::UnsupportedCapability { .. }),
-            ) => (StatusCode::BAD_REQUEST, error.to_string()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-            ApiError::Unprocessable(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
             ApiError::Policy(e) => {
                 tracing::error!(error = %e, "policy error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
@@ -1341,7 +1178,6 @@ pub(crate) mod scoped_api_tests {
             classifier_store: rbh_policy::ClassifierStore::new(pool.clone()),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: rbh_entry_store::EntryStore::with_pool(pool),
-            scheduler: None,
             scans: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1407,6 +1243,37 @@ pub(crate) mod scoped_api_tests {
         response.assert_status_bad_request();
         let body: serde_json::Value = response.json();
         assert!(body["error"].as_str().unwrap().contains("apiVersion"));
+    }
+
+    #[tokio::test]
+    async fn legacy_policy_submissions_require_a_rev8_document() {
+        let server = rev8_test_server(state_without_database_connection());
+        let legacy = serde_json::json!({
+            "name": "old-archive", "filesystem": "lustre", "kind": "hsm_archive",
+            "enabled": true, "trigger": "1h", "action": {"hsm": {"archive_id": 1}}
+        });
+        for request in [server.post("/api/policies"), server.put("/api/policies/123")] {
+            let response = request.json(&legacy).await;
+            response.assert_status_bad_request();
+            let body = response.json::<serde_json::Value>();
+            assert!(body["error"].as_str().unwrap().contains("hsm.storage.io/v1alpha3"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rev8_manual_run_rejects_a_legacy_target_even_without_a_json_content_type() {
+        let server = rev8_test_server(state_without_database_connection());
+        let response = server
+            .post("/api/policies/123/run")
+            .text(r#"{"target":{"kind":"ost","osts":[7]}}"#)
+            .await;
+        response.assert_status_bad_request();
+        assert!(
+            response.json::<serde_json::Value>()["error"]
+                .as_str()
+                .unwrap()
+                .contains("target")
+        );
     }
 
     #[tokio::test]
@@ -1559,14 +1426,11 @@ pub(crate) mod scoped_api_tests {
                 .await
                 .unwrap();
         }
-        let scheduler = scheduler_rs::prelude::Scheduler::builder().build().unwrap();
-        scheduler.register::<rbh_policy::PolicyRunTask>().await;
         let build_server = |entry_store: rbh_entry_store::EntryStore| {
             let mut state = state_without_database_connection();
             state.policy_store = rbh_policy::PolicyStore::new(entry_store.pool().clone());
             state.classifier_store = rbh_policy::ClassifierStore::new(entry_store.pool().clone());
             state.entry_store = entry_store;
-            state.scheduler = Some(scheduler.clone());
             rev8_test_server(state)
         };
         let server = build_server(store);
@@ -1632,7 +1496,6 @@ pub(crate) mod scoped_api_tests {
         assert_eq!(preview["estimatedBytes"], 64);
 
         check_resource_bindings(&server, &first, suffix, &policy_url, &preview_url, document).await;
-        assert!(scheduler.list_schedules().await.unwrap().is_empty());
         server.delete(&policy_url).await.assert_status(StatusCode::NO_CONTENT);
         server.get(&policy_url).await.assert_status_not_found();
         server
@@ -1961,7 +1824,6 @@ pub(crate) mod scoped_api_tests {
             classifier_store: rbh_policy::ClassifierStore::new(pool),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: store,
-            scheduler: None,
             scans: Arc::new(Mutex::new(HashMap::new())),
         };
         let server = TestServer::new(crate::router(state)).unwrap();
@@ -2073,7 +1935,6 @@ pub(crate) mod scoped_api_tests {
             classifier_store: rbh_policy::ClassifierStore::new(pool),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: store,
-            scheduler: None,
             scans: Arc::new(Mutex::new(HashMap::new())),
         }))
         .unwrap();
@@ -2092,7 +1953,7 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn create_policy_rejects_juicefs_hsm_before_persisting_or_scheduling() {
+    async fn rev8_rejects_hsm_on_juicefs() {
         if !integration_enabled() {
             return;
         }
@@ -2113,27 +1974,17 @@ pub(crate) mod scoped_api_tests {
             .await
             .unwrap();
         let pool = store.pool().clone();
-        let server = TestServer::new(crate::router(AppState {
+        let server = rev8_test_server(AppState {
             policy_store: rbh_policy::PolicyStore::new(pool.clone()),
             classifier_store: rbh_policy::ClassifierStore::new(pool),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: store,
-            scheduler: None,
             scans: Arc::new(Mutex::new(HashMap::new())),
-        }))
-        .unwrap();
-        let response = server
-            .post("/api/policies")
-            .json(&serde_json::json!({
-                "name": format!("invalid-hsm-{}", std::process::id()),
-                "filesystem": filesystem,
-                "kind": "hsm_archive",
-                "trigger": "1h",
-                "action": {"hsm": {"archive_id": 1}}
-            }))
-            .await;
+        });
+        let document = rev8_archive_policy(filesystem.as_str(), "invalid-hsm");
+        let response = server.post("/api/policies").json(&document).await;
         response.assert_status_bad_request();
         let body: serde_json::Value = response.json();
-        assert!(body["error"].as_str().unwrap().contains("hsm"));
+        assert!(body["error"].as_str().unwrap().contains("Lustre HSM"));
     }
 }

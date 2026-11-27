@@ -14,7 +14,6 @@ rbh-predicate = { path = "../rbh-predicate" }
 rbh-observability = { path = "../rbh-observability" }
 rbh-namespace = { path = "../rbh-namespace" }
 lustre-api = { path = "../lustre-api" }
-scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", features = ["sqlx-mysql"] }
 
 axum = { version = "0.8", features = ["json"] }
 futures-util = { workspace = true }
