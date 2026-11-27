@@ -1,4 +1,8 @@
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use lustre_api::{
@@ -8,15 +12,24 @@ use lustre_api::{
         VerifiedPlacement,
     },
 };
-use rbh_entry_store::{EntryKey, EntryStore, FileSystemId, ObjectId};
+use rbh_entry_store::{BackendKind, EntryKey, EntryStore, FileSystemId, ObjectId};
 use serde_json::json;
 use sqlx::{MySql, QueryBuilder, Transaction, types::Json};
 
 use super::{
-    Candidate, Dispatch, Generation, Invocation, PolicyError, PolicyStore, Rev8Operation, current_revision, decode_fid,
-    elapsed_ms, lock_permit, short_reason, verify_worker_permit,
+    BATCH_SIZE, Candidate, Dispatch, Generation, Invocation, PolicyError, PolicyStore, Rev8Operation, current_revision,
+    decode_fid, elapsed_ms, lock_permit, short_reason, verify_worker_permit,
 };
 use crate::rev8::{ActionKind, BudgetLimits, heat, push_expression, resources::safety_matches};
+
+pub(in crate::store) struct PoolRecovery {
+    operation: Rev8Operation,
+    filesystem: FileSystemId,
+    fid: LuFid,
+    mount: PathBuf,
+    expected: FileVersion,
+    task: JoinHandle<(Result<MigrationPlacement, MigrationError>, MigrationOwnership)>,
+}
 
 impl PolicyStore {
     pub(super) async fn admit_pool_migration(
@@ -135,9 +148,9 @@ impl PolicyStore {
         finish_migration(self, operation, "submitting", state, reason, evidence).await
     }
 
-    pub(super) async fn reconcile_pool_operation(
-        &self, entries: &EntryStore, filesystem: &FileSystemId, operation: &Rev8Operation,
-    ) -> Result<(), PolicyError> {
+    pub(super) async fn start_pool_recovery(
+        &self, entries: &EntryStore, filesystem: FileSystemId, operation: Rev8Operation,
+    ) -> Result<bool, PolicyError> {
         let fid = decode_fid(&operation.fid)?;
         let plan = operation
             .migration_plan
@@ -145,35 +158,127 @@ impl PolicyStore {
             .ok_or_else(|| PolicyError::Store("pending migration has no layout plan".into()))?
             .0
             .clone();
-        let generation = operation
+        let generation = &operation
             .generation
             .as_ref()
             .ok_or_else(|| PolicyError::Store("pending migration has no source generation".into()))?
-            .0
-            .clone();
-        let expected = file_version(&generation);
-        let result = if let Some(config) = entries
-            .get_filesystem(filesystem)
+            .0;
+        let expected = file_version(generation);
+        let Some(config) = entries
+            .get_filesystem(&filesystem)
             .await
             .map_err(|error| PolicyError::Store(error.to_string()))?
-            && config.backend == rbh_entry_store::BackendKind::Lustre
-        {
-            tokio::task::spawn_blocking(move || {
-                LustreApi.reconcile_pool_migration(
-                    &config.mount_path,
-                    &fid,
-                    &plan,
-                    expected,
-                    &generation.filesystem_name,
-                )
+            .filter(|config| config.backend == BackendKind::Lustre)
+        else {
+            finish_migration(
+                self,
+                operation.id,
+                &operation.state,
+                "unknown",
+                Some("filesystem_unavailable".into()),
+                None,
+            )
+            .await?;
+            return Ok(false);
+        };
+        let ownership = match MigrationOwnership::acquire(&generation.filesystem_name) {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                tracing::debug!(%filesystem, %fid, operation_id = operation.id, %error, "pool recovery waiting for migration ownership");
+                // Let later journal entries through while the previous worker
+                // still owns this Lustre filesystem.
+                sqlx::query("UPDATE rev8_operations SET checked_at = UTC_TIMESTAMP(6) WHERE id = ?")
+                    .bind(operation.id)
+                    .execute(&self.pool)
+                    .await?;
+                return Ok(false);
+            }
+        };
+        let mount = config.mount_path;
+        let observation_mount = mount.clone();
+        // Recovery only observes placement. A stalled Lustre call must not
+        // hold Tokio's runtime open during daemon shutdown.
+        let task = thread::Builder::new()
+            .name("rev8-pool-recovery".into())
+            .spawn(move || {
+                let result =
+                    LustreApi.reconcile_reserved_pool_migration(&observation_mount, &fid, &plan, expected, &ownership);
+                (result, ownership)
             })
+            .map_err(|error| PolicyError::Store(format!("start pool recovery worker: {error}")))?;
+        self.pool_recoveries.lock().await.insert(
+            operation.id,
+            PoolRecovery {
+                operation,
+                filesystem,
+                fid,
+                mount,
+                expected,
+                task,
+            },
+        );
+        Ok(true)
+    }
+
+    pub(super) async fn finish_pool_recoveries(&self, entries: &EntryStore) -> Result<(), PolicyError> {
+        // Read-only Lustre calls may block. Only join finished observations
+        // while holding the catalog-wide dispatch permit.
+        let finished: Vec<_> = self
+            .pool_recoveries
+            .lock()
             .await
-            .map_err(|error| PolicyError::Store(error.to_string()))?
-        } else {
-            Err(MigrationError::Deferred("filesystem_unavailable"))
+            .iter()
+            .filter(|(_, recovery)| recovery.task.is_finished())
+            .take(BATCH_SIZE)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in finished {
+            let recovery = self.pool_recoveries.lock().await.remove(&id);
+            if let Some(recovery) = recovery {
+                self.finish_pool_recovery(entries, recovery).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_pool_recovery(&self, entries: &EntryStore, recovery: PoolRecovery) -> Result<(), PolicyError> {
+        let PoolRecovery {
+            operation,
+            filesystem,
+            fid,
+            mount,
+            expected,
+            task,
+        } = recovery;
+        // Another daemon may have settled the operation while this worker
+        // was observing. Validate the journal and mount before publishing.
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM rev8_operations
+             WHERE id = ? AND pending_migration_fs IS NOT NULL AND state = ? AND checked_at <=> ?)",
+        )
+        .bind(operation.id)
+        .bind(&operation.state)
+        .bind(operation.checked_at)
+        .fetch_one(&self.pool)
+        .await?;
+        if !current
+            || !entries
+                .get_filesystem(&filesystem)
+                .await
+                .map_err(|error| PolicyError::Store(error.to_string()))?
+                .is_some_and(|config| config.backend == BackendKind::Lustre && config.mount_path == mount)
+        {
+            return Ok(());
+        }
+        let (result, _ownership) = match task.join() {
+            Ok((result, ownership)) => (result, Some(ownership)),
+            Err(_) => (
+                Err(MigrationError::Uncertain("migration_recovery_worker_panicked".into())),
+                None,
+            ),
         };
         let (state, reason, evidence) = match result {
-            Ok(MigrationPlacement::Target(layout)) => settle_layout(entries, filesystem, fid, *layout, expected).await,
+            Ok(MigrationPlacement::Target(layout)) => settle_layout(entries, &filesystem, fid, *layout, expected).await,
             Ok(MigrationPlacement::SourceUnchanged) => {
                 ("deferred", Some("swap_not_observed_in_source_pool".into()), None)
             }

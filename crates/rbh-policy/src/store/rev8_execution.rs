@@ -1,4 +1,5 @@
 mod migration;
+pub(super) use migration::PoolRecovery;
 
 use std::{
     collections::BTreeMap,
@@ -34,7 +35,8 @@ const RUN_FIELDS: &str =
      heat_deferred_by_reason";
 const OPERATION_FIELDS: &str =
     "o.id, o.run_id, r.policy_id, r.revision, o.filesystem, o.fid, o.action, o.archive_id, o.state,
-     o.reason, o.attempted, o.generation, o.principal, o.size, o.accepted_at, o.completion_evidence, o.migration_plan";
+     o.reason, o.attempted, o.generation, o.principal, o.size, o.accepted_at, o.completion_evidence, o.migration_plan,
+     o.checked_at";
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +77,8 @@ pub struct Rev8Operation {
     pub completion_evidence: Option<Json<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration_plan: Option<Json<MigrationPlan>>,
+    #[serde(skip)]
+    checked_at: Option<DateTime<Utc>>,
 }
 
 fn serialize_fid<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -870,17 +874,36 @@ impl PolicyStore {
     }
 
     async fn reconcile_operations(&self, entries: &EntryStore) -> Result<(), PolicyError> {
-        let pending: Vec<Rev8Operation> = sqlx::query_as(&format!(
+        self.finish_pool_recoveries(entries).await?;
+        let mut query = QueryBuilder::new(format!(
             "SELECT {OPERATION_FIELDS} FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id
-             WHERE o.pending_fid IS NOT NULL ORDER BY o.checked_at, o.id LIMIT {BATCH_SIZE}"
-        ))
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE o.pending_fid IS NOT NULL"
+        ));
+        let mut recovery_slots = {
+            let recoveries = self.pool_recoveries.lock().await;
+            let slots = BATCH_SIZE.saturating_sub(recoveries.len());
+            if slots == 0 {
+                query.push(" AND o.pending_migration_fs IS NULL");
+            } else if !recoveries.is_empty() {
+                let mut ids = query.push(" AND o.id NOT IN (").separated(", ");
+                for id in recoveries.keys().copied() {
+                    ids.push_bind(id);
+                }
+                ids.push_unseparated(")");
+            }
+            slots
+        };
+        query
+            .push(" ORDER BY o.checked_at, o.id LIMIT ")
+            .push_bind(BATCH_SIZE as u32);
+        let pending: Vec<Rev8Operation> = query.build_query_as().fetch_all(&self.pool).await?;
         for operation in pending {
             let filesystem = rbh_entry_store::FileSystemId::new(&operation.filesystem)
                 .map_err(|error| PolicyError::Store(error.to_string()))?;
             if operation.action == ActionKind::PoolMigrate.name() {
-                self.reconcile_pool_operation(entries, &filesystem, &operation).await?;
+                if recovery_slots > 0 && self.start_pool_recovery(entries, filesystem, operation).await? {
+                    recovery_slots -= 1;
+                }
                 continue;
             }
             let action =

@@ -342,8 +342,15 @@ impl LustreApi {
     pub fn reconcile_pool_migration(
         &self, mount: &Path, fid: &LuFid, plan: &MigrationPlan, expected: FileVersion, filesystem_name: &str,
     ) -> Result<MigrationPlacement, MigrationError> {
-        let _ownership = MigrationOwnership::acquire(filesystem_name)?;
-        if self.hsm_filesystem(mount)? != filesystem_name {
+        let ownership = MigrationOwnership::acquire(filesystem_name)?;
+        self.reconcile_reserved_pool_migration(mount, fid, plan, expected, &ownership)
+    }
+
+    /// Observe placement using ownership already acquired by the caller.
+    pub fn reconcile_reserved_pool_migration(
+        &self, mount: &Path, fid: &LuFid, plan: &MigrationPlan, expected: FileVersion, ownership: &MigrationOwnership,
+    ) -> Result<MigrationPlacement, MigrationError> {
+        if self.hsm_filesystem(mount)? != ownership.0 {
             return Err(MigrationError::Deferred("filesystem_identity_changed"));
         }
         let Some(src) = open_source(mount, fid)? else {
