@@ -4,7 +4,8 @@ use chrono::Utc;
 use lustre_api::{
     LuFid, LustreApi,
     migration::{
-        FileVersion, MigrationError, MigrationOwnership, MigrationPlacement, MigrationPlan, VerifiedPlacement,
+        FileVersion, MigrationError, MigrationLimits, MigrationOwnership, MigrationPlacement, MigrationPlan,
+        VerifiedPlacement,
     },
 };
 use rbh_entry_store::{EntryKey, EntryStore, FileSystemId, ObjectId};
@@ -94,15 +95,19 @@ impl PolicyStore {
             Err(MigrationError::Deferred("admission_window_closed"))
         } else if let Some(deadline) = migration_deadline(dispatch) {
             let expected = file_version(generation);
+            let limits = MigrationLimits {
+                deadline,
+                before_swap: dispatch.admission.migration_window_check(),
+            };
             // Moving this guard into the closure retains ownership for the
-            // real blocking operation, even if the scheduler loses its waiter.
-            match tokio::task::spawn_blocking(move || {
-                LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, deadline, ownership)
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => Err(MigrationError::Uncertain(error.to_string())),
+            // real blocking operation, even after the run budget expires.
+            let migration = tokio::task::spawn_blocking(move || {
+                LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, ownership)
+            });
+            match tokio::time::timeout_at(deadline.into(), migration).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(MigrationError::Uncertain(error.to_string())),
+                Err(_) => Err(MigrationError::Uncertain("migration_deadline_pending".into())),
             }
         } else {
             Err(MigrationError::Deferred("migration_deadline_elapsed"))

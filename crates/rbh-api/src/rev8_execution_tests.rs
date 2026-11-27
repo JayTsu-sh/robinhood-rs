@@ -36,6 +36,9 @@ struct HsmFixture {
     interrupt_request: AtomicBool,
     reject_request: AtomicBool,
     sent: Notify,
+    hold_observation: Mutex<Option<LuFid>>,
+    observation_started: Notify,
+    resume_observation: Notify,
 }
 
 #[async_trait::async_trait]
@@ -49,6 +52,14 @@ impl NativeHsm for HsmFixture {
     }
 
     async fn observe(&self, _: &Path, fid: LuFid) -> Result<Option<Observation>, String> {
+        let held = {
+            let mut hold = self.hold_observation.lock().unwrap();
+            *hold == Some(fid) && hold.take().is_some()
+        };
+        if held {
+            self.observation_started.notify_one();
+            self.resume_observation.notified().await;
+        }
         Ok(self.files.lock().unwrap().get(&fid).cloned())
     }
 
@@ -412,6 +423,33 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     assert_eq!(runs[0]["candidateCount"], 2);
     assert_eq!(env.submitted().len(), 1);
 
+    // Let an older manual preview take the worker's first slot, leaving
+    // the periodic one-shot queued when its safety bindings change.
+    preview_only["metadata"]["name"] = format!("{}-queued-preview", env.filesystem).into();
+    let queued_preview = env.create(&preview_only).await;
+    let mut earlier = preview_only.clone();
+    earlier["metadata"]["name"] = format!("{}-earlier-preview", env.filesystem).into();
+    earlier["spec"]["trigger"] = json!({"type": "manual"});
+    let earlier = env.create(&earlier).await;
+    env.queue(earlier).await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    env.tick().await;
+    let queued_url = format!("/api/policies/{queued_preview}/runs");
+    let runs = server.get(&queued_url).await.json::<Vec<Value>>();
+    assert_eq!(runs[0]["state"], "queued");
+    safety["spec"]["limits"]["maxUnknownOutstanding"] = 4.into();
+    server.put(&safety_url).json(&safety).await.assert_status_ok();
+    env.tick().await;
+    env.tick().await;
+    let runs = server.get(&queued_url).await.json::<Vec<Value>>();
+    assert_eq!(
+        runs.len(),
+        2,
+        "a queued automatic one-shot must follow the new safety revision"
+    );
+    assert_eq!(runs[0]["state"], "cancelled");
+    assert_eq!(runs[1]["state"], "previewed");
+
     // Denying approval explicitly prevents a previously valid unattended policy
     // from being enabled against the newly bound revision.
     approval["spec"]["requirements"][0]["mode"] = "deny".into();
@@ -507,4 +545,44 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
             .states
             .contains(HsmState::NOARCHIVE)
     );
+
+    // Rebind while the first batch is observing a file, before any submit.
+    // The old batch records a deferral and the new revision gets one attempt.
+    env.hsm.reject_request.store(false, Ordering::SeqCst);
+    let racing = env.file(3, 512, HsmState::empty(), 0).await;
+    let mut racing_policy = policy.clone();
+    racing_policy["metadata"]["name"] = format!("{}-racing-one-shot", env.filesystem).into();
+    racing_policy["spec"]["enabled"] = true.into();
+    racing_policy["spec"]["trigger"] = json!({"type": "periodic", "interval": "1ms"});
+    racing_policy["spec"]["mode"] = "one_shot".into();
+    racing_policy["spec"]["rules"]["entries"][0]["match"] = json!({"field": "object.size", "op": "eq", "value": 512});
+    let racing_id = env.create(&racing_policy).await;
+    *env.hsm.hold_observation.lock().unwrap() = Some(racing);
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let running = {
+        let entries = env.entries.clone();
+        let store = env.stores.clone();
+        tokio::spawn(async move { store.process_rev8(&entries).await })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        env.hsm.observation_started.notified(),
+    )
+    .await
+    .unwrap();
+    safety["spec"]["limits"]["maxUnknownOutstanding"] = 5.into();
+    server.put(&safety_url).json(&safety).await.assert_status_ok();
+    env.hsm.resume_observation.notify_one();
+    running.await.unwrap().unwrap();
+    env.tick().await;
+    let racing_runs = server
+        .get(&format!("/api/policies/{racing_id}/runs"))
+        .await
+        .json::<Vec<Value>>();
+    assert_eq!(racing_runs.len(), 2);
+    assert_eq!(racing_runs[0]["state"], "cancelled");
+    assert_eq!(racing_runs[1]["revision"], 2);
+    assert_eq!(racing_runs[1]["state"], "finished");
+    assert_eq!(env.submitted().last(), Some(&(racing, ActionKind::Archive, 17)));
+    assert_eq!(env.submitted().len(), call_count + 1);
 }

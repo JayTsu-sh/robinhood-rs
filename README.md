@@ -255,6 +255,8 @@ from enabled policies and from other selectors block resource deletion.
 Register the Lustre mount with HSM, stripe and OST capabilities. A pool
 migration policy has a periodic trigger and one pool pair on that filesystem.
 The action contract is available at `GET /api/action-contracts/lustre.pool_migrate`.
+When using the packaged systemd unit, allow writes to the executor mount.
+[Configure the service drop-in](packaging/README.md#enable-pool-migration-under-systemd).
 For example, use these fields in a Rev.8 policy:
 
 ```json
@@ -301,8 +303,10 @@ For existing observed layouts, the upgrade starts the clock at upgrade time.
 The first release handles online regular files with an initialized
 single-component RAID0 layout.
 
-The blocking copy checks the deadline between I/O calls. An I/O call already
-inside Lustre retains its filesystem slot until it exits and can be reconciled.
+The blocking copy checks the deadline between I/O calls and rechecks the
+admission window before swapping layouts. If an I/O call outlasts the run
+budget, the worker records an uncertain result and resumes ticking. The
+blocking call retains its filesystem slot until it exits and can be reconciled.
 A completed operation includes the actual pool and OSTs from a fresh open by
 FID. If the catalog write fails, the pending operation retains the slot and
 the restarted daemon reconciles the live layout before any new migration.

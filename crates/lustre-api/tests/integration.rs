@@ -164,7 +164,7 @@ fn hsm_state_get_on_plain_file() {
 
 #[test]
 fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
-    use lustre_api::migration::{FileVersion, MigrationPlacement, MigrationPlan};
+    use lustre_api::migration::{FileVersion, MigrationLimits, MigrationOwnership, MigrationPlacement, MigrationPlan};
     use std::os::unix::fs::{FileExt, MetadataExt};
     use std::time::{Duration, Instant};
 
@@ -205,6 +205,52 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
         ))
     ));
     assert_eq!(api.migration_source_layout(mount, &fid).unwrap(), stripe);
+    let fsname = api.hsm_filesystem(mount).unwrap();
+    let limits = MigrationLimits {
+        deadline: Instant::now() + Duration::from_secs(15),
+        before_swap: || false,
+    };
+    assert!(matches!(
+        api.migrate_reserved_pool(
+            mount,
+            &fid,
+            &plan,
+            generation,
+            limits,
+            MigrationOwnership::acquire(&fsname).unwrap()
+        ),
+        Err(lustre_api::migration::MigrationError::Deferred(
+            "admission_window_closed"
+        ))
+    ));
+    assert_eq!(api.migration_source_layout(mount, &fid).unwrap(), stripe);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let entered = std::cell::Cell::new(false);
+    let limits = MigrationLimits {
+        deadline,
+        before_swap: || {
+            entered.set(true);
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            true
+        },
+    };
+    assert!(matches!(
+        api.migrate_reserved_pool(
+            mount,
+            &fid,
+            &plan,
+            generation,
+            limits,
+            MigrationOwnership::acquire(&fsname).unwrap()
+        ),
+        Err(lustre_api::migration::MigrationError::Deferred(
+            "migration_deadline_elapsed"
+        ))
+    ));
+    assert!(entered.get(), "the final check must have crossed the deadline");
+    assert_eq!(api.migration_source_layout(mount, &fid).unwrap(), stripe);
+
     let target = api
         .migrate_pool(mount, &fid, &plan, generation, Instant::now() + Duration::from_secs(15))
         .unwrap();
@@ -215,7 +261,6 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
             .unwrap()
             .contains(&target.layout.stripe_items[0])
     );
-    let fsname = api.hsm_filesystem(mount).unwrap();
     assert!(matches!(
         api.reconcile_pool_migration(mount, &fid, &plan, generation, &fsname)
             .unwrap(),

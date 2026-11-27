@@ -197,6 +197,14 @@ impl Admission {
         self.windows.iter().all(|window| window.contains(now))
     }
 
+    pub(crate) fn migration_window_check(&self) -> impl FnOnce() -> bool + Send + use<> {
+        let windows = self.windows.clone();
+        move || {
+            let now = Utc::now();
+            windows.iter().all(|window| window.contains(now))
+        }
+    }
+
     pub(crate) fn authorize(&self, filesystem: &str, invocation: &Invocation) -> Decision {
         self.authorize_archive_id(&self.statements(filesystem, invocation.kind), invocation.archive_id)
     }

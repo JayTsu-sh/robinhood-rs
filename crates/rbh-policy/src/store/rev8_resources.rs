@@ -327,10 +327,22 @@ async fn rebind_safety(tx: &mut Transaction<'_, MySql>, actor: &str) -> Result<(
             continue;
         }
         check_approval_floor(tx, &revised, &safety, filesystem, actions.into_iter()).await?;
-        sqlx::query("UPDATE policies SET revision = revision + 1 WHERE id = ?")
-            .bind(policy.id)
-            .execute(&mut **tx)
-            .await?;
+        // A due one-shot loses its timer when it is queued. Wake the new
+        // revision if the old timer already fired. The enqueue path checks
+        // whether that definition has already evaluated or dispatched work.
+        sqlx::query(
+            "UPDATE policies SET revision = revision + 1, rev8_next_run = CASE
+                WHEN rev8_next_run IS NULL AND JSON_UNQUOTE(JSON_EXTRACT(definition, '$.spec.mode')) = 'one_shot'
+                AND EXISTS (
+                    SELECT 1 FROM rev8_runs WHERE policy_id = ? AND revision = ?
+                    AND requested_by IS NULL AND state IN ('queued', 'running')
+                ) THEN UTC_TIMESTAMP(6) ELSE rev8_next_run END WHERE id = ?",
+        )
+        .bind(policy.id)
+        .bind(policy.revision)
+        .bind(policy.id)
+        .execute(&mut **tx)
+        .await?;
         record_rev8_revision(tx, policy.id, revised, actor).await?;
     }
     Ok(())

@@ -319,17 +319,17 @@ impl PolicyStore {
         &self, entries: &EntryStore, mut run: Rev8Run, worker: &mut Transaction<'_, MySql>,
     ) -> Result<(), PolicyError> {
         let Some(row) = self.get_rev8(run.policy_id).await? else {
-            return self.finish_run(run.id, "cancelled", Some("policy_deleted"), None).await;
+            return self.finish_run(&run, "cancelled", Some("policy_deleted"), None).await;
         };
         if row.revision != run.revision || row.definition["spec"]["enabled"] == false {
             return self
-                .finish_run(run.id, "cancelled", Some("policy_revision_inactive"), None)
+                .finish_run(&run, "cancelled", Some("policy_revision_inactive"), None)
                 .await;
         }
         let policy = rev8::parse(&row.definition)?;
         if self.ensure_configured(policy.filesystem()).is_err() {
             return self
-                .finish_run(run.id, "deferred", Some("filesystem_not_configured"), None)
+                .finish_run(&run, "deferred", Some("filesystem_not_configured"), None)
                 .await;
         }
         let bindings = row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default();
@@ -341,7 +341,7 @@ impl PolicyStore {
             {
                 Ok(preview) => Some(preview),
                 Err(PolicyError::InvalidPolicy(reason)) => {
-                    return self.finish_run(run.id, "deferred", Some(&reason), None).await;
+                    return self.finish_run(&run, "deferred", Some(&reason), None).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -350,38 +350,48 @@ impl PolicyStore {
         };
         let now = Utc::now();
         if let Some(preview) = preview {
-            let state = if policy.enforced { "running" } else { "previewed" };
+            let mut tx = self.pool.begin().await?;
+            let active = current_revision(&mut tx, &run).await?;
+            let (state, reason) = if !active {
+                ("cancelled", Some("policy_revision_inactive"))
+            } else if policy.enforced {
+                ("running", None)
+            } else {
+                ("previewed", None)
+            };
             sqlx::query(
-                "UPDATE rev8_runs SET state = ?, candidate_count = ?, estimated_bytes = ?, started_at = ?,
+                "UPDATE rev8_runs SET state = ?, reason = ?, candidate_count = ?, estimated_bytes = ?, started_at = ?,
                  heat_deferred_by_reason = ? WHERE id = ?",
             )
             .bind(state)
+            .bind(reason)
             .bind(preview.candidate_count)
             .bind(preview.estimated_bytes)
             .bind(now)
             .bind(preview.read_heat.map(|heat| Json(heat.deferred_by_reason)))
             .bind(run.id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-            if !policy.enforced {
+            tx.commit().await?;
+            if !active || !policy.enforced {
                 return Ok(());
             }
         }
         run.started_at.get_or_insert(now);
         let Some(runtime) = self.runtime.as_ref() else {
             return self
-                .finish_run(run.id, "deferred", Some("workload_identity_unavailable"), None)
+                .finish_run(&run, "deferred", Some("workload_identity_unavailable"), None)
                 .await;
         };
         let config = match rev8::validate_filesystem(entries, &policy.filesystem).await {
             Ok(config) => config,
             Err(PolicyError::InvalidPolicy(reason)) => {
-                return self.finish_run(run.id, "deferred", Some(&reason), None).await;
+                return self.finish_run(&run, "deferred", Some(&reason), None).await;
             }
             Err(error) => return Err(error),
         };
         if let Err(PolicyError::InvalidPolicy(reason)) = policy.validate_capabilities(&config) {
-            return self.finish_run(run.id, "deferred", Some(&reason), None).await;
+            return self.finish_run(&run, "deferred", Some(&reason), None).await;
         }
         let mut tx = self.pool.begin().await?;
         let admission = Self::compile_admission(&mut tx, &policy, &bindings, runtime.principal.clone()).await;
@@ -389,29 +399,24 @@ impl PolicyStore {
         let admission = match admission {
             Ok(admission) => admission,
             Err(PolicyError::InvalidPolicy(reason)) => {
-                return self.finish_run(run.id, "deferred", Some(&reason), None).await;
+                return self.finish_run(&run, "deferred", Some(&reason), None).await;
             }
             Err(error) => return Err(error),
         };
         if !self.synchronous_permit_store().await? {
             return self
-                .finish_run(
-                    run.id,
-                    "deferred",
-                    Some("permit_store_requires_synchronous_commit"),
-                    None,
-                )
+                .finish_run(&run, "deferred", Some("permit_store_requires_synchronous_commit"), None)
                 .await;
         }
         if !admission.window_open(Utc::now()) {
             return self
-                .finish_run(run.id, "deferred", Some("admission_window_closed"), None)
+                .finish_run(&run, "deferred", Some("admission_window_closed"), None)
                 .await;
         }
         let heat = if policy.uses_read_heat {
             let Some(profile) = self.read_heat.get(&policy.filesystem) else {
                 return self
-                    .finish_run(run.id, "deferred", Some(heat::NOT_CONFIGURED), None)
+                    .finish_run(&run, "deferred", Some(heat::NOT_CONFIGURED), None)
                     .await;
             };
             Some(profile)
@@ -429,8 +434,14 @@ impl PolicyStore {
     }
 
     async fn finish_run(
-        &self, id: u64, state: &str, reason: Option<&str>, heat_deferrals: Option<Json<BTreeMap<String, u64>>>,
+        &self, run: &Rev8Run, state: &str, reason: Option<&str>, heat_deferrals: Option<Json<BTreeMap<String, u64>>>,
     ) -> Result<(), PolicyError> {
+        let mut tx = self.pool.begin().await?;
+        let (state, reason) = if state != "cancelled" && !current_revision(&mut tx, run).await? {
+            ("cancelled", Some("policy_revision_inactive"))
+        } else {
+            (state, reason)
+        };
         sqlx::query(
             "UPDATE rev8_runs SET state = ?, reason = ?, updated_at = UTC_TIMESTAMP(6),
              heat_deferred_by_reason = COALESCE(?, heat_deferred_by_reason) WHERE id = ?",
@@ -438,9 +449,10 @@ impl PolicyStore {
         .bind(state)
         .bind(reason.map(short_reason))
         .bind(heat_deferrals)
-        .bind(id)
-        .execute(&self.pool)
+        .bind(run.id)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -513,12 +525,12 @@ impl PolicyStore {
         for candidate in &candidates {
             if !dispatch.admission.window_open(Utc::now()) {
                 return self
-                    .finish_run(run.id, "deferred", Some("admission_window_closed"), heat_deferrals)
+                    .finish_run(run, "deferred", Some("admission_window_closed"), heat_deferrals)
                     .await;
             }
             if self.breaker_open(run.policy_id, &dispatch.admission.profile).await? {
                 return self
-                    .finish_run(run.id, "deferred", Some("policy_circuit_breaker_open"), heat_deferrals)
+                    .finish_run(run, "deferred", Some("policy_circuit_breaker_open"), heat_deferrals)
                     .await;
             }
             let invocation = policy.actions[candidate.branch as usize - 1].clone();
@@ -528,7 +540,7 @@ impl PolicyStore {
             ).bind(run.id).fetch_all(&self.pool).await?;
             if usage_for_scope(&stats, policy.filesystem.as_str(), None).exhausted(policy.budget, elapsed_ms(run)) {
                 return self
-                    .finish_run(run.id, "finished", Some("policy_run_budget"), heat_deferrals)
+                    .finish_run(run, "finished", Some("policy_run_budget"), heat_deferrals)
                     .await;
             }
             if let Some(block) = self
@@ -536,7 +548,7 @@ impl PolicyStore {
                 .await?
             {
                 if policy.one_shot && block.is_capacity() {
-                    return self.finish_run(run.id, "running", Some(block.reason()), None).await;
+                    return self.finish_run(run, "running", Some(block.reason()), None).await;
                 }
                 self.record_deferred(&dispatch, candidate, &invocation, block.reason())
                     .await?;
@@ -544,18 +556,30 @@ impl PolicyStore {
             }
             self.admit_candidate(&dispatch, candidate, invocation, worker).await?;
         }
+        // A stale batch without submissions must not consume a one-shot that
+        // was rescheduled when its bound safety revision changed.
+        let mut tx = self.pool.begin().await?;
+        let (state, reason) = if !current_revision(&mut tx, run).await? {
+            ("cancelled", Some("policy_revision_inactive"))
+        } else if through.is_none() {
+            ("finished", None)
+        } else {
+            ("running", None)
+        };
         sqlx::query(
             "UPDATE rev8_runs
-             SET cursor_id = ?, state = IF(? IS NULL, 'finished', 'running'), reason = NULL,
+             SET cursor_id = ?, state = ?, reason = ?,
                  heat_deferred_by_reason = COALESCE(?, heat_deferred_by_reason), updated_at = UTC_TIMESTAMP(6)
              WHERE id = ?",
         )
         .bind(through)
-        .bind(through)
+        .bind(state)
+        .bind(reason)
         .bind(heat_deferrals)
         .bind(run.id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 

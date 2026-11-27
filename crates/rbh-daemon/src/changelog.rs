@@ -28,6 +28,16 @@ use rbh_entry_store::store::EntryStore;
 
 const CATCHUP_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
+#[derive(Debug, thiserror::Error)]
+enum LustreIngestError {
+    #[error(transparent)]
+    Store(#[from] rbh_entry_store::StoreError),
+    #[error("Lustre layout read failed: {0}")]
+    Layout(#[from] lustre_api::LustreApiError),
+    #[error("Lustre metadata worker failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestExit {
     Stopped,
@@ -656,7 +666,7 @@ fn lustre_event(change: &Change) -> anyhow::Result<ChangelogEvent> {
 /// Returns `Ok(true)` if the store was modified, `Ok(false)` if skipped.
 async fn apply_event(
     store: &EntryStore, filesystem: &FileSystemId, mount: &Path, event: &ChangelogEvent, event_time: i64,
-) -> anyhow::Result<bool> {
+) -> Result<bool, LustreIngestError> {
     match event {
         // ── Creation events: stat the new file and upsert ──
         ChangelogEvent::Create { fid, parent, name, .. }
@@ -834,7 +844,7 @@ async fn apply_event(
 
 async fn refresh_lustre_layout(
     store: &EntryStore, filesystem: &FileSystemId, mount: &Path, fid: &lustre_api::LuFid,
-) -> anyhow::Result<bool> {
+) -> Result<bool, LustreIngestError> {
     let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
     if !store
         .get_scoped_entry(&key)
@@ -903,7 +913,7 @@ fn build_hsm_patch(hsm_event: u8, hsm_flags: u8, hsm_error: u8, now: i64) -> ser
 
 async fn apply_hsm_event(
     store: &EntryStore, filesystem: &FileSystemId, fid: &lustre_api::LuFid, hsm_event: u8, hsm_flags: u8, hsm_error: u8,
-) -> anyhow::Result<bool> {
+) -> Result<bool, LustreIngestError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1599,7 +1609,7 @@ async fn refresh_hsm_state_if_managed(
 async fn restat_entry(
     store: &EntryStore, filesystem: &FileSystemId, mount: &Path, fid: &lustre_api::LuFid,
     parent: Option<lustre_api::LuFid>, name: Bytes,
-) -> anyhow::Result<bool> {
+) -> Result<bool, LustreIngestError> {
     if let Some(mut entry) = store.get_lustre_entry(filesystem, fid).await? {
         // Re-stat via FID path for fresh metadata.
         let lustre = LustreApi;
