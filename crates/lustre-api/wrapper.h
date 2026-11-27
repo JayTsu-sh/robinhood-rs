@@ -9,3 +9,6 @@
  */
 #include <lustre/lustreapi.h>
 #include <lustre/lustre_user.h>
+#include <sys/ioctl.h>
+
+enum { RBH_LL_IOC_HSM_REQUEST = LL_IOC_HSM_REQUEST };

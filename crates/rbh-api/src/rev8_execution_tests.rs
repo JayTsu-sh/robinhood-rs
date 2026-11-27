@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ops::ControlFlow,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -19,7 +20,9 @@ use rbh_policy::{
     PolicyStore,
     rev8::{
         ActionKind, Invocation,
-        execution::{Generation, NativeHsm, Observation, Principal, Runtime, Submission, TerminalError},
+        execution::{
+            Generation, NativeHsm, Observation, Principal, Runtime, Submission, SubmissionGate, TerminalError,
+        },
     },
 };
 use serde_json::{Value, json};
@@ -39,6 +42,9 @@ struct HsmFixture {
     hold_observation: Mutex<Option<LuFid>>,
     observation_started: Notify,
     resume_observation: Notify,
+    hold_submission: AtomicBool,
+    submission_started: Notify,
+    resume_submission: Notify,
 }
 
 #[async_trait::async_trait]
@@ -63,7 +69,14 @@ impl NativeHsm for HsmFixture {
         Ok(self.files.lock().unwrap().get(&fid).cloned())
     }
 
-    async fn submit(&self, _: &Path, fid: LuFid, invocation: Invocation) -> Submission {
+    async fn submit(&self, _: &Path, fid: LuFid, invocation: Invocation, gate: SubmissionGate) -> Submission {
+        if self.hold_submission.swap(false, Ordering::SeqCst) {
+            self.submission_started.notify_one();
+            self.resume_submission.notified().await;
+        }
+        if let ControlFlow::Break(reason) = gate.check() {
+            return Submission::Deferred(reason);
+        }
         self.submitted
             .lock()
             .unwrap()
@@ -585,4 +598,38 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     assert_eq!(racing_runs[1]["state"], "finished");
     assert_eq!(env.submitted().last(), Some(&(racing, ActionKind::Archive, 17)));
     assert_eq!(env.submitted().len(), call_count + 1);
+
+    // Clear the prior Archive's outstanding slot before testing a new FID.
+    env.hsm.files.lock().unwrap().get_mut(&racing).unwrap().state = HsmUserStateInfo {
+        states: copies,
+        archive_id: 17,
+        ..Default::default()
+    };
+    let late = env.file(4, 1024, HsmState::empty(), 0).await;
+    let mut budgeted = env.policy("budgeted", archive);
+    budgeted["spec"]["execution"]["budget"]["run"]["maxDuration"] = "2s".into();
+    budgeted["spec"]["rules"]["entries"][0]["match"] = json!({"field": "object.size", "op": "eq", "value": 1024});
+    budgeted["spec"]["rules"]["entries"][0]["action"]["params"] = json!({"archiveId": 17});
+    let budgeted_id = env.create(&budgeted).await;
+    let late_run = env.queue(budgeted_id).await;
+    env.hsm.hold_submission.store(true, Ordering::SeqCst);
+    tokio::join!(env.tick(), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), env.hsm.submission_started.notified())
+            .await
+            .unwrap();
+        assert_eq!(env.operations(budgeted_id, late_run).await[0]["state"], "submitting");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        env.hsm.resume_submission.notify_one();
+    });
+    let operations = env.operations(budgeted_id, late_run).await;
+    assert_eq!(operations[0]["state"], "deferred");
+    assert_eq!(operations[0]["reason"], "policy_run_duration");
+    assert_eq!(operations[0]["attempted"], false);
+    assert!(operations[0]["acceptedAt"].is_null());
+    assert_eq!(env.submitted().len(), call_count + 1);
+
+    let next_run = env.queue(budgeted_id).await;
+    env.tick().await;
+    assert_eq!(env.operations(budgeted_id, next_run).await[0]["state"], "submitted");
+    assert_eq!(env.submitted().last(), Some(&(late, ActionKind::Archive, 17)));
 }

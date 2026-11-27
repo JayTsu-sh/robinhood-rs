@@ -197,7 +197,7 @@ impl Admission {
         self.windows.iter().all(|window| window.contains(now))
     }
 
-    pub(crate) fn migration_window_check(&self) -> impl FnOnce() -> bool + Send + use<> {
+    pub(crate) fn window_check(&self) -> impl Fn() -> bool + Send + use<> {
         let windows = self.windows.clone();
         move || {
             let now = Utc::now();

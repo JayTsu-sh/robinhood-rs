@@ -97,7 +97,7 @@ impl PolicyStore {
             let expected = file_version(generation);
             let limits = MigrationLimits {
                 deadline,
-                before_swap: dispatch.admission.migration_window_check(),
+                before_swap: dispatch.admission.window_check(),
             };
             // Moving this guard into the closure retains ownership for the
             // real blocking operation, even after the run budget expires.

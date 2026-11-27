@@ -2,10 +2,10 @@
 
 mod governance;
 
-use std::{os::unix::fs::MetadataExt, path::Path, sync::Arc};
+use std::{ops::ControlFlow, os::unix::fs::MetadataExt, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use lustre_api::{HsmAction, HsmState, HsmUserStateInfo, LuFid, LustreApi};
+use lustre_api::{HsmAction, HsmRequestBuilder, HsmState, HsmUserStateInfo, LuFid, LustreApi};
 use serde::{Deserialize, Serialize};
 
 use super::{ActionKind, Invocation};
@@ -55,11 +55,39 @@ pub struct Observation {
 #[derive(Debug)]
 pub enum Submission {
     Accepted,
+    Deferred(SubmissionDeferral),
     Rejected {
         error: String,
         class: Option<TerminalError>,
     },
     Unknown(String),
+}
+
+/// Admission can expire while the native backend prepares a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionDeferral {
+    WindowClosed,
+    PolicyRunDuration,
+    SystemSafetyRunDuration,
+}
+
+impl SubmissionDeferral {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::WindowClosed => "admission_window_closed",
+            Self::PolicyRunDuration => "policy_run_duration",
+            Self::SystemSafetyRunDuration => "system_safety_run_duration",
+        }
+    }
+}
+
+/// Recheck the current time against the admitted run immediately before submission.
+pub struct SubmissionGate(pub(crate) Box<dyn Fn() -> ControlFlow<SubmissionDeferral> + Send>);
+
+impl SubmissionGate {
+    pub fn check(&self) -> ControlFlow<SubmissionDeferral> {
+        (self.0)()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,7 +116,8 @@ impl TerminalError {
 pub trait NativeHsm: Send + Sync {
     async fn filesystem_name(&self, mount: &Path) -> Result<String, String>;
     async fn observe(&self, mount: &Path, fid: LuFid) -> Result<Option<Observation>, String>;
-    async fn submit(&self, mount: &Path, fid: LuFid, invocation: Invocation) -> Submission;
+    /// Apply the gate after blocking preparation and before issuing the request.
+    async fn submit(&self, mount: &Path, fid: LuFid, invocation: Invocation, gate: SubmissionGate) -> Submission;
 }
 
 pub struct LustreHsm;
@@ -142,8 +171,11 @@ impl NativeHsm for LustreHsm {
         .map_err(|error| error.to_string())?
     }
 
-    async fn submit(&self, mount: &Path, fid: LuFid, invocation: Invocation) -> Submission {
-        use lustre_api::error::LustreApiError::{Ffi, Hsm, Io};
+    async fn submit(&self, mount: &Path, fid: LuFid, invocation: Invocation, gate: SubmissionGate) -> Submission {
+        use lustre_api::error::{
+            HsmOp,
+            LustreApiError::{Ffi, Hsm, Io},
+        };
 
         let mount = mount.to_owned();
         let result = tokio::task::spawn_blocking(move || {
@@ -180,8 +212,30 @@ impl NativeHsm for LustreHsm {
             } else {
                 0
             };
-            match rbh_actions::submit_hsm(LustreApi, &mount, fid, action, archive_id, None) {
-                Ok(()) => Submission::Accepted,
+            let request = HsmRequestBuilder::new(action).archive_id(archive_id).add_fid(fid);
+            match request.submit_guarded(&mount, || gate.check()) {
+                Ok(ControlFlow::Continue(())) => Submission::Accepted,
+                Ok(ControlFlow::Break(reason)) => Submission::Deferred(reason),
+                Err(
+                    error @ Hsm {
+                        op: HsmOp::OpenRoot,
+                        errno,
+                        ..
+                    },
+                ) => {
+                    if let ControlFlow::Break(reason) = gate.check() {
+                        return Submission::Deferred(reason);
+                    }
+                    let class = if errno == libc::EIO {
+                        TerminalError::TransientIo
+                    } else {
+                        TerminalError::BackendUnavailable
+                    };
+                    Submission::Rejected {
+                        error: error.to_string(),
+                        class: Some(class),
+                    }
+                }
                 // The single-FID request failed validation or access checks.
                 Err(
                     error @ Hsm {

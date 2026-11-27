@@ -52,6 +52,7 @@ pub enum LustreApiError {
 /// Kind of HSM operation — used in `LustreApiError::Hsm` for telemetry attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HsmOp {
+    OpenRoot,
     StateGet,
     CurrentAction,
     StateSet,
@@ -81,15 +82,14 @@ pub(crate) fn check_rc(rc: c_int, op: &'static str) -> Result<()> {
 /// HSM-specific variant of [`check_rc`]. Produces `LustreApiError::Hsm` instead of
 /// `Ffi` so telemetry can distinguish HSM failures from changelog/MDT failures.
 pub(crate) fn check_rc_hsm(rc: c_int, op: HsmOp) -> Result<()> {
-    if rc < 0 {
-        let errno = -rc;
-        Err(LustreApiError::Hsm {
-            op,
-            errno,
-            strerror: strerror_for(errno),
-        })
-    } else {
-        Ok(())
+    if rc < 0 { Err(hsm_error(-rc, op)) } else { Ok(()) }
+}
+
+pub(crate) fn hsm_error(errno: c_int, op: HsmOp) -> LustreApiError {
+    LustreApiError::Hsm {
+        op,
+        errno,
+        strerror: strerror_for(errno),
     }
 }
 

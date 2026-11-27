@@ -12,9 +12,16 @@
 //! All HSM operations require `CAP_SYS_ADMIN` on the calling process (except
 //! [`LustreApi::hsm_state_get`] which is world-readable).
 
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::{
+    ffi::CString,
+    fs::OpenOptions,
+    ops::ControlFlow,
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    },
+    path::Path,
+};
 
 use core::mem::{MaybeUninit, size_of};
 
@@ -23,7 +30,7 @@ use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 
 use crate::LustreApi;
-use crate::error::{HsmOp, Result, check_rc_hsm};
+use crate::error::{HsmOp, Result, check_rc_hsm, hsm_error};
 use crate::fid::LuFid;
 use crate::sys;
 
@@ -179,6 +186,50 @@ impl HsmRequestBuilder {
         ),
     )]
     pub fn submit(&self, _api: &LustreApi, mount_path: &Path) -> Result<()> {
+        let buf = self.encode()?;
+        let c_path = CString::new(mount_path.as_os_str().as_bytes())?;
+        // SAFETY: c_path and the encoded variable-length request live through the FFI call.
+        let rc =
+            unsafe { sys::llapi_hsm_request(c_path.as_ptr(), buf.as_ptr() as *const sys::bindings::hsm_user_request) };
+        check_rc_hsm(rc, HsmOp::Request)
+    }
+
+    /// Submit on a verified Lustre root directory after checking admission.
+    ///
+    /// The gate runs after request encoding and the potentially blocking root
+    /// lookup. A break returns the supplied reason without issuing the ioctl.
+    #[tracing::instrument(name = "lustre.hsm_request_guarded", skip(self, before_ioctl), fields(action = ?self.action))]
+    pub fn submit_guarded<D>(
+        &self, mount_root: &Path, before_ioctl: impl FnOnce() -> ControlFlow<D>,
+    ) -> Result<ControlFlow<D>> {
+        let buf = self.encode()?;
+        // OpenOptions sets O_CLOEXEC atomically. The configured path already
+        // exposes the Lustre root, so no additional mount lookup is needed.
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(mount_root)
+            .map_err(|error| hsm_error(error.raw_os_error().unwrap_or(libc::EIO), HsmOp::OpenRoot))?;
+        if let ControlFlow::Break(reason) = before_ioctl() {
+            return Ok(ControlFlow::Break(reason));
+        }
+
+        // SAFETY: root is open and buf contains the complete hsm_user_request.
+        let rc = unsafe {
+            libc::ioctl(
+                root.as_raw_fd(),
+                sys::bindings::RBH_LL_IOC_HSM_REQUEST.into(),
+                buf.as_ptr(),
+            )
+        };
+        if rc < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+            return Err(hsm_error(errno, HsmOp::Request));
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn encode(&self) -> Result<BytesMut> {
         let header_size = size_of::<sys::bindings::hsm_request>();
         let item_size = size_of::<sys::bindings::hsm_user_item>();
         let total = header_size + self.fids.len() * item_size + self.data.len();
@@ -228,13 +279,7 @@ impl HsmRequestBuilder {
             }
         }
 
-        let c_path = CString::new(mount_path.as_os_str().as_bytes())?;
-        // SAFETY: buf is alive for the duration of the FFI call; we cast its
-        // pointer to the packed `hsm_user_request` type which is a prefix of
-        // the buffer (flex-array member).
-        let rc =
-            unsafe { sys::llapi_hsm_request(c_path.as_ptr(), buf.as_ptr() as *const sys::bindings::hsm_user_request) };
-        check_rc_hsm(rc, HsmOp::Request)
+        Ok(buf)
     }
 }
 
@@ -347,6 +392,28 @@ mod tests {
         assert!(!s.contains(HsmState::DIRTY));
         let raw = s.bits();
         assert_eq!(HsmState::from_bits_truncate(raw), s);
+    }
+
+    #[test]
+    fn guarded_hsm_request_checks_admission_between_root_open_and_ioctl() {
+        // A non-directory must fail to open even if the admission gate would break.
+        let request = HsmRequestBuilder::new(HsmAction::None);
+        let closed = || ControlFlow::Break("window closed");
+        let failed_open = request.submit_guarded(Path::new("/dev/null"), closed);
+        assert!(matches!(
+            failed_open,
+            Err(crate::error::LustreApiError::Hsm {
+                op: HsmOp::OpenRoot,
+                errno: libc::ENOTDIR,
+                ..
+            })
+        ));
+
+        // /dev is openable, but its ioctl handler cannot submit a Lustre request.
+        assert_eq!(
+            request.submit_guarded(Path::new("/dev"), closed).unwrap(),
+            ControlFlow::Break("window closed")
+        );
     }
 
     #[test]

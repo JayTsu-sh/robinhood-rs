@@ -1,6 +1,10 @@
 mod migration;
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    ops::ControlFlow,
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
 use lustre_api::{LuFid, migration::MigrationPlan};
@@ -14,7 +18,10 @@ use crate::{
     PolicyError,
     rev8::{
         self, ActionKind, BudgetLimits, CompiledPolicy, DB_EPOCH_MICROS, Invocation,
-        execution::{Admission, Decision, Generation, LustreHsm, NativeHsm, Profile, Submission},
+        execution::{
+            Admission, Decision, Generation, LustreHsm, NativeHsm, Profile, Submission, SubmissionDeferral,
+            SubmissionGate,
+        },
         heat::{self, HeatProfile},
         invalid, push_expression,
         resources::safety_matches,
@@ -775,10 +782,9 @@ impl PolicyStore {
             let live = self.backend().observe(mount, fid).await;
             match live {
                 Ok(Some(current)) if current.generation == snapshot.generation && current.state == snapshot.state => {
-                    if !dispatch.admission.window_open(Utc::now()) {
-                        ("deferred", false, Some("admission_window_closed".into()), None)
-                    } else if let Some(reason) = self.deadline_elapsed(dispatch, invocation.kind) {
-                        ("deferred", false, Some(reason.into()), None)
+                    let gate = native_submission_gate(dispatch, invocation.kind);
+                    if let ControlFlow::Break(reason) = gate.check() {
+                        ("deferred", false, Some(reason.reason().into()), None)
                     } else {
                         // Verify that the worker transaction still owns its lock.
                         // The committed operation reserves the FID and budget even
@@ -791,8 +797,9 @@ impl PolicyStore {
                                 None,
                             )
                         } else {
-                            match self.backend().submit(mount, fid, invocation).await {
+                            match self.backend().submit(mount, fid, invocation, gate).await {
                                 Submission::Accepted => ("submitted", true, None, None),
+                                Submission::Deferred(reason) => ("deferred", false, Some(reason.reason().into()), None),
                                 Submission::Rejected { error, class } => {
                                     ("failed", true, Some(error), class.map(|class| class.name()))
                                 }
@@ -812,24 +819,6 @@ impl PolicyStore {
             .bind(state).bind(state).bind(operation).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
-    }
-
-    fn deadline_elapsed(&self, dispatch: &Dispatch<'_>, action: ActionKind) -> Option<&'static str> {
-        let elapsed = elapsed_ms(dispatch.run);
-        if dispatch.policy.budget.duration_ms.is_some_and(|limit| elapsed >= limit) {
-            return Some("policy_run_duration");
-        }
-        dispatch
-            .admission
-            .safety
-            .iter()
-            .any(|scope| {
-                safety_matches(scope, dispatch.policy.filesystem.as_str(), action)
-                    && BudgetLimits::from_safety(scope)
-                        .duration_ms
-                        .is_some_and(|limit| elapsed >= limit)
-            })
-            .then_some("system_safety_run_duration")
     }
 
     async fn reserve_operation(
@@ -1002,6 +991,37 @@ fn elapsed_ms(run: &Rev8Run) -> u64 {
     (Utc::now() - run.started_at.expect("run started"))
         .num_milliseconds()
         .max(0) as u64
+}
+
+fn native_submission_gate(dispatch: &Dispatch<'_>, action: ActionKind) -> SubmissionGate {
+    // Anchor the persisted run age before blocking. A wall-clock step during
+    // preparation must not extend the remaining duration budgets.
+    let checked_at = Instant::now();
+    let already_elapsed = elapsed_ms(dispatch.run);
+    let remaining = |limit: u64| Duration::from_millis(limit.saturating_sub(already_elapsed));
+    let window_open = dispatch.admission.window_check();
+    let policy_limit = dispatch.policy.budget.duration_ms.map(remaining);
+    let safety_limit = dispatch
+        .admission
+        .safety
+        .iter()
+        .filter(|scope| safety_matches(scope, dispatch.policy.filesystem.as_str(), action))
+        .filter_map(|scope| BudgetLimits::from_safety(scope).duration_ms)
+        .min()
+        .map(remaining);
+    SubmissionGate(Box::new(move || {
+        if !window_open() {
+            return ControlFlow::Break(SubmissionDeferral::WindowClosed);
+        }
+        let elapsed = checked_at.elapsed();
+        if policy_limit.is_some_and(|limit| elapsed >= limit) {
+            return ControlFlow::Break(SubmissionDeferral::PolicyRunDuration);
+        }
+        if safety_limit.is_some_and(|limit| elapsed >= limit) {
+            return ControlFlow::Break(SubmissionDeferral::SystemSafetyRunDuration);
+        }
+        ControlFlow::Continue(())
+    }))
 }
 
 fn usage_for_scope(stats: &[Usage], filesystem: &str, scope: Option<&Value>) -> Usage {
