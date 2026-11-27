@@ -7,15 +7,15 @@ use lustre_api::{
         FileVersion, MigrationError, MigrationOwnership, MigrationPlacement, MigrationPlan, VerifiedPlacement,
     },
 };
-use rbh_entry_store::{EntryKey, EntryStore, FileSystemId, ObjectId, store::QueryParam};
+use rbh_entry_store::{EntryKey, EntryStore, FileSystemId, ObjectId};
 use serde_json::json;
-use sqlx::{MySql, Transaction, types::Json};
+use sqlx::{MySql, QueryBuilder, Transaction, types::Json};
 
 use super::{
     Candidate, Dispatch, Generation, Invocation, PolicyError, PolicyStore, Rev8Operation, current_revision, decode_fid,
     elapsed_ms, lock_permit, short_reason, verify_worker_permit,
 };
-use crate::rev8::{ActionKind, BudgetLimits, resources::safety_matches};
+use crate::rev8::{ActionKind, BudgetLimits, heat, push_expression, resources::safety_matches};
 
 impl PolicyStore {
     pub(super) async fn admit_pool_migration(
@@ -61,6 +61,13 @@ impl PolicyStore {
                 .or_else(|| u32::try_from(source.size).ok())
                 .ok_or_else(|| PolicyError::Store("unsupported source stripe size".into()))?,
         };
+        // A client can go offline after the periodic sampler last visited
+        // this FID. Recheck before holding catalog or policy row locks.
+        if let Some(profile) = dispatch.heat
+            && let Some(reason) = profile.refresh_for_admission(&self.pool, fid).await?
+        {
+            return self.record_deferred(dispatch, candidate, invocation, reason).await;
+        }
         let ownership = match MigrationOwnership::acquire(&generation.filesystem_name) {
             Ok(ownership) => ownership,
             Err(error) => {
@@ -79,8 +86,8 @@ impl PolicyStore {
         }
         let result = if !active {
             Err(MigrationError::Deferred("policy_revision_inactive"))
-        } else if !lock_matching_candidate(&mut tx, dispatch, candidate).await? {
-            Err(MigrationError::Deferred("catalog_candidate_changed"))
+        } else if let Some(reason) = candidate_deferral(&mut tx, dispatch, candidate).await? {
+            Err(MigrationError::Deferred(reason))
         } else if !verify_worker_permit(worker).await? {
             Err(MigrationError::Deferred("permit_store_requires_synchronous_commit"))
         } else if !dispatch.admission.window_open(Utc::now()) {
@@ -174,28 +181,51 @@ impl PolicyStore {
     }
 }
 
-async fn lock_matching_candidate(
+async fn candidate_deferral(
     tx: &mut Transaction<'_, MySql>, dispatch: &Dispatch<'_>, candidate: &Candidate,
-) -> Result<bool, PolicyError> {
+) -> Result<Option<&'static str>, PolicyError> {
     let policy = dispatch.policy;
-    let sql = format!(
-        "SELECT CAST(1 AS SIGNED) FROM scoped_entries AS entries WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?
-         AND size = ? AND mtime = ? AND ctime = ? AND ({}) AND ({}) = ? FOR UPDATE",
-        policy.where_clause, policy.decision,
-    );
-    let mut query = sqlx::query_scalar::<_, i64>(&sql)
-        .bind(policy.filesystem.as_str())
-        .bind(&candidate.fid)
-        .bind(candidate.size)
-        .bind(candidate.mtime)
-        .bind(candidate.ctime);
-    for param in policy.params.iter().chain(&policy.decision_params) {
-        query = match param {
-            QueryParam::Int(value) => query.bind(*value),
-            QueryParam::Str(value) => query.bind(value),
-        };
+    let entry = sqlx::query_scalar::<_, i64>(
+        "SELECT CAST(1 AS SIGNED) FROM scoped_entries
+         WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?
+         AND size = ? AND mtime = ? AND ctime = ? FOR UPDATE",
+    )
+    .bind(policy.filesystem.as_str())
+    .bind(&candidate.fid)
+    .bind(candidate.size)
+    .bind(candidate.mtime)
+    .bind(candidate.ctime)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if entry.is_none() {
+        return Ok(Some("catalog_candidate_changed"));
     }
-    Ok(query.bind(candidate.branch).fetch_optional(&mut **tx).await?.is_some())
+    let mut query = QueryBuilder::new("SELECT CAST(((");
+    policy.push_scope(&mut query, None);
+    query.push(") AND ((");
+    push_expression(&mut query, &policy.decision, &policy.decision_params);
+    query.push(") = ").push_bind(candidate.branch).push(")) AS SIGNED)");
+    if let Some(profile) = dispatch.heat {
+        query.push(", read_heat.heat_status FROM scoped_entries AS entries ");
+        heat::push_scores(&mut query, profile, Utc::now(), Some(&candidate.fid));
+    } else {
+        query.push(", NULL FROM scoped_entries AS entries ");
+    }
+    query
+        .push(" WHERE entries.filesystem_id = ")
+        .push_bind(policy.filesystem.as_str())
+        .push(" AND entries.object_kind = 0 AND entries.object_id = ")
+        .push_bind(candidate.fid.clone())
+        .push(" FOR UPDATE");
+    let (matched, heat_status) = query
+        .build_query_as::<(Option<i64>, Option<String>)>()
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(match matched {
+        Some(1) => None,
+        None if dispatch.heat.is_some() => Some(heat::deferral_reason(heat_status.as_deref())),
+        _ => Some("catalog_candidate_changed"),
+    })
 }
 
 fn file_version(generation: &Generation) -> FileVersion {

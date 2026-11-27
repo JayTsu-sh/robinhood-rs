@@ -280,8 +280,13 @@ matching system safety and approval policies, and set the run budget including
 Execution rechecks the source placement and HSM state. Classifier tags come
 from the catalog and are rechecked on the locked candidate row along with its
 indexed file generation. Optional `stripeCount`
-and `stripeSize` override the source stripe geometry. The first release handles
-online regular files with an initialized single-component RAID0 layout.
+and `stripeSize` override the source stripe geometry. Set `minResidence`
+to a positive Rev.8 duration such as `24h` to require time in the source
+pool. The catalog starts the clock on its first verified observation of
+the pool or a change of pool, and retains it across rescans and restarts.
+For existing observed layouts, the upgrade starts the clock at upgrade time.
+The first release handles online regular files with an initialized
+single-component RAID0 layout.
 
 The blocking copy checks the deadline between I/O calls. An I/O call already
 inside Lustre retains its filesystem slot until it exits and can be reconciled.
@@ -331,19 +336,39 @@ request and runs without a database connection. The sampling process needs
 for local business mounts too when the controller runs as the unprivileged
 packaged service.
 
-Submit heat conditions through the Rev.8 policy API. For example, use
-`{"field":"lustre.heat.readsample","op":"gte","value":20}` in a rule for
-`lustre.pool_migrate` with `sourcePool: cold` and `targetPool: hot`.
+Submit a separate periodic policy through the Rev.8 policy API for warming.
+For example, set this execute rule and use the execution and governance
+resources for `lustre.pool_migrate` described above.
+
+```json
+{
+  "match": {"field": "lustre.heat.readsample", "op": "gte", "value": 20},
+  "decision": "execute",
+  "action": {
+    "type": "lustre.pool_migrate",
+    "params": {
+      "sourcePool": "cold", "targetPool": "hot",
+      "maxFileBytes": "64GiB", "minResidence": "24h"
+    }
+  }
+}
+```
+
 The supported fields are `lustre.heat.readsample` and `lustre.heat.readbyte`.
 Each is the maximum decayed score for that counter across the configured
-clients. Heat conditions currently require preview activation.
+clients. Enabling enforced heat-driven migration requires a configured
+`read_heat` profile and an explicit `minResidence`. Each execute decision
+must depend on heat, whether through its own condition, the policy scope,
+or an earlier heat-based skip rule.
 
 The daemon samples up to `batch_size` FIDs per interval on a filesystem with
 an enabled heat policy. It rotates through such policies and their eligible
 FIDs. Set the sample lifetime to cover the rotation through the candidate
 set. Per-client heat comes from the open inode on that client and can reset
 when the client evicts the inode. The collector opens by FID and calls
-`llapi_heat_get` without reading payload data.
+`llapi_heat_get` without reading payload data. Before admitting a migration,
+the worker refreshes heat for the selected FID on the same business clients.
+A busy sampler or a refresh that exceeds its deadline defers the candidate.
 
 `POST /api/policies/{id}/preview` includes `readHeat.clients`,
 `readHeat.decay`, `readHeat.maxAgeSeconds`, and `readHeat.deferredByReason`.
@@ -352,8 +377,11 @@ that FID on each configured client. Each observation includes the time,
 scores, measured decay and status. The query parameter leaves the policy
 totals scoped to the entire policy. All configured clients must have
 fresh observations with the requested decay profile. An observed zero
-participates in the comparison. Missing samples, expired samples and
-incompatible decay defer decisions that depend on the unavailable value.
+participates in the comparison. Missing samples, expired samples, unavailable
+clients and incompatible decay defer decisions that depend on the unavailable
+value. `GET /api/policies/{id}/runs` includes `heatDeferredByReason` with the
+counts from the preview or each evaluated dispatch page. A candidate deferred
+during admission has its reason in `GET /api/policies/{id}/runs/{runId}/operations`.
 
 ## Configuration
 

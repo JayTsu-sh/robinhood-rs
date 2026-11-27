@@ -2,7 +2,7 @@ use lustre_api::{LustreApi, migration::valid_pool_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{invalid, size_bytes};
+use super::{duration_millis, invalid, size_bytes};
 use crate::PolicyError;
 
 /// Resolved Rev.8 parameters. Per-file stripe defaults are fixed at admission.
@@ -14,6 +14,8 @@ pub struct PoolMigration {
     pub(crate) stripe_count: Option<u16>,
     pub(crate) stripe_size: Option<u32>,
     pub(crate) max_file_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) min_residence_micros: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -24,6 +26,7 @@ struct Parameters {
     stripe_count: Option<u16>,
     stripe_size: Option<Value>,
     max_file_bytes: Option<Value>,
+    min_residence: Option<String>,
 }
 
 pub(super) fn validate_parameter_names(params: &Map<String, Value>, path: &str) -> Result<(), PolicyError> {
@@ -68,12 +71,27 @@ impl PoolMigration {
                     })
             })
             .transpose()?;
+        let min_residence_micros = params
+            .min_residence
+            .as_deref()
+            .map(|value| {
+                duration_millis(value)
+                    .and_then(|ms| ms.checked_mul(1000))
+                    .and_then(|micros| i64::try_from(micros).ok())
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "{path}.action.params.minResidence must be a positive Rev.8 duration"
+                        ))
+                    })
+            })
+            .transpose()?;
         Ok(Self {
             source_pool,
             target_pool,
             stripe_count: params.stripe_count,
             stripe_size,
             max_file_bytes: bytes,
+            min_residence_micros,
         })
     }
 

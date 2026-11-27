@@ -206,6 +206,11 @@ impl PolicyStore {
             migration.validate_pools(&config.mount_path).await?;
         }
         if let Some(principal) = activation {
+            if policy.uses_read_heat && !self.read_heat.contains_key(&policy.filesystem) {
+                return Err(rev8::invalid(
+                    "enforced read heat conditions require a configured Lustre read_heat profile",
+                ));
+            }
             if policy.actions.is_empty() {
                 return Err(PolicyError::InvalidPolicy(
                     "enforced activation requires an execute rule".into(),

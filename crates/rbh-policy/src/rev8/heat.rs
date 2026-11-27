@@ -1,28 +1,40 @@
-//! Compile, sample and preview the optional business-client read heat signals.
+//! Sample and evaluate business-client read heat signals.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use lustre_api::{
     LuFid,
     heat::{Decay, HeatMount, ReadHeat},
 };
-use rbh_entry_store::{BackendKind, EntryStore, FileSystemConfig, fid_codec, store::QueryParam};
+use rbh_entry_store::{BackendKind, EntryStore, FileSystemConfig, fid_codec};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, MySqlPool, QueryBuilder};
+use tokio::sync::Mutex;
 
 pub use crate::store::HeatSampler;
 
 pub mod agent;
 use agent::{AgentConfig, HeatFailure, MAX_BATCH_SIZE, SampleRequest, SampleResult, sample_mount};
 
-use super::{CompiledPolicy, PreviewResult, invalid, resources::ResourceBinding, valid_name};
+use super::{CompiledPolicy, PreviewResult, invalid, push_expression, resources::ResourceBinding, valid_name};
 use crate::PolicyError;
 
 const MISSING: &str = "heat_sample_missing";
 const STALE: &str = "heat_sample_stale";
 const MISMATCH: &str = "heat_decay_mismatch";
-const NOT_CONFIGURED: &str = "heat_not_configured";
+pub(crate) const NOT_CONFIGURED: &str = "heat_not_configured";
+const CLIENT_UNAVAILABLE: &str = "heat_client_unavailable";
+
+pub(crate) fn deferral_reason(status: Option<&str>) -> &'static str {
+    match status {
+        Some(STALE) => STALE,
+        Some(MISMATCH) => MISMATCH,
+        Some(CLIENT_UNAVAILABLE) => CLIENT_UNAVAILABLE,
+        Some(MISSING) | None => MISSING,
+        Some(_) => "heat_status_unrecognized",
+    }
+}
 
 pub(super) fn score_column(field: &str) -> Option<&'static str> {
     match field {
@@ -64,6 +76,7 @@ pub(crate) struct HeatProfile {
     config: ReadHeatConfig,
     executor_mounts: Arc<[PathBuf]>,
     http: Option<reqwest::Client>,
+    sampling: Arc<Mutex<()>>,
     // This canonical JSON is hashed in SQL. Changing a client's mount or the
     // executor path invalidates samples from the earlier deployment.
     identity: String,
@@ -75,7 +88,7 @@ pub struct PreviewHeat {
     clients: Vec<String>,
     decay: Option<DecayConfig>,
     max_age_seconds: Option<u32>,
-    deferred_by_reason: BTreeMap<String, u64>,
+    pub(crate) deferred_by_reason: BTreeMap<String, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     observations: Option<Vec<ClientObservation>>,
 }
@@ -146,6 +159,7 @@ impl HeatProfile {
             config,
             executor_mounts,
             http,
+            sampling: Arc::default(),
             identity,
         })
     }
@@ -167,34 +181,55 @@ impl HeatProfile {
         } else {
             fid_codec::encode(&fids[count - 1])
         };
-        let observations = collect_batch(self, fids).await?;
-        record_batch(pool, self, observations).await?;
+        let _slot = self.sampling.lock().await;
+        self.collect_and_record(pool, fids).await?;
         Ok((count, next))
     }
 
     fn fresh_after(&self, now: DateTime<Utc>) -> DateTime<Utc> {
         now - TimeDelta::seconds(i64::from(self.config.max_age_seconds))
     }
-}
 
-fn matches_sql(policy: &CompiledPolicy) -> String {
-    format!("(({}) AND (({}) > 0))", policy.where_clause, policy.decision)
-}
-
-fn push_matches(query: &mut QueryBuilder<MySql>, policy: &CompiledPolicy) {
-    // Indexed and heat expressions are compiled SQL with one bind per '?';
-    // all JSON values remain bound parameters.
-    let sql = matches_sql(policy);
-    let mut parts = sql.split('?');
-    query.push(parts.next().expect("SQL has an initial fragment"));
-    for param in policy.params.iter().chain(&policy.decision_params) {
-        match param {
-            QueryParam::Int(value) => query.push_bind(*value),
-            QueryParam::Str(value) => query.push_bind(value.clone()),
+    #[tracing::instrument(skip(self, pool), fields(filesystem = %self.filesystem.id))]
+    pub(crate) async fn refresh_for_admission(
+        &self, pool: &MySqlPool, fid: LuFid,
+    ) -> Result<Option<&'static str>, PolicyError> {
+        let Ok(slot) = tokio::time::timeout(Duration::from_secs(1), self.sampling.clone().lock_owned()).await else {
+            return Ok(Some("heat_sampling_busy"));
         };
-        query.push(parts.next().expect("compiled SQL bind placeholder"));
+        let profile = self.clone();
+        let pool = pool.clone();
+        // Local Lustre I/O can stay blocked after a deadline. Keep the
+        // sampling slot with the task so another refresh cannot pile up.
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            let result = profile.collect_and_record(&pool, vec![fid]).await;
+            if let Err(error) = &result {
+                tracing::warn!(filesystem = %profile.filesystem.id, %fid, %error, "admission heat refresh failed");
+            }
+            result
+        });
+        match tokio::time::timeout(Duration::from_secs(6), task).await {
+            Ok(result) => {
+                result.map_err(|error| PolicyError::Store(error.to_string()))??;
+                Ok(None)
+            }
+            Err(_) => Ok(Some("heat_sampling_timeout")),
+        }
     }
-    debug_assert!(parts.next().is_none());
+
+    async fn collect_and_record(&self, pool: &MySqlPool, fids: Vec<LuFid>) -> Result<(), PolicyError> {
+        let observations = collect_batch(self, fids).await?;
+        record_batch(pool, self, observations).await
+    }
+}
+
+fn push_matches(query: &mut QueryBuilder<MySql>, policy: &CompiledPolicy, database_time_micros: Option<i64>) {
+    query.push("((");
+    policy.push_scope(query, database_time_micros);
+    query.push(") AND ((");
+    push_expression(query, &policy.decision, &policy.decision_params);
+    query.push(") > 0))");
 }
 
 const UNKNOWN_SCORES: &str =
@@ -211,7 +246,7 @@ async fn batch_fids(
         .push(" AND object_kind = 0 AND object_id > ")
         .push_bind(after.to_vec())
         .push(" AND ");
-    push_matches(&mut query, policy);
+    push_matches(&mut query, policy, None);
     query
         .push(" IS NULL ORDER BY object_id LIMIT ")
         .push_bind(i64::from(limit));
@@ -286,9 +321,19 @@ async fn collect_batch(profile: &HeatProfile, fids: Vec<LuFid>) -> Result<Vec<Ob
     }
 
     let mut responses = BTreeMap::new();
+    let mut join_error = None;
     while let Some(response) = samples.join_next().await {
-        let (client, response) = response.map_err(|error| PolicyError::Store(error.to_string()))?;
-        responses.insert(client, response);
+        match response {
+            Ok((client, response)) => {
+                responses.insert(client, response);
+            }
+            Err(error) => {
+                join_error.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = join_error {
+        return Err(PolicyError::Store(error.to_string()));
     }
     let capacity = request.fids.len() * responses.len();
     let mut observations = Vec::with_capacity(capacity);
@@ -428,10 +473,10 @@ pub(crate) async fn preview(
          CAST(SUM(IF(matched IS TRUE, size, 0)) AS UNSIGNED) AS bytes
          FROM (SELECT size, heat_status, "
     ));
-    push_matches(&mut query, policy);
+    push_matches(&mut query, policy, None);
     query.push(" AS matched FROM scoped_entries AS entries ");
     if let Some(profile) = profile {
-        push_scores(&mut query, profile, now);
+        push_scores(&mut query, profile, now, None);
     } else {
         query.push(UNKNOWN_SCORES);
     }
@@ -466,7 +511,9 @@ pub(crate) async fn preview(
     })
 }
 
-fn push_scores(query: &mut QueryBuilder<MySql>, profile: &HeatProfile, now: DateTime<Utc>) {
+pub(crate) fn push_scores(
+    query: &mut QueryBuilder<MySql>, profile: &HeatProfile, now: DateTime<Utc>, fid: Option<&[u8]>,
+) {
     query
         .push(
             " LEFT JOIN (
@@ -476,7 +523,15 @@ fn push_scores(query: &mut QueryBuilder<MySql>, profile: &HeatProfile, now: Date
                     heat_status
              FROM (
                  SELECT object_id, MAX(read_samples) AS read_samples, MAX(read_bytes) AS read_bytes,
-                        CASE WHEN COUNT(IF(failure IS NULL AND read_samples IS NOT NULL
+                        CASE WHEN SUM(failure IN (",
+        )
+        .push_bind(HeatFailure::ClientAgentUnavailable.code())
+        .push(", ")
+        .push_bind(HeatFailure::ClientMountUnavailable.code())
+        .push(")) > 0 THEN ")
+        .push_bind(CLIENT_UNAVAILABLE)
+        .push(
+            " WHEN COUNT(IF(failure IS NULL AND read_samples IS NOT NULL
                                            AND read_bytes IS NOT NULL AND period_seconds IS NOT NULL
                                            AND decay_percentage IS NOT NULL, 1, NULL)) <> ",
         )
@@ -507,11 +562,38 @@ fn push_scores(query: &mut QueryBuilder<MySql>, profile: &HeatProfile, now: Date
             clients.push_bind(client.clone());
         }
     }
+    query.push(")");
+    if let Some(fid) = fid {
+        query.push(" AND object_id = ").push_bind(fid.to_vec());
+    }
     query.push(
-        ") GROUP BY object_id
+        " GROUP BY object_id
          ) AS summary
          ) AS read_heat ON read_heat.object_id = entries.object_id ",
     );
+}
+
+pub(crate) async fn dispatch_deferrals(
+    tx: &mut sqlx::Transaction<'_, MySql>, policy: &CompiledPolicy, profile: &HeatProfile, now: DateTime<Utc>,
+    database_time_micros: Option<i64>, after: &[u8], through: Option<&[u8]>,
+) -> Result<BTreeMap<String, u64>, PolicyError> {
+    let mut query = QueryBuilder::new("SELECT COALESCE(heat_status, ");
+    query
+        .push_bind(MISSING)
+        .push(") AS reason, CAST(COUNT(*) AS UNSIGNED) FROM scoped_entries AS entries ");
+    push_scores(&mut query, profile, now, None);
+    query
+        .push(" WHERE entries.filesystem_id = ")
+        .push_bind(policy.filesystem.as_str())
+        .push(" AND entries.object_kind = 0 AND entries.object_id > ")
+        .push_bind(after.to_vec());
+    if let Some(through) = through {
+        query.push(" AND entries.object_id <= ").push_bind(through.to_vec());
+    }
+    query.push(" AND ");
+    push_matches(&mut query, policy, database_time_micros);
+    query.push(" IS NULL GROUP BY reason");
+    Ok(query.build_query_as().fetch_all(&mut **tx).await?.into_iter().collect())
 }
 
 async fn observations(

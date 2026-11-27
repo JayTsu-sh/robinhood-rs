@@ -1438,6 +1438,20 @@ pub(crate) mod scoped_api_tests {
             migration["parametersSchema"]["required"],
             serde_json::json!(["sourcePool", "targetPool", "maxFileBytes"])
         );
+        assert_eq!(migration["revision"], 2);
+        assert_eq!(
+            migration["parametersSchema"]["properties"]["minResidence"]["type"],
+            "string"
+        );
+        let previous_migration = server
+            .get("/api/action-contracts/lustre.pool_migrate/revisions/1")
+            .await;
+        previous_migration.assert_status_ok();
+        assert!(
+            previous_migration.json::<serde_json::Value>()["parametersSchema"]["properties"]
+                .get("minResidence")
+                .is_none()
+        );
         assert_eq!(
             migration["definition"]["spec"]["completionGuarantees"][0]["evidence"],
             "verified_lustre_layout"

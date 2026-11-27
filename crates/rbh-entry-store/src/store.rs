@@ -1909,20 +1909,27 @@ async fn upsert_scoped_entry_tx(
         ObjectId::Lustre(fid) => Some(fid_codec::encode(fid)),
         ObjectId::JuiceFs(_) => None,
     };
+    let observed_pool = layout_observed_at.is_some() && fid.is_some() && entry.pool_name.is_some();
     let entry_data = serde_json::to_string(entry)?;
     let sm_status = serde_json::to_string(&entry.sm_status)?;
     sqlx::query(
         r"INSERT INTO scoped_entries
             (filesystem_id, object_kind, object_id, entry_data, parent_kind, parent_id, fid,
              name, kind, size, blocks, uid, gid, projid, mode, nlink, atime, mtime, ctime,
-             stripe_count, stripe_size, pool_name, sm_status, last_seen, depth, layout_observed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             stripe_count, stripe_size, pool_name, sm_status, last_seen, depth, layout_observed_at, pool_entered_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  CASE WHEN ? THEN TIMESTAMPDIFF(MICROSECOND, '1970-01-01', UTC_TIMESTAMP(6)) END)
           ON DUPLICATE KEY UPDATE
             entry_data = VALUES(entry_data), parent_kind = VALUES(parent_kind), parent_id = VALUES(parent_id),
             fid = VALUES(fid), name = VALUES(name), kind = VALUES(kind), size = VALUES(size),
             blocks = VALUES(blocks), uid = VALUES(uid), gid = VALUES(gid), projid = VALUES(projid),
             mode = VALUES(mode), nlink = VALUES(nlink), atime = VALUES(atime), mtime = VALUES(mtime),
             ctime = VALUES(ctime), stripe_count = VALUES(stripe_count), stripe_size = VALUES(stripe_size),
+            pool_entered_at = CASE
+                WHEN CAST(pool_name AS BINARY) <=> CAST(VALUES(pool_name) AS BINARY)
+                THEN COALESCE(pool_entered_at, VALUES(pool_entered_at))
+                ELSE VALUES(pool_entered_at)
+            END,
             pool_name = VALUES(pool_name), sm_status = VALUES(sm_status), last_seen = VALUES(last_seen),
             depth = VALUES(depth), layout_observed_at = COALESCE(VALUES(layout_observed_at), layout_observed_at)",
     )
@@ -1952,6 +1959,7 @@ async fn upsert_scoped_entry_tx(
     .bind(entry.last_seen)
     .bind(entry.depth)
     .bind(layout_observed_at)
+    .bind(observed_pool)
     .execute(&mut **tx)
     .await?;
     Ok(())

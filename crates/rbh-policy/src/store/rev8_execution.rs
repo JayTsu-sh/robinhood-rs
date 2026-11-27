@@ -1,26 +1,30 @@
 mod migration;
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use lustre_api::{LuFid, migration::MigrationPlan};
-use rbh_entry_store::{EntryStore, FileSystemConfig, fid_codec, store::QueryParam};
+use rbh_entry_store::{EntryStore, FileSystemConfig, fid_codec};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::{MySql, Transaction, types::Json};
+use sqlx::{MySql, QueryBuilder, Transaction, types::Json};
 
 use super::PolicyStore;
 use crate::{
     PolicyError,
     rev8::{
-        self, ActionKind, BudgetLimits, CompiledPolicy, Invocation,
+        self, ActionKind, BudgetLimits, CompiledPolicy, DB_EPOCH_MICROS, Invocation,
         execution::{Admission, Decision, Generation, LustreHsm, NativeHsm, Profile, Submission},
-        invalid,
+        heat::{self, HeatProfile},
+        invalid, push_expression,
         resources::safety_matches,
     },
 };
 
 const BATCH_SIZE: usize = 64;
 const RUN_FIELDS: &str =
-    "id, policy_id, revision, state, reason, candidate_count, estimated_bytes, requested_by, created_at, started_at";
+    "id, policy_id, revision, state, reason, candidate_count, estimated_bytes, requested_by, created_at, started_at,
+     heat_deferred_by_reason";
 const OPERATION_FIELDS: &str =
     "o.id, o.run_id, r.policy_id, r.revision, o.filesystem, o.fid, o.action, o.archive_id, o.state,
      o.reason, o.attempted, o.generation, o.principal, o.size, o.accepted_at, o.completion_evidence, o.migration_plan";
@@ -38,6 +42,8 @@ pub struct Rev8Run {
     pub requested_by: Option<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heat_deferred_by_reason: Option<Json<BTreeMap<String, u64>>>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -145,6 +151,7 @@ struct Dispatch<'a> {
     policy: &'a CompiledPolicy,
     admission: &'a Admission,
     config: &'a FileSystemConfig,
+    heat: Option<&'a HeatProfile>,
 }
 
 impl PolicyStore {
@@ -312,11 +319,11 @@ impl PolicyStore {
         &self, entries: &EntryStore, mut run: Rev8Run, worker: &mut Transaction<'_, MySql>,
     ) -> Result<(), PolicyError> {
         let Some(row) = self.get_rev8(run.policy_id).await? else {
-            return self.finish_run(run.id, "cancelled", Some("policy_deleted")).await;
+            return self.finish_run(run.id, "cancelled", Some("policy_deleted"), None).await;
         };
         if row.revision != run.revision || row.definition["spec"]["enabled"] == false {
             return self
-                .finish_run(run.id, "cancelled", Some("policy_revision_inactive"))
+                .finish_run(run.id, "cancelled", Some("policy_revision_inactive"), None)
                 .await;
         }
         let bindings = row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default();
@@ -328,7 +335,7 @@ impl PolicyStore {
             {
                 Ok(preview) => Some(preview),
                 Err(PolicyError::InvalidPolicy(reason)) => {
-                    return self.finish_run(run.id, "deferred", Some(&reason)).await;
+                    return self.finish_run(run.id, "deferred", Some(&reason), None).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -339,12 +346,14 @@ impl PolicyStore {
         if let Some(preview) = preview {
             let state = if policy.enforced { "running" } else { "previewed" };
             sqlx::query(
-                "UPDATE rev8_runs SET state = ?, candidate_count = ?, estimated_bytes = ?, started_at = ? WHERE id = ?",
+                "UPDATE rev8_runs SET state = ?, candidate_count = ?, estimated_bytes = ?, started_at = ?,
+                 heat_deferred_by_reason = ? WHERE id = ?",
             )
             .bind(state)
             .bind(preview.candidate_count)
             .bind(preview.estimated_bytes)
             .bind(now)
+            .bind(preview.read_heat.map(|heat| Json(heat.deferred_by_reason)))
             .bind(run.id)
             .execute(&self.pool)
             .await?;
@@ -355,51 +364,77 @@ impl PolicyStore {
         run.started_at.get_or_insert(now);
         let Some(runtime) = self.runtime.as_ref() else {
             return self
-                .finish_run(run.id, "deferred", Some("workload_identity_unavailable"))
+                .finish_run(run.id, "deferred", Some("workload_identity_unavailable"), None)
                 .await;
         };
         let config = match rev8::validate_filesystem(entries, &policy.filesystem).await {
             Ok(config) => config,
-            Err(PolicyError::InvalidPolicy(reason)) => return self.finish_run(run.id, "deferred", Some(&reason)).await,
+            Err(PolicyError::InvalidPolicy(reason)) => {
+                return self.finish_run(run.id, "deferred", Some(&reason), None).await;
+            }
             Err(error) => return Err(error),
         };
         if let Err(PolicyError::InvalidPolicy(reason)) = policy.validate_capabilities(&config) {
-            return self.finish_run(run.id, "deferred", Some(&reason)).await;
+            return self.finish_run(run.id, "deferred", Some(&reason), None).await;
         }
         let mut tx = self.pool.begin().await?;
         let admission = Self::compile_admission(&mut tx, &policy, &bindings, runtime.principal.clone()).await;
         tx.commit().await?;
         let admission = match admission {
             Ok(admission) => admission,
-            Err(PolicyError::InvalidPolicy(reason)) => return self.finish_run(run.id, "deferred", Some(&reason)).await,
+            Err(PolicyError::InvalidPolicy(reason)) => {
+                return self.finish_run(run.id, "deferred", Some(&reason), None).await;
+            }
             Err(error) => return Err(error),
         };
         if !self.synchronous_permit_store().await? {
             return self
-                .finish_run(run.id, "deferred", Some("permit_store_requires_synchronous_commit"))
+                .finish_run(
+                    run.id,
+                    "deferred",
+                    Some("permit_store_requires_synchronous_commit"),
+                    None,
+                )
                 .await;
         }
         if !admission.window_open(Utc::now()) {
             return self
-                .finish_run(run.id, "deferred", Some("admission_window_closed"))
+                .finish_run(run.id, "deferred", Some("admission_window_closed"), None)
                 .await;
         }
+        let heat = if policy.uses_read_heat {
+            let Some(profile) = self.read_heat.get(&policy.filesystem) else {
+                return self
+                    .finish_run(run.id, "deferred", Some(heat::NOT_CONFIGURED), None)
+                    .await;
+            };
+            Some(profile)
+        } else {
+            None
+        };
         let dispatch = Dispatch {
             run: &run,
             policy: &policy,
             admission: &admission,
             config: &config,
+            heat,
         };
         self.dispatch_batch(dispatch, worker).await
     }
 
-    async fn finish_run(&self, id: u64, state: &str, reason: Option<&str>) -> Result<(), PolicyError> {
-        sqlx::query("UPDATE rev8_runs SET state = ?, reason = ?, updated_at = UTC_TIMESTAMP(6) WHERE id = ?")
-            .bind(state)
-            .bind(reason.map(short_reason))
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+    async fn finish_run(
+        &self, id: u64, state: &str, reason: Option<&str>, heat_deferrals: Option<Json<BTreeMap<String, u64>>>,
+    ) -> Result<(), PolicyError> {
+        sqlx::query(
+            "UPDATE rev8_runs SET state = ?, reason = ?, updated_at = UTC_TIMESTAMP(6),
+             heat_deferred_by_reason = COALESCE(?, heat_deferred_by_reason) WHERE id = ?",
+        )
+        .bind(state)
+        .bind(reason.map(short_reason))
+        .bind(heat_deferrals)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -412,37 +447,72 @@ impl PolicyStore {
             .bind(run.id)
             .fetch_one(&self.pool)
             .await?;
-        let cursor = cursor.unwrap_or_else(|| vec![0; 16]);
-        let sql = format!(
-            "SELECT object_id AS fid, size, mtime, ctime, CAST(({}) AS SIGNED) AS branch
-             FROM scoped_entries AS entries WHERE filesystem_id = ? AND object_kind = 0 AND object_id > ?
-             AND ({}) HAVING branch > 0 ORDER BY object_id LIMIT {BATCH_SIZE}",
-            policy.decision, policy.where_clause,
-        );
-        let mut query = sqlx::query_as::<_, Candidate>(&sql);
-        for param in &policy.decision_params {
-            query = match param {
-                QueryParam::Int(value) => query.bind(*value),
-                QueryParam::Str(value) => query.bind(value),
-            };
+        let start = [0; 16];
+        let after = cursor.as_deref().unwrap_or(&start);
+        let mut snapshot = if dispatch.heat.is_some() {
+            Some(
+                self.pool
+                    .begin_with("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let database_time_micros = if let Some(tx) = &mut snapshot {
+            let sql = format!("SELECT CAST({DB_EPOCH_MICROS} AS SIGNED)");
+            Some(sqlx::query_scalar::<_, i64>(&sql).fetch_one(&mut **tx).await?)
+        } else {
+            None
+        };
+        let now = Utc::now();
+        let mut query = QueryBuilder::new("SELECT entries.object_id AS fid, size, mtime, ctime, CAST((");
+        push_expression(&mut query, &policy.decision, &policy.decision_params);
+        query.push(") AS SIGNED) AS branch FROM scoped_entries AS entries ");
+        if let Some(profile) = dispatch.heat {
+            heat::push_scores(&mut query, profile, now, None);
         }
-        query = query.bind(policy.filesystem.as_str()).bind(cursor);
-        for param in &policy.params {
-            query = match param {
-                QueryParam::Int(value) => query.bind(*value),
-                QueryParam::Str(value) => query.bind(value),
-            };
+        query
+            .push(" WHERE entries.filesystem_id = ")
+            .push_bind(policy.filesystem.as_str())
+            .push(" AND entries.object_kind = 0 AND entries.object_id > ")
+            .push_bind(after)
+            .push(" AND (");
+        policy.push_scope(&mut query, database_time_micros);
+        query.push(format!(
+            ") HAVING branch > 0 ORDER BY entries.object_id LIMIT {BATCH_SIZE}"
+        ));
+        let select = query.build_query_as::<Candidate>();
+        let candidates = match snapshot.as_mut() {
+            Some(tx) => select.fetch_all(&mut **tx).await?,
+            None => select.fetch_all(&self.pool).await?,
+        };
+        let through = candidates
+            .last()
+            .filter(|_| candidates.len() == BATCH_SIZE)
+            .map(|row| row.fid.as_slice());
+        let mut heat_deferrals = None;
+        if let (Some(mut tx), Some(profile)) = (snapshot, dispatch.heat) {
+            // Use the same view and freshness clock as candidate selection.
+            // Count only the range visited by this page before advancing it.
+            let mut page =
+                heat::dispatch_deferrals(&mut tx, policy, profile, now, database_time_micros, after, through).await?;
+            tx.commit().await?;
+            if let Some(Json(prior)) = run.heat_deferred_by_reason.as_ref().filter(|_| cursor.is_some()) {
+                for (reason, count) in prior {
+                    *page.entry(reason.clone()).or_default() += count;
+                }
+            }
+            heat_deferrals = Some(Json(page));
         }
-        let candidates = query.fetch_all(&self.pool).await?;
         for candidate in &candidates {
             if !dispatch.admission.window_open(Utc::now()) {
                 return self
-                    .finish_run(run.id, "deferred", Some("admission_window_closed"))
+                    .finish_run(run.id, "deferred", Some("admission_window_closed"), heat_deferrals)
                     .await;
             }
             if self.breaker_open(run.policy_id, &dispatch.admission.profile).await? {
                 return self
-                    .finish_run(run.id, "deferred", Some("policy_circuit_breaker_open"))
+                    .finish_run(run.id, "deferred", Some("policy_circuit_breaker_open"), heat_deferrals)
                     .await;
             }
             let invocation = policy.actions[candidate.branch as usize - 1].clone();
@@ -451,14 +521,16 @@ impl PolicyStore {
                  CAST(SUM(size) AS UNSIGNED) AS bytes FROM rev8_operations WHERE run_id = ? AND state <> 'deferred' GROUP BY action",
             ).bind(run.id).fetch_all(&self.pool).await?;
             if usage_for_scope(&stats, policy.filesystem.as_str(), None).exhausted(policy.budget, elapsed_ms(run)) {
-                return self.finish_run(run.id, "finished", Some("policy_run_budget")).await;
+                return self
+                    .finish_run(run.id, "finished", Some("policy_run_budget"), heat_deferrals)
+                    .await;
             }
             if let Some(block) = self
                 .block_reason(&dispatch, invocation.kind, candidate.size, &stats)
                 .await?
             {
                 if policy.one_shot && block.is_capacity() {
-                    return self.finish_run(run.id, "running", Some(block.reason())).await;
+                    return self.finish_run(run.id, "running", Some(block.reason()), None).await;
                 }
                 self.record_deferred(&dispatch, candidate, &invocation, block.reason())
                     .await?;
@@ -466,15 +538,18 @@ impl PolicyStore {
             }
             self.admit_candidate(&dispatch, candidate, invocation, worker).await?;
         }
-        if candidates.len() < BATCH_SIZE {
-            self.finish_run(run.id, "finished", None).await?;
-        } else if let Some(last) = candidates.last() {
-            sqlx::query("UPDATE rev8_runs SET cursor_id = ? WHERE id = ?")
-                .bind(&last.fid)
-                .bind(run.id)
-                .execute(&self.pool)
-                .await?;
-        }
+        sqlx::query(
+            "UPDATE rev8_runs
+             SET cursor_id = ?, state = IF(? IS NULL, 'finished', 'running'), reason = NULL,
+                 heat_deferred_by_reason = COALESCE(?, heat_deferred_by_reason), updated_at = UTC_TIMESTAMP(6)
+             WHERE id = ?",
+        )
+        .bind(through)
+        .bind(through)
+        .bind(heat_deferrals)
+        .bind(run.id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

@@ -46,3 +46,5 @@ NNN_short_description.sql
 | `013_rev8_resources.sql` | versioned Rev.8 resources and policy bindings |
 | `014_rev8_execution.sql` | durable run queue, per-FID operation journal, and breaker resets |
 | `015_rev8_pool_migration.sql` | persistent pool migration plan and one pending migration per filesystem |
+| `016_rev8_read_heat.sql` | business-client heat observations and sampling policy index |
+| `017_rev8_pool_residence.sql` | pool residence clock and run heat deferral counts |

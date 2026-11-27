@@ -119,6 +119,10 @@ fn contract_response(action: ActionKind, revision: u64, definition: Value) -> Va
                 "sourcePool": pool, "targetPool": pool, "maxFileBytes": size, "stripeSize": size,
                 "stripeCount": {"type": "integer", "minimum": 1, "maximum": u16::MAX}
             });
+            if revision >= 2 {
+                schema["properties"]["minResidence"] =
+                    serde_json::json!({"type": "string", "pattern": "^[1-9][0-9]*(ms|s|m|h|d)$"});
+            }
         }
         _ => {}
     }
@@ -150,6 +154,11 @@ async fn get_contract_revision(Path((name, revision)): Path<(String, u64)>) -> R
             ActionKind::Archive,
             1,
             original_archive_contract(),
+        ))),
+        Some(ActionKind::PoolMigrate) if revision == 1 => Ok(Json(contract_response(
+            ActionKind::PoolMigrate,
+            1,
+            action_contract(ActionKind::PoolMigrate),
         ))),
         Some(action) if revision == contract_revision(action) => Ok(Json(current_contract(action))),
         _ => Err(ApiError::NotFound(format!(

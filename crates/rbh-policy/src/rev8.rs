@@ -1,6 +1,7 @@
 //! Compile the supported Rev.8 policy subset.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
 };
@@ -18,11 +19,13 @@ use rbh_entry_store::{BackendKind, EntryKind, FileSystemId};
 use rbh_predicate::{CmpOp, Field, Predicate, SqlParam, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sqlx::{MySql, QueryBuilder};
 
 use crate::PolicyError;
 
 pub(crate) const API_VERSION: &str = "hsm.storage.io/v1alpha3";
 pub(crate) const BUILTIN_PREVIEW: &str = "builtin-preview";
+pub(crate) const DB_EPOCH_MICROS: &str = "TIMESTAMPDIFF(MICROSECOND, '1970-01-01', UTC_TIMESTAMP(6))";
 
 pub struct CompiledPolicy {
     pub name: String,
@@ -154,9 +157,11 @@ impl Policy {
             params: decision_params,
             actions,
             uses_read_heat,
+            execute_requires_heat,
         } = spec.rules.compile(&mut conditions)?;
         let scope = Condition::join("AND", vec![Condition::indexed(files), target_condition, excludes]);
         let uses_read_heat = uses_read_heat || scope.uses_read_heat;
+        let scope_requires_heat = !scope.can_match_without_heat;
         let mut where_clause = scope.sql;
         if uses_read_heat && !scope.uses_read_heat {
             where_clause = format!("({where_clause}) IS TRUE");
@@ -165,9 +170,6 @@ impl Policy {
             .execution
             .activation
             .is_some_and(|activation| activation.mode == ActivationMode::Enforced);
-        if uses_read_heat && enforced {
-            return Err(invalid("read heat conditions currently require preview activation"));
-        }
         let mut params = query_params(scope.params);
         if let Some(migration) = actions.iter().find_map(|invocation| invocation.migration.as_ref()) {
             if !matches!(spec.trigger, Trigger::Periodic { .. }) {
@@ -183,6 +185,16 @@ impl Policy {
             }
             where_clause.push_str(" AND (CAST(pool_name AS BINARY) = CAST(? AS BINARY)) IS TRUE");
             params.push(QueryParam::Str(migration.source_pool.clone()));
+            if uses_read_heat && enforced && migration.min_residence_micros.is_none() {
+                return Err(invalid("heat-driven migration requires action.params.minResidence"));
+            }
+            if uses_read_heat && enforced && !scope_requires_heat && !execute_requires_heat {
+                return Err(invalid(
+                    "each execute decision in a heat-driven migration policy must require a read heat condition",
+                ));
+            }
+        } else if uses_read_heat && enforced {
+            return Err(invalid("enforced read heat conditions require lustre.pool_migrate"));
         }
         Ok(CompiledPolicy {
             name: self.metadata.name,
@@ -213,6 +225,20 @@ fn query_params(params: Vec<SqlParam>) -> Vec<QueryParam> {
         .collect()
 }
 
+// Expressions are compiled by the server. Client values remain bound.
+pub(crate) fn push_expression(query: &mut QueryBuilder<MySql>, sql: &str, params: &[QueryParam]) {
+    let mut parts = sql.split('?');
+    query.push(parts.next().expect("SQL has an initial fragment"));
+    for param in params {
+        match param {
+            QueryParam::Int(value) => query.push_bind(*value),
+            QueryParam::Str(value) => query.push_bind(value.clone()),
+        };
+        query.push(parts.next().expect("compiled SQL bind placeholder"));
+    }
+    debug_assert!(parts.next().is_none());
+}
+
 #[tracing::instrument(skip(entries))]
 pub(crate) async fn validate_filesystem(
     entries: &EntryStore, filesystem: &FileSystemId,
@@ -236,6 +262,33 @@ impl CompiledPolicy {
         self.actions.iter().find_map(|invocation| invocation.migration.as_ref())
     }
 
+    fn scope(&self, database_time_micros: Option<i64>) -> (Cow<'_, str>, Cow<'_, [QueryParam]>) {
+        let Some(duration) = self
+            .pool_migration()
+            .and_then(|migration| migration.min_residence_micros)
+        else {
+            return (Cow::Borrowed(&self.where_clause), Cow::Borrowed(&self.params));
+        };
+        let (cutoff, param) = match database_time_micros {
+            Some(now) => ("?".into(), now.saturating_sub(duration)),
+            None => (format!("{DB_EPOCH_MICROS} - ?"), duration),
+        };
+        let mut params = self.params.clone();
+        params.push(QueryParam::Int(param));
+        (
+            Cow::Owned(format!(
+                "{} AND (pool_entered_at <= {cutoff}) IS TRUE",
+                self.where_clause
+            )),
+            Cow::Owned(params),
+        )
+    }
+
+    pub(crate) fn push_scope(&self, query: &mut QueryBuilder<MySql>, database_time_micros: Option<i64>) {
+        let (sql, params) = self.scope(database_time_micros);
+        push_expression(query, &sql, &params);
+    }
+
     pub(crate) fn validate_capabilities(&self, config: &rbh_entry_store::FileSystemConfig) -> Result<(), PolicyError> {
         if self.pool_migration().is_some() && !(config.capabilities.stripe && config.capabilities.ost) {
             return Err(invalid(
@@ -251,8 +304,9 @@ impl CompiledPolicy {
     ) -> Result<PreviewResult, PolicyError> {
         let config = validate_filesystem(entries, &self.filesystem).await?;
         self.validate_capabilities(&config)?;
-        let where_clause = format!("{} AND ({}) > 0", self.where_clause, self.decision);
-        let params: Vec<_> = self.params.iter().chain(&self.decision_params).cloned().collect();
+        let (scope, params) = self.scope(None);
+        let where_clause = format!("{scope} AND ({}) > 0", self.decision);
+        let params: Vec<_> = params.iter().chain(&self.decision_params).cloned().collect();
         let (candidate_count, estimated_bytes) = entries
             .scoped_totals_where(&self.filesystem, &where_clause, &params)
             .await
@@ -445,6 +499,7 @@ struct CompiledRules {
     decision: String,
     params: Vec<SqlParam>,
     uses_read_heat: bool,
+    execute_requires_heat: bool,
     actions: Vec<Invocation>,
 }
 
@@ -470,6 +525,8 @@ impl Rules {
             .collect::<Result<Vec<_>, _>>()?;
         let excludes = Condition::join("OR", excludes).negate();
         let mut uses_read_heat = false;
+        let mut execute_requires_heat = true;
+        let mut skip_requires_heat_to_pass = false;
         let mut clauses = vec!["CASE".to_owned()];
         let mut actions = Vec::new();
         let mut params = Vec::new();
@@ -507,6 +564,13 @@ impl Rules {
                 Decision::Skip => 0,
             };
             let condition = conditions.compile(&rule.condition, &format!("{path}.match"))?;
+            if branch > 0 {
+                execute_requires_heat &= skip_requires_heat_to_pass || !condition.can_match_without_heat;
+            } else if condition.uses_read_heat {
+                // A prior skip that cannot be ruled out without heat already
+                // guards all lower-priority execute decisions.
+                skip_requires_heat_to_pass |= !condition.can_fail_without_heat;
+            }
             if condition.uses_read_heat {
                 // An earlier unknown rule could override the remainder of
                 // first_match, so it must defer instead of falling through.
@@ -527,6 +591,7 @@ impl Rules {
             decision: clauses.join(" "),
             params,
             uses_read_heat,
+            execute_requires_heat,
             actions,
         })
     }
@@ -807,6 +872,9 @@ struct Condition {
     sql: String,
     params: Vec<SqlParam>,
     uses_read_heat: bool,
+    // Conservative Boolean outcomes when every heat comparison is SQL NULL.
+    can_match_without_heat: bool,
+    can_fail_without_heat: bool,
 }
 
 impl Condition {
@@ -816,11 +884,14 @@ impl Condition {
             sql,
             params,
             uses_read_heat: false,
+            can_match_without_heat: !matches!(predicate, Predicate::False),
+            can_fail_without_heat: !matches!(predicate, Predicate::True),
         }
     }
 
     fn negate(mut self) -> Self {
         self.sql = format!("NOT ({})", self.sql);
+        std::mem::swap(&mut self.can_match_without_heat, &mut self.can_fail_without_heat);
         self
     }
 
@@ -833,6 +904,17 @@ impl Condition {
             });
         }
         let uses_read_heat = conditions.iter().any(|condition| condition.uses_read_heat);
+        let (can_match_without_heat, can_fail_without_heat) = if operator == "AND" {
+            (
+                conditions.iter().all(|condition| condition.can_match_without_heat),
+                conditions.iter().any(|condition| condition.can_fail_without_heat),
+            )
+        } else {
+            (
+                conditions.iter().any(|condition| condition.can_match_without_heat),
+                conditions.iter().all(|condition| condition.can_fail_without_heat),
+            )
+        };
         let mut parts = Vec::with_capacity(conditions.len());
         let mut params = Vec::new();
         for condition in conditions {
@@ -849,6 +931,8 @@ impl Condition {
             sql: format!("({})", parts.join(&format!(" {operator} "))),
             params,
             uses_read_heat,
+            can_match_without_heat,
+            can_fail_without_heat,
         }
     }
 }
@@ -915,6 +999,8 @@ impl<'a> ConditionCompiler<'a> {
                     sql: format!("read_heat.{column} {} ?", condition.op.ordinal(path)?.sql()),
                     params: vec![SqlParam::Num(value)],
                     uses_read_heat: true,
+                    can_match_without_heat: false,
+                    can_fail_without_heat: false,
                 });
             }
             return condition.compile(path, self.now).map(Condition::indexed);

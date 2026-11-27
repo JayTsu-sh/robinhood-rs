@@ -12,7 +12,10 @@ use crate::PolicyError;
 
 pub const ARCHIVE: &str = "lustre.hsm.archive";
 pub fn contract_revision(action: ActionKind) -> u64 {
-    if action == ActionKind::Archive { 2 } else { 1 }
+    match action {
+        ActionKind::Archive | ActionKind::PoolMigrate => 2,
+        _ => 1,
+    }
 }
 
 pub fn original_archive_contract() -> Value {
