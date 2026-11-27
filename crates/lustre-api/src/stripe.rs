@@ -66,17 +66,8 @@ impl LustreApi {
     /// an empty layout.
     #[tracing::instrument(skip(self), fields(mount = %mount.display(), %fid))]
     pub fn get_ost_layout_by_fid(&self, mount: &Path, fid: &LuFid) -> Result<Option<OstLayout>> {
+        validate_mount(mount)?;
         let path = CString::new(mount.as_os_str().as_bytes())?;
-        // A missing or detached mount cannot confirm that a FID is gone.
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        // SAFETY: the path is NUL-terminated and stat has room for the output.
-        if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: a successful statfs initialized the struct.
-        if unsafe { stat.assume_init() }.f_type != LUSTRE_SUPER_MAGIC {
-            return Err(LustreApiError::NotALustreMount(mount.to_owned()));
-        }
         let raw_fid = fid.into_raw();
         // SAFETY: path and raw_fid are valid for the call. On success the
         // caller owns the descriptor.
@@ -93,6 +84,21 @@ impl LustreApi {
         let layout = Layout::from_raw(raw, "llapi_layout_get_by_fd")?;
         Ok(Some(layout.ost_layout(observed_at)?))
     }
+}
+
+/// Check the kernel filesystem type before a FID operation.
+pub(crate) fn validate_mount(mount: &Path) -> Result<()> {
+    let path = CString::new(mount.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the path is NUL-terminated and stat has room for the output.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: a successful statfs initialized the struct.
+    if unsafe { stat.assume_init() }.f_type != LUSTRE_SUPER_MAGIC {
+        return Err(LustreApiError::NotALustreMount(mount.to_owned()));
+    }
+    Ok(())
 }
 
 struct Layout(NonNull<c_void>);

@@ -8,10 +8,11 @@ use super::{PolicyStore, Rev8PolicyRow, record_rev8_revision};
 use crate::{
     PolicyError,
     rev8::{
-        self, BUILTIN_PREVIEW, CompiledPolicy, Policy,
+        self, ActionKind, BUILTIN_PREVIEW, CompiledPolicy, Policy,
+        execution::{Admission, Principal},
         resources::{
-            ARCHIVE, ARCHIVE_EFFECT, ARCHIVE_REVISION, ResourceBinding, ResourceKind, archive_contract, safety_matches,
-            validate_archive_approval_floor,
+            ARCHIVE, ResourceBinding, ResourceKind, action_contract, contract_revision, safety_matches,
+            validate_approval_floor,
         },
     },
 };
@@ -206,8 +207,20 @@ impl PolicyStore {
             bindings.push(binding);
         }
         let compiled = policy.compile(&selector_map(&resources))?;
-        let safety = applicable_safety(&resources, compiled.filesystem.as_str());
-        check_approval_floor(tx, &bindings, &safety, compiled.filesystem.as_str()).await?;
+        let actions = compiled
+            .actions
+            .iter()
+            .map(|invocation| invocation.kind)
+            .collect::<std::collections::BTreeSet<_>>();
+        let safety = applicable_safety(&resources, compiled.filesystem.as_str(), actions.iter().copied());
+        check_approval_floor(
+            tx,
+            &bindings,
+            &safety,
+            compiled.filesystem.as_str(),
+            actions.iter().copied(),
+        )
+        .await?;
         bindings.extend(
             resources
                 .iter()
@@ -217,14 +230,49 @@ impl PolicyStore {
                 .map(ResourceRevision::binding),
         );
         bindings.extend(safety.into_iter().map(ResourceRevision::binding));
-        bindings.push(ResourceBinding {
+        bindings.extend(actions.into_iter().map(|action| ResourceBinding {
             kind: ResourceKind::ActionContract,
-            name: ARCHIVE.into(),
-            revision: ARCHIVE_REVISION,
-            server_definition: Some(archive_contract()),
-        });
+            name: action.name().into(),
+            revision: contract_revision(action),
+            server_definition: Some(action_contract(action)),
+        }));
         sort_bindings(&mut bindings);
         Ok((compiled, bindings))
+    }
+
+    pub(super) async fn compile_admission(
+        tx: &mut Transaction<'_, MySql>, policy: &CompiledPolicy, bindings: &[ResourceBinding], principal: Principal,
+    ) -> Result<Admission, PolicyError> {
+        let mut profile = None;
+        let mut authorization = Value::Null;
+        let mut approval = Value::Null;
+        let mut safety = Vec::new();
+        for binding in bindings {
+            let output = match binding.kind {
+                ResourceKind::ExecutionProfile => {
+                    profile = Some((binding.name.as_str(), bound_spec(tx, binding).await?));
+                    continue;
+                }
+                ResourceKind::AuthorizationPolicy => &mut authorization,
+                ResourceKind::ApprovalPolicy => &mut approval,
+                ResourceKind::SystemSafetyPolicy => {
+                    safety.push(bound_spec(tx, binding).await?);
+                    continue;
+                }
+                _ => continue,
+            };
+            *output = bound_spec(tx, binding).await?;
+        }
+        let (profile_name, profile) = profile.ok_or_else(|| rev8::invalid("missing execution profile binding"))?;
+        Admission::compile(
+            policy,
+            principal,
+            profile_name,
+            profile,
+            authorization,
+            approval,
+            safety,
+        )
     }
 
     pub(super) async fn compile_revision(
@@ -248,7 +296,7 @@ async fn enabled_policies(tx: &mut Transaction<'_, MySql>) -> Result<Vec<Rev8Pol
     Ok(sqlx::query_as(
         "SELECT p.id, r.revision, r.definition, r.resource_bindings, r.modified_by
          FROM policies p JOIN rev8_policy_revisions r ON p.id = r.policy_id AND p.revision = r.revision
-         WHERE COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.definition, '$.spec.enabled')), 'true') <> 'false'",
+         WHERE p.name IS NOT NULL AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.definition, '$.spec.enabled')), 'true') <> 'false'",
     )
     .fetch_all(&mut **tx)
     .await?)
@@ -262,7 +310,15 @@ async fn rebind_safety(tx: &mut Transaction<'_, MySql>, actor: &str) -> Result<(
         };
         let input = rev8::parse(&policy.definition)?;
         let filesystem = input.filesystem().as_str();
-        let safety = applicable_safety(&resources, filesystem);
+        let mut actions: Vec<_> = bindings
+            .iter()
+            .filter(|binding| binding.kind == ResourceKind::ActionContract)
+            .filter_map(|binding| ActionKind::from_name(&binding.name))
+            .collect();
+        if actions.is_empty() {
+            actions.push(ActionKind::Archive);
+        }
+        let safety = applicable_safety(&resources, filesystem, actions.iter().copied());
         let mut revised = bindings.clone();
         revised.retain(|binding| binding.kind != ResourceKind::SystemSafetyPolicy);
         revised.extend(safety.iter().map(|resource| resource.binding()));
@@ -270,7 +326,7 @@ async fn rebind_safety(tx: &mut Transaction<'_, MySql>, actor: &str) -> Result<(
         if revised == bindings {
             continue;
         }
-        check_approval_floor(tx, &revised, &safety, filesystem).await?;
+        check_approval_floor(tx, &revised, &safety, filesystem, actions.into_iter()).await?;
         sqlx::query("UPDATE policies SET revision = revision + 1 WHERE id = ?")
             .bind(policy.id)
             .execute(&mut **tx)
@@ -284,51 +340,65 @@ fn sort_bindings(bindings: &mut [ResourceBinding]) {
     bindings.sort_by(|left, right| (left.kind, &left.name).cmp(&(right.kind, &right.name)));
 }
 
-fn applicable_safety<'a>(resources: &'a [ResourceRevision], filesystem: &str) -> Vec<&'a ResourceRevision> {
+fn applicable_safety<'a>(
+    resources: &'a [ResourceRevision], filesystem: &str, actions: impl Iterator<Item = ActionKind> + Clone,
+) -> Vec<&'a ResourceRevision> {
     resources
         .iter()
         .filter(|resource| {
             resource.kind == ResourceKind::SystemSafetyPolicy
-                && resource
-                    .definition
-                    .as_ref()
-                    .is_some_and(|definition| safety_matches(&definition["spec"], filesystem))
+                && resource.definition.as_ref().is_some_and(|definition| {
+                    actions
+                        .clone()
+                        .any(|action| safety_matches(&definition["spec"], filesystem, action))
+                })
         })
         .collect()
 }
 
 async fn check_approval_floor(
     tx: &mut Transaction<'_, MySql>, bindings: &[ResourceBinding], safety: &[&ResourceRevision], filesystem: &str,
+    actions: impl Iterator<Item = ActionKind>,
 ) -> Result<(), PolicyError> {
-    let needs_human = safety
-        .iter()
-        .filter_map(|resource| resource.definition.as_ref())
-        .flat_map(|definition| definition["spec"]["effectRules"].as_array().into_iter().flatten())
-        .any(|rule| rule["effect"] == ARCHIVE_EFFECT && rule["minimumApproval"] == "human");
-    if !needs_human {
-        return Ok(());
+    for action in actions {
+        let needs_human = safety
+            .iter()
+            .filter_map(|resource| resource.definition.as_ref())
+            .filter(|definition| safety_matches(&definition["spec"], filesystem, action))
+            .flat_map(|definition| definition["spec"]["effectRules"].as_array().into_iter().flatten())
+            .any(|rule| rule["effect"] == action.effect() && rule["minimumApproval"] == "human");
+        if needs_human {
+            let approval = bindings
+                .iter()
+                .find(|binding| binding.kind == ResourceKind::ApprovalPolicy)
+                .ok_or_else(|| PolicyError::InvalidPolicy("policy revision is missing its ApprovalPolicy".into()))?;
+            validate_approval_floor(&bound_spec(tx, approval).await?, filesystem, action)?;
+        }
     }
-    let approval = bindings
-        .iter()
-        .find(|binding| binding.kind == ResourceKind::ApprovalPolicy)
-        .ok_or_else(|| PolicyError::InvalidPolicy("policy revision is missing its ApprovalPolicy".into()))?;
-    if let Some(definition) = &approval.server_definition {
-        return validate_archive_approval_floor(&definition["spec"], filesystem, true);
+    Ok(())
+}
+
+async fn bound_spec(tx: &mut Transaction<'_, MySql>, binding: &ResourceBinding) -> Result<Value, PolicyError> {
+    if let Some(definition) = &binding.server_definition {
+        return Ok(definition["spec"].clone());
     }
-    if approval.name == BUILTIN_PREVIEW && approval.revision == 1 {
-        return Ok(()); // Revision 1 denies archive without a matching grant.
+    if binding.name == BUILTIN_PREVIEW {
+        let resource = builtin_preview(binding.kind).ok_or_else(|| not_found(binding.kind, &binding.name))?;
+        if resource.revision == binding.revision {
+            return Ok(resource.definition.expect("built-in resource definition")["spec"].clone());
+        }
     }
     let revision: ResourceRevision = sqlx::query_as(HISTORICAL_RESOURCE)
-        .bind(approval.kind.as_str())
-        .bind(&approval.name)
-        .bind(approval.revision)
+        .bind(binding.kind.as_str())
+        .bind(&binding.name)
+        .bind(binding.revision)
         .fetch_optional(&mut **tx)
         .await?
-        .ok_or_else(|| not_found(approval.kind, &approval.name))?;
+        .ok_or_else(|| not_found(binding.kind, &binding.name))?;
     let definition = revision
         .definition
-        .ok_or_else(|| not_found(approval.kind, &approval.name))?;
-    validate_archive_approval_floor(&definition["spec"], filesystem, true)
+        .ok_or_else(|| not_found(binding.kind, &binding.name))?;
+    Ok(definition["spec"].clone())
 }
 
 fn not_found(kind: ResourceKind, name: &str) -> PolicyError {

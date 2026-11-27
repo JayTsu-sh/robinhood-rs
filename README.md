@@ -132,7 +132,7 @@ and reports missing parents and stale catalog paths as distinct typed errors.
 The unscoped Lustre dump, restore, orphan-sweep, and classifier-run surfaces
 are retained only under `/api/compat/lustre/` as an explicit migration boundary.
 
-### Rev.8 archive preview
+### Rev.8 native Lustre HSM
 
 Set `RBH_REV8_WRITERS_FILE` to a server-side JSON map from writer principal
 names to the hex SHA-256 digests of their high-entropy bearer tokens. Send a
@@ -162,7 +162,7 @@ the ID of a registered Lustre filesystem with HSM enabled.
     "execution": {
       "profileRef": "builtin-preview",
       "activation": { "mode": "preview" },
-      "budget": { "run": { "maxOperations": 100, "maxSubmitAttempts": 100, "maxObjectLogicalBytes": "1TiB" } }
+      "budget": { "run": { "maxOperations": 100, "maxSubmitAttempts": 100, "maxObjectLogicalBytes": "1TiB", "maxDuration": "30m" } }
     },
     "governance": { "authorizationRef": "builtin-preview", "approvalPolicyRef": "builtin-preview" }
   }
@@ -176,6 +176,44 @@ and the total logical `estimatedBytes` before any execution budget is applied.
 `PUT /api/policies/{id}` saves a new revision. This preview accepts indexed
 regular files, the built-in preview references, and first-match archive rules
 with size comparisons or boolean conditions.
+
+To enable execution, point `RBH_REV8_HSM_PRINCIPAL_FILE` to a JSON file supplied
+by the daemon deployment, for example
+`{"serviceAccount":"hsm-controller","roles":["storage-operator"]}`. The
+daemon uses this identity for both scheduled and manual native submissions.
+The API writer identity is recorded separately. The built-in submit path
+requires MariaDB `innodb_flush_log_at_trx_commit=1` and a durable database
+volume. Deploy the daemon as the trusted actuator. Rev.8's separate deployment
+attestation and cross-node permit log verification are outside this execution
+path.
+
+Use `lustre.hsm.archive`, `lustre.hsm.release` or `lustre.hsm.restore`. Configure
+an applicable `SystemSafetyPolicy`, grant the workload access in an
+`AuthorizationPolicy`, and select an `ApprovalPolicy` that explicitly allows
+unattended execution for the action. Set `spec.execution.activation.mode` to
+`enforced` and bind a saved execution profile. This serial executor accepts a
+single submit attempt per operation. Set `concurrency.global` to cap unresolved
+operations sharing the profile. Policy-scoped consecutive-failure breakers
+support definitive `backend_unavailable` and `transient_io` errors and manual
+reset. System safety limits cap unresolved submissions. Authorization can constrain filesystem,
+object type and archive ID. Activation rejects grants that require namespace
+or OST authorization, human approval, or unsupported profile combinations.
+Use the profile and policy admission windows to restrict submission times.
+
+- `POST /api/policies/{id}/run` queues a manual run and returns its `runId`.
+  A periodic trigger queues runs automatically. One-shot runs wait for available
+  profile or safety capacity within their run deadline. The preview endpoint
+  evaluates candidates immediately without writing a run.
+- `GET /api/policies/{id}/runs` lists runs. `GET /api/policies/{id}/runs/{run}/operations`
+  lists the file-level decisions. Both accept `afterId` for pagination.
+- `submitted` records a successful Lustre request response. `completed` records
+  matching live Lustre HSM state for the FID and expected file generation.
+  A run can finish dispatch while individual requests are still outstanding.
+- Set `spec.enabled` to `false` with `PUT`, or delete the policy with `DELETE`,
+  to stop new submissions. Operation history remains available by policy ID
+  and pending requests continue reconciling against their bound revision.
+- `POST /api/policies/{id}/breaker/reset` resets the policy circuit breaker
+  with an authenticated writer. Outstanding operation limits remain in force.
 
 ### Rev.8 policy resources
 

@@ -58,7 +58,23 @@ pub async fn run() -> anyhow::Result<()> {
             "filesystem runtime registered"
         );
     }
-    let policy_store = rbh_policy::PolicyStore::new(pool.clone());
+    let mut policy_store = rbh_policy::PolicyStore::new(pool.clone());
+    if let Some(path) = std::env::var_os("RBH_REV8_HSM_PRINCIPAL_FILE") {
+        use rbh_policy::rev8::execution::{LustreHsm, Principal, Runtime};
+
+        let json = tokio::fs::read_to_string(path)
+            .await
+            .context("read RBH_REV8_HSM_PRINCIPAL_FILE")?;
+        let principal: Principal = serde_json::from_str(&json).context("invalid Rev.8 HSM workload identity")?;
+        anyhow::ensure!(
+            !principal.service_account.trim().is_empty(),
+            "Rev.8 HSM serviceAccount is empty"
+        );
+        policy_store = policy_store.with_rev8_runtime(Runtime {
+            principal,
+            hsm: Arc::new(LustreHsm),
+        });
+    }
     policy_store
         .check_schema()
         .await
@@ -334,6 +350,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Register task types.
     scheduler.register::<rbh_policy::PolicyRunTask>().await;
+    scheduler.register::<rbh_policy::Rev8TickTask>().await;
 
     // Initialize the policy runtime (global state for PolicyRunTask).
     rbh_policy::init_runtime(Arc::new(rbh_policy::PolicyRuntime {
@@ -349,6 +366,10 @@ pub async fn run() -> anyhow::Result<()> {
     // scheduler marks them Completed but never removes them — this
     // keeps the schedules table from growing unbounded.
     prune_threshold_schedules(&scheduler).await;
+
+    ensure_rev8_schedule(&scheduler)
+        .await
+        .context("register Rev.8 scheduler wakeup")?;
 
     // Start the scheduler loop.
     let _scheduler_handle = scheduler.spawn();
@@ -739,7 +760,48 @@ async fn run_juicefs_baseline(
     Ok(())
 }
 
-/// Reconcile all enabled policies to scheduler-rs schedules on startup.
+/// Reinstall the wakeup trigger, which scheduler-rs holds in memory.
+async fn ensure_rev8_schedule(scheduler: &Scheduler) -> Result<(), SchedulerError> {
+    use scheduler_rs::trigger::IntervalTrigger;
+
+    const NAME: &str = "rbh.rev8.tick";
+    for schedule in scheduler.list_schedules_by_name_prefix(NAME).await? {
+        if schedule.name.as_deref() == Some(NAME) {
+            scheduler.remove(&schedule.id).await?;
+        }
+    }
+    let config = ScheduleConfig {
+        misfire_policy: MisfirePolicy::Coalesce,
+        max_instances: 1,
+        ..Default::default()
+    };
+    let result = scheduler
+        .add_raw(
+            rbh_policy::Rev8TickTask::TYPE_NAME.to_owned(),
+            serde_json::Value::Null,
+            Box::new(IntervalTrigger::every(std::time::Duration::from_secs(1))),
+            config,
+            Some(NAME.to_owned()),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if scheduler
+                .list_schedules_by_name_prefix(NAME)
+                .await?
+                .iter()
+                .any(|schedule| schedule.name.as_deref() == Some(NAME))
+            {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Reconcile enabled legacy policies to scheduler-rs on startup.
 async fn reconcile_all_policies(
     scheduler: &Scheduler, policy_store: &rbh_policy::PolicyStore, entry_store: &rbh_entry_store::store::EntryStore,
 ) {

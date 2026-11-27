@@ -5,7 +5,10 @@ use axum::{
     routing::{get, post},
 };
 use rbh_policy::{
-    rev8::resources::{ARCHIVE, ARCHIVE_REVISION, ResourceKind, archive_contract},
+    rev8::{
+        ActionKind,
+        resources::{ResourceKind, action_contract, contract_revision, original_archive_contract},
+    },
     store::ResourceRevision,
 };
 use serde_json::Value;
@@ -98,33 +101,42 @@ async fn delete_resource(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn archive_revision() -> Value {
+fn contract_response(action: ActionKind, revision: u64, definition: Value) -> Value {
+    let properties = if action == ActionKind::Archive {
+        serde_json::json!({"archiveId": {"type": "integer", "minimum": 0, "maximum": u32::MAX}})
+    } else {
+        serde_json::json!({})
+    };
     serde_json::json!({
-        "revision": 1,
-        "definition": archive_contract(),
-        "parametersSchema": {
-            "type": "object",
-            "properties": {"archiveId": {"type": "integer", "minimum": 0, "maximum": u32::MAX}},
-            "additionalProperties": false
-        }
+        "revision": revision,
+        "definition": definition,
+        "parametersSchema": {"type": "object", "properties": properties, "additionalProperties": false}
     })
 }
 
 async fn list_contracts() -> Json<Vec<Value>> {
-    Json(vec![archive_revision()])
+    Json(ActionKind::ALL.into_iter().map(current_contract).collect())
+}
+
+fn current_contract(action: ActionKind) -> Value {
+    contract_response(action, contract_revision(action), action_contract(action))
 }
 
 async fn get_contract(Path(name): Path<String>) -> Result<Json<Value>, ApiError> {
-    contract_revision(&name, ARCHIVE_REVISION)
+    ActionKind::from_name(&name)
+        .map(current_contract)
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown ActionContract/{name}")))
 }
 
 async fn get_contract_revision(Path((name, revision)): Path<(String, u64)>) -> Result<Json<Value>, ApiError> {
-    contract_revision(&name, revision)
-}
-
-fn contract_revision(name: &str, revision: u64) -> Result<Json<Value>, ApiError> {
-    match (name, revision) {
-        (ARCHIVE, 1) => Ok(Json(archive_revision())),
+    match ActionKind::from_name(&name) {
+        Some(ActionKind::Archive) if revision == 1 => Ok(Json(contract_response(
+            ActionKind::Archive,
+            1,
+            original_archive_contract(),
+        ))),
+        Some(action) if revision == contract_revision(action) => Ok(Json(current_contract(action))),
         _ => Err(ApiError::NotFound(format!(
             "unknown ActionContract/{name} revision {revision}"
         ))),

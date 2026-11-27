@@ -7,12 +7,23 @@ use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{API_VERSION, BUILTIN_PREVIEW, duration_millis, invalid, size_bytes};
+use super::{API_VERSION, ActionKind, BUILTIN_PREVIEW, duration_millis, invalid, size_bytes};
 use crate::PolicyError;
 
 pub const ARCHIVE: &str = "lustre.hsm.archive";
-pub const ARCHIVE_REVISION: u64 = 1;
-pub const ARCHIVE_EFFECT: &str = "data_copy";
+pub fn contract_revision(action: ActionKind) -> u64 {
+    if action == ActionKind::Archive { 2 } else { 1 }
+}
+
+pub fn original_archive_contract() -> Value {
+    let mut contract = action_contract(ActionKind::Archive);
+    contract["spec"]["completionGuarantees"][0]["evidence"] = "hsm_completion_and_authoritative_state".into();
+    contract["spec"]["preconditions"]["beforeSubmit"]
+        .as_array_mut()
+        .expect("contract preconditions")
+        .pop();
+    contract
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ResourceKind {
@@ -144,12 +155,19 @@ pub struct ResourceBinding {
 
 // Published server revisions are append-only. A new contract goes in a new
 // revision and leaves the existing builder available for historical reads.
-pub fn archive_contract() -> Value {
+pub fn action_contract(action: ActionKind) -> Value {
+    let (completion, readiness) = match action {
+        ActionKind::Archive => ("archive_completed", "file_archive_eligible"),
+        ActionKind::Release => ("release_completed", "file_release_eligible"),
+        ActionKind::Restore => ("restore_completed", "file_restore_eligible"),
+    };
+    let name = action.name();
+    let effect = action.effect();
     json!({
-        "apiVersion": API_VERSION, "kind": "ActionContract", "metadata": {"name": ARCHIVE},
+        "apiVersion": API_VERSION, "kind": "ActionContract", "metadata": {"name": name},
         "spec": {
             "targetTypes": ["file"],
-            "effect": {"category": ARCHIVE_EFFECT, "reversibility": "recoverable"},
+            "effect": {"category": effect, "reversibility": "recoverable"},
             "identity": {"objectKey": "filesystem_fid", "required": ["filesystemId", "fid", "sourceGeneration"]},
             "idempotency": {"strategy": "operation_generation", "reconciliationRequired": true},
             "metering": [
@@ -158,19 +176,22 @@ pub fn archive_contract() -> Value {
                 {"key": "maxObjectLogicalBytes", "required": true, "unit": "bytes", "basis": "object_logical_size_at_admission", "chargeAt": "admission"}
             ],
             "compatibility": {"default": "reject"},
-            "completionGuarantees": [{"name": "archive_completed", "evidence": "hsm_completion_and_authoritative_state"}],
-            "preconditions": {"beforeSubmit": [{"name": "source_generation_matches", "requiredWhen": "always"}]},
+            "completionGuarantees": [{"name": completion, "evidence": "authoritative_hsm_state"}],
+            "preconditions": {"beforeSubmit": [
+                {"name": "source_generation_matches", "requiredWhen": "always"},
+                {"name": readiness, "requiredWhen": "always"}
+            ]},
             "safety": {"objectChangePolicy": "defer", "authoritativeValidation": "required"}
         }
     })
 }
 
-pub(crate) fn safety_matches(spec: &Value, filesystem: &str) -> bool {
+pub(crate) fn safety_matches(spec: &Value, filesystem: &str, action: ActionKind) -> bool {
     let scope = &spec["scope"];
     [
         ("filesystems", filesystem),
-        ("actions", ARCHIVE),
-        ("effectCategories", ARCHIVE_EFFECT),
+        ("actions", action.name()),
+        ("effectCategories", action.effect()),
     ]
     .into_iter()
     .all(|(field, target)| {
@@ -180,45 +201,46 @@ pub(crate) fn safety_matches(spec: &Value, filesystem: &str) -> bool {
     })
 }
 
-pub(crate) fn validate_archive_approval_floor(
-    approval: &Value, filesystem: &str, safety_requires_human: bool,
+pub(crate) fn approval_matches(rule: &Value, filesystem: &str, action: ActionKind) -> bool {
+    rule["scope"]["filesystems"]
+        .as_array()
+        .is_none_or(|values| values.iter().any(|value| value == filesystem))
+        && [(&rule["actions"], action.name()), (&rule["effects"], action.effect())]
+            .into_iter()
+            .any(|(values, target)| {
+                values
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|value| value == target))
+            })
+}
+
+pub(crate) fn validate_approval_floor(
+    approval: &Value, filesystem: &str, action: ActionKind,
 ) -> Result<(), PolicyError> {
-    if !safety_requires_human || approval["floorDefaults"].is_object() {
+    if approval["floorDefaults"].is_object() {
         return Ok(());
     }
-    let mut needs_floor = false;
-    for requirement in approval["requirements"].as_array().into_iter().flatten() {
-        let matches_target = requirement["scope"]["filesystems"]
-            .as_array()
-            .is_none_or(|filesystems| filesystems.iter().any(|fs| fs == filesystem));
-        let matches_action = [
-            (&requirement["actions"], ARCHIVE),
-            (&requirement["effects"], ARCHIVE_EFFECT),
-        ]
+    let modes: Vec<_> = approval["requirements"]
+        .as_array()
         .into_iter()
-        .any(|(values, target)| {
-            values
-                .as_array()
-                .is_some_and(|values| values.iter().any(|value| value == target))
-        });
-        if matches_target && matches_action {
-            if requirement["mode"] != "not_required" {
-                return Ok(());
-            }
-            needs_floor = true;
-        }
-    }
-    if needs_floor {
-        return Err(invalid(
-            "APPROVAL_FLOOR_UNSATISFIABLE: archive approvalPolicy requires floorDefaults",
-        ));
+        .flatten()
+        .filter(|rule| approval_matches(rule, filesystem, action))
+        .map(|rule| &rule["mode"])
+        .collect();
+    if !modes.is_empty() && modes.iter().all(|mode| *mode == "not_required") {
+        return Err(invalid(format!(
+            "APPROVAL_FLOOR_UNSATISFIABLE: {} approvalPolicy requires floorDefaults",
+            action.name()
+        )));
     }
     Ok(())
 }
 
 fn validate_actions(actions: &Value, field: &str) -> Result<(), PolicyError> {
     if let Some(actions) = actions.as_array()
-        && let Some(action) = actions.iter().find(|action| *action != ARCHIVE)
+        && let Some(action) = actions
+            .iter()
+            .find(|action| action.as_str().and_then(ActionKind::from_name).is_none())
     {
         return Err(invalid(format!(
             "{field} references an unregistered ActionContract: {action}"

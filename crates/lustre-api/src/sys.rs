@@ -162,6 +162,10 @@ unsafe extern "C" {
 
     // HSM -------------------------------------------------------------------
 
+    pub(crate) fn llapi_get_fsname(path: *const c_char, name: *mut c_char, len: usize) -> c_int;
+
+    pub(crate) fn llapi_hsm_current_action(path: *const c_char, action: *mut bindings::hsm_current_action) -> c_int;
+
     pub(crate) fn llapi_hsm_state_get(path: *const c_char, hus: *mut hsm_user_state) -> c_int;
 
     pub(crate) fn llapi_hsm_state_set(path: *const c_char, setmask: u64, clearmask: u64, archive_id: u32) -> c_int;

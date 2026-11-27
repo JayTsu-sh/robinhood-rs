@@ -36,3 +36,4 @@ axum-test = "17"
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tempfile = "3"
+async-trait = { workspace = true }

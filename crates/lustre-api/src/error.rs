@@ -53,6 +53,7 @@ pub enum LustreApiError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HsmOp {
     StateGet,
+    CurrentAction,
     StateSet,
     Request,
 }

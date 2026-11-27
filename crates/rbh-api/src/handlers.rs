@@ -2,7 +2,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,9 @@ pub fn api_routes() -> Router<AppState> {
             get(get_policy).put(update_policy).delete(delete_policy),
         )
         .route("/policies/{id}/run", post(run_policy_now))
+        .route("/policies/{id}/runs", get(list_rev8_runs))
+        .route("/policies/{id}/breaker/reset", post(reset_rev8_breaker))
+        .route("/policies/{id}/runs/{run}/operations", get(list_rev8_operations))
         .route("/policies/{id}/preview", post(preview_policy))
         .route("/policies/{id}/revisions/{revision}", get(get_policy_revision))
         .route("/entries/count", get(entry_count))
@@ -246,17 +249,64 @@ pub struct RunRequest {
     pub dry_run: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunPage {
+    #[serde(default)]
+    after_id: u64,
+}
+
+async fn reset_rev8_breaker(
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let actor = writers.authorize(&headers)?;
+    state.policy_store.reset_rev8_breaker(id, actor).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_rev8_runs(
+    State(state): State<AppState>, Path(id): Path<u64>, axum::extract::Query(page): axum::extract::Query<RunPage>,
+) -> Result<Json<Vec<rbh_policy::store::Rev8Run>>, ApiError> {
+    Ok(Json(state.policy_store.list_rev8_runs(id, page.after_id).await?))
+}
+
+async fn list_rev8_operations(
+    State(state): State<AppState>, Path((id, run)): Path<(u64, u64)>,
+    axum::extract::Query(page): axum::extract::Query<RunPage>,
+) -> Result<Json<Vec<rbh_policy::store::Rev8Operation>>, ApiError> {
+    Ok(Json(
+        state.policy_store.list_rev8_operations(id, run, page.after_id).await?,
+    ))
+}
+
 /// Fire a one-shot policy run via an `ImmediateTrigger` schedule. The
 /// response returns the generated schedule id so operators can cancel
 /// or observe it. Requires the scheduler to be present in `AppState`.
-#[tracing::instrument(skip(state, req))]
+#[tracing::instrument(skip_all, fields(id))]
 async fn run_policy_now(
-    State(state): State<AppState>, Path(id): Path<u64>, Json(req): Json<RunRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    headers: HeaderMap, request: Option<Json<RunRequest>>,
+) -> Result<Response, ApiError> {
     use scheduler_rs::prelude::{MisfirePolicy, ScheduleConfig, Task};
     use scheduler_rs::trigger::ImmediateTrigger;
 
-    // Verify the policy exists first (returns 404 if not).
+    if state.policy_store.get_rev8(id).await?.is_some() {
+        let req = request.map(|Json(request)| request).unwrap_or_default();
+        let actor = writers.authorize(&headers)?;
+        if req.target.is_some() {
+            return Err(ApiError::BadRequest(
+                "Rev.8 runs use the target bound to the policy revision".into(),
+            ));
+        }
+        if req.dry_run {
+            return Ok(Json(state.policy_store.preview_rev8(&state.entry_store, id).await?).into_response());
+        }
+        let run = state.policy_store.request_rev8_run(id, actor).await?;
+        return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"runId": run}))).into_response());
+    }
+    let Json(req) = request.ok_or_else(|| ApiError::BadRequest("expected a JSON run request".into()))?;
+    // Verify the legacy policy exists first.
     let row = state.policy_store.get(id).await?;
     let config = validate_policy_request(&state, &row.definition).await?;
 
@@ -299,7 +349,8 @@ async fn run_policy_now(
     Ok(Json(serde_json::json!({
         "schedule_id": schedule_id.0.to_string(),
         "name": name,
-    })))
+    }))
+    .into_response())
 }
 
 async fn validate_policy_request(
@@ -315,8 +366,16 @@ async fn validate_policy_request(
     Ok(config)
 }
 
-#[tracing::instrument(skip(state))]
-async fn delete_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
+#[tracing::instrument(skip_all, fields(id))]
+async fn delete_policy(
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    if state.policy_store.get_rev8(id).await?.is_some() {
+        writers.authorize(&headers)?;
+        state.policy_store.delete_rev8(id).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
     if let Some(ref scheduler) = state.scheduler {
         let _ = rbh_policy::reconcile::remove_policy_schedule(scheduler, id).await;
     }
@@ -1251,7 +1310,7 @@ impl IntoResponse for ApiError {
 }
 
 #[cfg(test)]
-mod scoped_api_tests {
+pub(crate) mod scoped_api_tests {
     use super::*;
     use axum_test::TestServer;
     use bytes::Bytes;
@@ -1262,7 +1321,7 @@ mod scoped_api_tests {
     use std::sync::Arc;
     use tokio::sync::{Mutex, RwLock};
 
-    fn state_without_database_connection() -> AppState {
+    pub(crate) fn state_without_database_connection() -> AppState {
         let pool = MySqlPoolOptions::new()
             .connect_lazy("mysql://root@127.0.0.1/rbh_entries_test")
             .unwrap();
@@ -1276,11 +1335,11 @@ mod scoped_api_tests {
         }
     }
 
-    fn integration_enabled() -> bool {
+    pub(crate) fn integration_enabled() -> bool {
         matches!(std::env::var("RBH_INTEGRATION"), Ok(value) if !value.is_empty() && value != "0")
     }
 
-    fn rev8_test_server(state: AppState) -> TestServer {
+    pub(crate) fn rev8_test_server(state: AppState) -> TestServer {
         use sha2::{Digest, Sha256};
 
         const TOKEN: &str = "rev8-rest-test-writer";
@@ -1292,13 +1351,13 @@ mod scoped_api_tests {
         server
     }
 
-    fn resource_document(kind: &str, name: &str, spec: serde_json::Value) -> serde_json::Value {
+    pub(crate) fn resource_document(kind: &str, name: &str, spec: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "hsm.storage.io/v1alpha3", "kind": kind, "metadata": {"name": name}, "spec": spec
         })
     }
 
-    fn rev8_archive_policy(filesystem: &str, name: &str) -> serde_json::Value {
+    pub(crate) fn rev8_archive_policy(filesystem: &str, name: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "hsm.storage.io/v1alpha3",
             "kind": "Policy",
@@ -1360,7 +1419,7 @@ mod scoped_api_tests {
         let response = server.get("/api/action-contracts").await;
         response.assert_status_ok();
         let contracts = response.json::<Vec<serde_json::Value>>();
-        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts.len(), 3);
         let url = "/api/action-contracts/lustre.hsm.archive";
         let entry = server.get(url).await;
         entry.assert_status_ok();
@@ -1368,7 +1427,8 @@ mod scoped_api_tests {
         assert_eq!(contracts[0]["definition"]["spec"]["effect"]["category"], "data_copy");
         let historical = server.get(&format!("{url}/revisions/1")).await;
         historical.assert_status_ok();
-        assert_eq!(historical.json::<serde_json::Value>(), contracts[0]);
+        assert_eq!(historical.json::<serde_json::Value>()["revision"], 1);
+        assert_eq!(contracts[0]["revision"], 2);
         server
             .put(url)
             .json(&contracts[0])
@@ -1381,7 +1441,7 @@ mod scoped_api_tests {
     async fn rev8_policy_reports_invalid_configuration_at_its_field() {
         let server = rev8_test_server(state_without_database_connection());
         for (field, value, error_field) in [
-            ("/spec/execution/activation/mode", "enforced".into(), "activation.mode"),
+            ("/spec/execution/activation/mode", "unknown".into(), "activation.mode"),
             ("/spec/trigger/interval", "0h".into(), "trigger.interval"),
         ] {
             let mut document = rev8_archive_policy("lustre", "archive-preview");
@@ -1537,6 +1597,12 @@ mod scoped_api_tests {
 
         check_resource_bindings(&server, &first, suffix, &policy_url, &preview_url, document).await;
         assert!(scheduler.list_schedules().await.unwrap().is_empty());
+        server.delete(&policy_url).await.assert_status(StatusCode::NO_CONTENT);
+        server.get(&policy_url).await.assert_status_not_found();
+        server
+            .get(&format!("{policy_url}/revisions/1"))
+            .await
+            .assert_status_ok();
     }
 
     async fn check_resource_bindings(
@@ -1665,7 +1731,7 @@ mod scoped_api_tests {
             .find(|binding| binding["kind"] == "ActionContract")
             .unwrap();
         assert_eq!(contract["name"], "lustre.hsm.archive");
-        assert_eq!(contract["revision"], 1);
+        assert_eq!(contract["revision"], 2);
         assert_eq!(contract["serverDefinition"]["metadata"]["name"], "lustre.hsm.archive");
 
         let human_floor = resource_document(

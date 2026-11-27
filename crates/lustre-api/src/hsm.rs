@@ -89,6 +89,14 @@ pub struct HsmUserStateInfo {
     pub in_progress_action: u32,
 }
 
+impl HsmUserStateInfo {
+    /// An undecodable action/state is treated as busy.
+    pub fn has_active_action(&self) -> bool {
+        // Lustre 2.16 can pair NOOP with WAITING when no coordinator item exists.
+        self.in_progress_action != sys::HUA_NONE && (self.in_progress_action != 0 || self.in_progress_state != 0)
+    }
+}
+
 bitflags! {
     /// Flags accepted by `llapi_hsm_request`. See `HSM_*` constants in `lustre_user.h`.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -231,6 +239,39 @@ impl HsmRequestBuilder {
 }
 
 impl LustreApi {
+    /// Identify the verified Lustre mount for FID-scoped HSM requests.
+    pub fn hsm_filesystem(&self, mount: &Path) -> Result<String> {
+        crate::stripe::validate_mount(mount)?;
+        let path = CString::new(mount.as_os_str().as_bytes())?;
+        let mut name = [0; 256];
+        // SAFETY: path is NUL-terminated and name holds len writable bytes.
+        let rc = unsafe { sys::llapi_get_fsname(path.as_ptr(), name.as_mut_ptr(), name.len()) };
+        crate::error::check_rc(rc, "llapi_get_fsname")?;
+        let name = name.map(|byte| byte as u8);
+        let name = std::ffi::CStr::from_bytes_until_nul(&name)
+            .map_err(|_| crate::error::LustreApiError::RecordParse("invalid filesystem name"))?;
+        let name = name.to_str()?;
+        if name.is_empty() {
+            return Err(crate::error::LustreApiError::NotALustreMount(mount.to_owned()));
+        }
+        Ok(name.to_owned())
+    }
+
+    /// Read authoritative flags and the coordinator's current request.
+    pub fn hsm_state_and_action(&self, path: &Path) -> Result<HsmUserStateInfo> {
+        let mut state = self.hsm_state_get(path)?;
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        let mut current = MaybeUninit::<sys::bindings::hsm_current_action>::uninit();
+        // SAFETY: the C call receives valid input and initializes current on success.
+        let rc = unsafe { sys::llapi_hsm_current_action(path.as_ptr(), current.as_mut_ptr()) };
+        check_rc_hsm(rc, HsmOp::CurrentAction)?;
+        // SAFETY: successful ioctl initialized the output.
+        let current = unsafe { current.assume_init() };
+        state.in_progress_state = current.hca_state;
+        state.in_progress_action = current.hca_action;
+        Ok(state)
+    }
+
     /// Read the HSM state for `path` via `llapi_hsm_state_get`.
     ///
     /// Returns `HsmUserStateInfo { states: HsmState::empty(), .. }` for files
@@ -248,7 +289,7 @@ impl LustreApi {
         // SAFETY: rc >= 0 means `hus` is fully initialized.
         let hus = unsafe { hus.assume_init() };
         Ok(HsmUserStateInfo {
-            states: HsmState::from_bits_truncate(hus.hus_states),
+            states: HsmState::from_bits_retain(hus.hus_states),
             archive_id: hus.hus_archive_id,
             in_progress_state: hus.hus_in_progress_state,
             in_progress_action: hus.hus_in_progress_action,

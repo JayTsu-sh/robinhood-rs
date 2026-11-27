@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::submit_hsm;
 use async_trait::async_trait;
 use lustre_api::LustreApi;
 use lustre_api::hsm::{HsmAction, HsmRequestBuilder};
@@ -173,17 +174,9 @@ impl ActionExecutor for HsmArchiveExecutor {
         let hints = self.hints.clone();
         let mount = ctx.mount_path.clone();
         let lustre = ctx.lustre;
-        tokio::task::spawn_blocking(move || {
-            let mut builder = HsmRequestBuilder::new(HsmAction::Archive)
-                .archive_id(archive_id)
-                .add_fid(fid);
-            if let Some(h) = hints {
-                builder = builder.data(h);
-            }
-            builder.submit(&lustre, &mount)
-        })
-        .await
-        .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
+        tokio::task::spawn_blocking(move || submit_hsm(lustre, &mount, fid, HsmAction::Archive, archive_id, hints))
+            .await
+            .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
 
         tracing::info!(archive_id, "HSM archive request submitted");
         Ok(ActionOutcome::Success)
@@ -235,13 +228,9 @@ impl ActionExecutor for HsmReleaseExecutor {
         let fid = entry.fid;
         let mount = ctx.mount_path.clone();
         let lustre = ctx.lustre;
-        tokio::task::spawn_blocking(move || {
-            HsmRequestBuilder::new(HsmAction::Release)
-                .add_fid(fid)
-                .submit(&lustre, &mount)
-        })
-        .await
-        .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
+        tokio::task::spawn_blocking(move || submit_hsm(lustre, &mount, fid, HsmAction::Release, 0, None))
+            .await
+            .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
 
         tracing::info!("HSM release request submitted");
         Ok(ActionOutcome::Success)
@@ -286,13 +275,9 @@ impl ActionExecutor for HsmRestoreExecutor {
         let fid = entry.fid;
         let mount = ctx.mount_path.clone();
         let lustre = ctx.lustre;
-        tokio::task::spawn_blocking(move || {
-            HsmRequestBuilder::new(HsmAction::Restore)
-                .add_fid(fid)
-                .submit(&lustre, &mount)
-        })
-        .await
-        .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
+        tokio::task::spawn_blocking(move || submit_hsm(lustre, &mount, fid, HsmAction::Restore, 0, None))
+            .await
+            .map_err(|e| ActionError::Store(format!("spawn_blocking join error: {e}")))??;
 
         tracing::info!("HSM restore request submitted");
         Ok(ActionOutcome::Success)

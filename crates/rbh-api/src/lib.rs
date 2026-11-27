@@ -16,6 +16,8 @@
 mod classifier_handlers;
 mod handlers;
 mod rev8_auth;
+#[cfg(test)]
+mod rev8_execution_tests;
 mod rev8_handlers;
 pub mod state;
 

@@ -1,13 +1,15 @@
-//! Compile the native HSM archive preview supported by the Rev.8 API.
+//! Compile the supported Rev.8 policy subset.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
 };
 
+pub mod execution;
 pub mod resources;
 use resources::{ResourceBinding, ResourceKind};
 
+use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use rbh_entry_store::store::{EntryStore, QueryParam};
 use rbh_entry_store::{BackendKind, EntryKind, FileSystemId};
 use rbh_predicate::{CmpOp, Field, Predicate, SqlParam, Value};
@@ -23,8 +25,16 @@ pub struct CompiledPolicy {
     pub name: String,
     pub filesystem: FileSystemId,
     pub(crate) selectors: BTreeSet<String>,
-    where_clause: String,
-    params: Vec<QueryParam>,
+    pub(crate) where_clause: String,
+    pub(crate) params: Vec<QueryParam>,
+    pub(crate) actions: Vec<Invocation>,
+    pub(crate) decision: String,
+    pub(crate) decision_params: Vec<QueryParam>,
+    pub(crate) enabled: bool,
+    pub(crate) enforced: bool,
+    pub(crate) one_shot: bool,
+    pub(crate) window: Option<JsonValue>,
+    pub(crate) budget: BudgetLimits,
 }
 
 #[derive(Serialize)]
@@ -54,14 +64,51 @@ pub(crate) fn parse(document: &JsonValue) -> Result<Policy, PolicyError> {
             "metadata.name must be a lowercase resource name of 1–253 characters",
         ));
     }
-    if let Trigger::Periodic { interval } = &policy.spec.trigger {
-        duration_millis(interval).ok_or_else(|| invalid("spec.trigger.interval must be a positive Rev.8 duration"))?;
-    }
+    policy.schedule_after(Utc::now())?;
     policy.spec.execution.budget.run.validate()?;
+    if policy.enforced_and_enabled() && policy.spec.execution.budget.run.max_duration.is_none() {
+        return Err(invalid(
+            "spec.execution.budget.run.maxDuration is required for enforced activation",
+        ));
+    }
+    if let Some(window) = &policy.spec.execution.admission_window {
+        execution::Window::parse(window)?;
+    }
     Ok(policy)
 }
 
 impl Policy {
+    pub(crate) fn schedule_after(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, PolicyError> {
+        let Trigger::Periodic { interval } = &self.spec.trigger else {
+            return Ok(None);
+        };
+        let delay = duration_millis(interval)
+            .and_then(|value| i64::try_from(value).ok())
+            .and_then(TimeDelta::try_milliseconds)
+            .ok_or_else(|| invalid("spec.trigger.interval must be a positive Rev.8 duration in the scheduler range"))?;
+        now.checked_add_signed(delay)
+            .filter(|date| date.year() <= 9999)
+            .map(Some)
+            .ok_or_else(|| invalid("spec.trigger.interval exceeds the scheduler range"))
+    }
+
+    pub(crate) fn next_run(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, PolicyError> {
+        if matches!(self.spec.mode, Some(RunMode::OneShot)) {
+            return Ok(None);
+        }
+        self.schedule_after(now)
+    }
+
+    pub(crate) fn enforced_and_enabled(&self) -> bool {
+        self.spec.enabled != Some(false)
+            && self
+                .spec
+                .execution
+                .activation
+                .as_ref()
+                .is_some_and(|activation| activation.mode == ActivationMode::Enforced)
+    }
+
     pub(crate) fn filesystem(&self) -> &FileSystemId {
         &self.spec.target.filesystem
     }
@@ -95,31 +142,50 @@ impl Policy {
             cmp: CmpOp::Eq,
             value: Value::Num(EntryKind::File as i64),
         };
-        let (mut where_clause, mut params) = rbh_predicate::to_sql(&Predicate::And {
+        let (mut where_clause, params) = rbh_predicate::to_sql(&Predicate::And {
             children: vec![files, target_condition],
         });
-        let (rules, rule_params) = spec.rules.compile(&mut conditions)?;
+        let rules = spec.rules.compile(&mut conditions)?;
         where_clause.push_str(" AND ");
-        where_clause.push_str(&rules);
-        params.extend(rule_params);
+        where_clause.push_str(&rules.excludes);
+        let decision_params = query_params(rules.params);
+        let mut params = query_params(params);
+        params.extend(query_params(rules.exclude_params));
         Ok(CompiledPolicy {
             name: self.metadata.name,
             filesystem: spec.target.filesystem,
             selectors: conditions.referenced,
             where_clause,
-            params: params
-                .into_iter()
-                .map(|param| match param {
-                    SqlParam::Num(value) => QueryParam::Int(value),
-                    SqlParam::Str(value) => QueryParam::Str(value),
-                })
-                .collect(),
+            actions: rules.actions,
+            decision: rules.decision,
+            decision_params,
+            enabled: spec.enabled.unwrap_or(true),
+            enforced: spec
+                .execution
+                .activation
+                .is_some_and(|activation| activation.mode == ActivationMode::Enforced),
+            one_shot: matches!(spec.mode, Some(RunMode::OneShot)),
+            window: spec.execution.admission_window,
+            budget: spec.execution.budget.run.limits(),
+            params,
         })
     }
 }
 
+fn query_params(params: Vec<SqlParam>) -> Vec<QueryParam> {
+    params
+        .into_iter()
+        .map(|param| match param {
+            SqlParam::Num(value) => QueryParam::Int(value),
+            SqlParam::Str(value) => QueryParam::Str(value),
+        })
+        .collect()
+}
+
 #[tracing::instrument(skip(entries))]
-pub(crate) async fn validate_filesystem(entries: &EntryStore, filesystem: &FileSystemId) -> Result<(), PolicyError> {
+pub(crate) async fn validate_filesystem(
+    entries: &EntryStore, filesystem: &FileSystemId,
+) -> Result<rbh_entry_store::FileSystemConfig, PolicyError> {
     let config = entries
         .get_filesystem(filesystem)
         .await
@@ -131,7 +197,7 @@ pub(crate) async fn validate_filesystem(entries: &EntryStore, filesystem: &FileS
             filesystem
         )));
     }
-    Ok(())
+    Ok(config)
 }
 
 impl CompiledPolicy {
@@ -140,8 +206,10 @@ impl CompiledPolicy {
         &self, entries: &EntryStore, revision: u64, resource_bindings: Vec<ResourceBinding>,
     ) -> Result<PreviewResult, PolicyError> {
         validate_filesystem(entries, &self.filesystem).await?;
+        let where_clause = format!("{} AND ({}) > 0", self.where_clause, self.decision);
+        let params: Vec<_> = self.params.iter().chain(&self.decision_params).cloned().collect();
         let (candidate_count, estimated_bytes) = entries
-            .scoped_totals_where(&self.filesystem, &self.where_clause, &self.params)
+            .scoped_totals_where(&self.filesystem, &where_clause, &params)
             .await
             .map_err(|error| PolicyError::Store(error.to_string()))?;
         Ok(PreviewResult {
@@ -180,12 +248,10 @@ struct Metadata {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Spec {
-    #[serde(rename = "enabled")]
-    _enabled: Option<bool>,
+    enabled: Option<bool>,
     #[serde(rename = "priority")]
     _priority: Option<u64>,
-    #[serde(rename = "mode")]
-    _mode: Option<RunMode>,
+    mode: Option<RunMode>,
     target: Target,
     trigger: Trigger,
     #[serde(rename = "objective")]
@@ -243,22 +309,22 @@ enum Objective {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Execution {
     profile_ref: String,
-    #[serde(rename = "activation")]
-    _activation: Option<Activation>,
+    activation: Option<Activation>,
+    admission_window: Option<JsonValue>,
     budget: Budget,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Activation {
-    #[serde(rename = "mode")]
-    _mode: ActivationMode,
+    mode: ActivationMode,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ActivationMode {
     Preview,
+    Enforced,
 }
 
 #[derive(Deserialize)]
@@ -270,15 +336,30 @@ struct Budget {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RunBudget {
-    #[serde(rename = "maxOperations")]
-    _max_operations: NonZeroU64,
-    #[serde(rename = "maxSubmitAttempts")]
-    _max_submit_attempts: NonZeroU64,
+    max_operations: NonZeroU64,
+    max_submit_attempts: NonZeroU64,
     max_object_logical_bytes: JsonValue,
     max_duration: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct BudgetLimits {
+    pub operations: u64,
+    pub attempts: u64,
+    pub bytes: u64,
+    pub duration_ms: Option<u64>,
+}
+
 impl RunBudget {
+    fn limits(&self) -> BudgetLimits {
+        BudgetLimits {
+            operations: self.max_operations.get(),
+            attempts: self.max_submit_attempts.get(),
+            bytes: size_bytes(&self.max_object_logical_bytes).expect("validated budget"),
+            duration_ms: self.max_duration.as_deref().and_then(duration_millis),
+        }
+    }
+
     fn validate(&self) -> Result<(), PolicyError> {
         size_bytes(&self.max_object_logical_bytes)
             .filter(|bytes| *bytes > 0)
@@ -313,16 +394,25 @@ struct Rules {
     entries: Vec<Rule>,
 }
 
+struct CompiledRules {
+    excludes: String,
+    decision: String,
+    params: Vec<SqlParam>,
+    exclude_params: Vec<SqlParam>,
+    actions: Vec<Invocation>,
+}
+
 impl Rules {
-    fn compile(self, conditions: &mut ConditionCompiler<'_>) -> Result<(String, Vec<SqlParam>), PolicyError> {
+    fn compile(self, conditions: &mut ConditionCompiler<'_>) -> Result<CompiledRules, PolicyError> {
         if self.entries.is_empty() {
             return Err(invalid("spec.rules.entries must contain at least one rule"));
         }
         let default_action = self.defaults.and_then(|defaults| defaults.action);
-        if let Some(action) = &default_action
-            && action.kind.is_none()
-        {
-            return Err(invalid("spec.rules.defaults.action.type is required"));
+        if let Some(action) = &default_action {
+            let kind = action
+                .kind
+                .ok_or_else(|| invalid("spec.rules.defaults.action.type is required"))?;
+            action.archive_id(kind, "spec.rules.defaults")?;
         }
         let mut rules: Vec<_> = self.entries.into_iter().enumerate().collect();
         rules.sort_by_key(|(_, rule)| std::cmp::Reverse(rule.priority));
@@ -332,38 +422,58 @@ impl Rules {
             .enumerate()
             .map(|(i, condition)| conditions.compile(condition, &format!("spec.rules.exclude[{i}]")))
             .collect::<Result<Vec<_>, _>>()?;
-        let (exclude, mut params) = rbh_predicate::to_sql(&Predicate::Not {
+        let (exclude, exclude_params) = rbh_predicate::to_sql(&Predicate::Not {
             inner: Box::new(Predicate::Or { children: excludes }),
         });
-        let mut clauses = vec![exclude, "AND CASE".to_owned()];
+        let mut clauses = vec!["CASE".to_owned()];
+        let mut actions = Vec::new();
+        let mut params = Vec::new();
         for (index, rule) in rules {
             let path = format!("spec.rules.entries[{index}]");
-            let execute = match rule.decision {
-                Decision::Execute => {
-                    let action_kind = rule
+            let branch = match rule.decision {
+                Decision::Execute | Decision::RequireApproval => {
+                    let kind = rule
                         .action
                         .as_ref()
                         .and_then(|action| action.kind)
-                        .or_else(|| default_action.as_ref().and_then(|action| action.kind));
-                    if action_kind.is_none() {
-                        return Err(invalid(format!(
-                            "{path}.action.type is required when no default action is set"
-                        )));
-                    }
-                    true
+                        .or_else(|| default_action.as_ref().and_then(|action| action.kind))
+                        .ok_or_else(|| {
+                            invalid(format!("{path}.action.type is required when no default action is set"))
+                        })?;
+                    let default_archive = default_action
+                        .as_ref()
+                        .filter(|action| action.kind == Some(kind))
+                        .and_then(|action| action.params.as_ref())
+                        .and_then(|params| params.archive_id);
+                    let rule_archive = match &rule.action {
+                        Some(action) => action.archive_id(kind, &path)?,
+                        None => None,
+                    };
+                    actions.push(Invocation {
+                        kind,
+                        archive_id: rule_archive.or(default_archive).unwrap_or_default(),
+                        requires_human: matches!(rule.decision, Decision::RequireApproval),
+                    });
+                    actions.len()
                 }
                 Decision::Skip if rule.action.is_some() => {
                     return Err(invalid(format!("{path}.action cannot be set on a skip rule")));
                 }
-                Decision::Skip => false,
+                Decision::Skip => 0,
             };
             let (condition, rule_params) =
                 rbh_predicate::to_sql(&conditions.compile(&rule.condition, &format!("{path}.match"))?);
-            clauses.push(format!("WHEN {condition} THEN {}", u8::from(execute)));
+            clauses.push(format!("WHEN {condition} THEN {branch}"));
             params.extend(rule_params);
         }
-        clauses.push("ELSE 0 END = 1".to_owned());
-        Ok((clauses.join(" "), params))
+        clauses.push("ELSE 0 END".to_owned());
+        Ok(CompiledRules {
+            excludes: exclude,
+            decision: clauses.join(" "),
+            params,
+            exclude_params,
+            actions,
+        })
     }
 }
 
@@ -408,6 +518,7 @@ struct Rule {
 #[serde(rename_all = "snake_case")]
 enum Decision {
     Execute,
+    RequireApproval,
     Skip,
 }
 
@@ -416,16 +527,63 @@ enum Decision {
 struct Action {
     #[serde(rename = "type")]
     kind: Option<ActionKind>,
-    #[serde(rename = "params")]
-    _params: Option<ArchiveParams>,
+    params: Option<ArchiveParams>,
     #[serde(rename = "targetRef")]
     _target_ref: Option<ActionTarget>,
 }
 
-#[derive(Clone, Copy, Deserialize)]
-enum ActionKind {
+impl Action {
+    fn archive_id(&self, kind: ActionKind, path: &str) -> Result<Option<u32>, PolicyError> {
+        let id = self.params.as_ref().and_then(|params| params.archive_id);
+        if id.is_some() && kind != ActionKind::Archive {
+            return Err(invalid(format!(
+                "{path}.action.params.archiveId is only supported for archive"
+            )));
+        }
+        Ok(id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ActionKind {
     #[serde(rename = "lustre.hsm.archive")]
     Archive,
+    #[serde(rename = "lustre.hsm.release")]
+    Release,
+    #[serde(rename = "lustre.hsm.restore")]
+    Restore,
+}
+
+impl ActionKind {
+    pub const ALL: [Self; 3] = [Self::Archive, Self::Release, Self::Restore];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Archive => "lustre.hsm.archive",
+            Self::Release => "lustre.hsm.release",
+            Self::Restore => "lustre.hsm.restore",
+        }
+    }
+
+    pub const fn effect(self) -> &'static str {
+        match self {
+            Self::Archive => "data_copy",
+            Self::Release => "data_release",
+            Self::Restore => "data_copy",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Invocation {
+    pub kind: ActionKind,
+    pub archive_id: u32,
+    pub(crate) requires_human: bool,
 }
 
 #[derive(Deserialize)]
@@ -438,7 +596,7 @@ enum ActionTarget {
 #[serde(deny_unknown_fields)]
 struct ArchiveParams {
     #[serde(rename = "archiveId")]
-    _archive_id: Option<u32>,
+    archive_id: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -590,7 +748,7 @@ fn match_all() -> JsonValue {
     JsonValue::Bool(true)
 }
 
-fn invalid(message: impl Into<String>) -> PolicyError {
+pub(crate) fn invalid(message: impl Into<String>) -> PolicyError {
     PolicyError::InvalidPolicy(message.into())
 }
 

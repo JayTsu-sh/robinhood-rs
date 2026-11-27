@@ -1,0 +1,851 @@
+use chrono::{DateTime, Utc};
+use lustre_api::LuFid;
+use rbh_entry_store::{EntryStore, FileSystemConfig, fid_codec, store::QueryParam};
+use serde::Serialize;
+use serde_json::Value;
+use sqlx::{MySql, Transaction, types::Json};
+
+use super::PolicyStore;
+use crate::{
+    PolicyError,
+    rev8::{
+        self, ActionKind, BudgetLimits, CompiledPolicy, Invocation,
+        execution::{Admission, Decision, Generation, LustreHsm, NativeHsm, Profile, Submission},
+        invalid,
+        resources::safety_matches,
+    },
+};
+
+const BATCH_SIZE: usize = 64;
+const RUN_FIELDS: &str =
+    "id, policy_id, revision, state, reason, candidate_count, estimated_bytes, requested_by, created_at, started_at";
+const OPERATION_FIELDS: &str =
+    "o.id, o.run_id, r.policy_id, r.revision, o.filesystem, o.fid, o.action, o.archive_id, o.state,
+     o.reason, o.attempted, o.generation, o.principal, o.size, o.accepted_at, o.completion_evidence";
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct Rev8Run {
+    pub id: u64,
+    pub policy_id: u64,
+    pub revision: u64,
+    pub state: String,
+    pub reason: Option<String>,
+    pub candidate_count: Option<u64>,
+    pub estimated_bytes: Option<u64>,
+    pub requested_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct Rev8Operation {
+    pub id: u64,
+    pub run_id: u64,
+    pub policy_id: u64,
+    pub revision: u64,
+    pub filesystem: String,
+    #[serde(serialize_with = "serialize_fid")]
+    fid: Vec<u8>,
+    pub action: String,
+    pub archive_id: u32,
+    pub state: String,
+    pub reason: Option<String>,
+    pub attempted: bool,
+    pub generation: Option<Json<Generation>>,
+    pub principal: Option<Json<Value>>,
+    pub size: u64,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub completion_evidence: Option<Json<Value>>,
+}
+
+fn serialize_fid<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    decode_fid(bytes)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn decode_fid(bytes: &[u8]) -> Result<LuFid, PolicyError> {
+    fid_codec::decode(bytes).ok_or_else(|| PolicyError::Store("invalid persisted Lustre FID".into()))
+}
+
+#[derive(sqlx::FromRow)]
+struct Candidate {
+    fid: Vec<u8>,
+    size: u64,
+    mtime: i64,
+    ctime: i64,
+    branch: i64,
+}
+
+#[derive(Default, sqlx::FromRow)]
+struct Usage {
+    action: String,
+    operations: u64,
+    attempts: u64,
+    bytes: u64,
+}
+
+impl Usage {
+    fn add(&mut self, other: &Self) {
+        self.operations = self.operations.saturating_add(other.operations);
+        self.attempts = self.attempts.saturating_add(other.attempts);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+
+    fn exceeds(&self, limits: BudgetLimits, size: u64, elapsed_ms: u64) -> bool {
+        self.exhausted(limits, elapsed_ms) || limits.bytes.checked_sub(self.bytes).is_none_or(|left| size > left)
+    }
+
+    fn exhausted(&self, limits: BudgetLimits, elapsed_ms: u64) -> bool {
+        self.operations >= limits.operations
+            || self.attempts >= limits.attempts
+            || limits.duration_ms.is_some_and(|limit| elapsed_ms >= limit)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct Outstanding {
+    filesystem: String,
+    action: String,
+    operations: i64,
+}
+
+enum AdmissionBlock {
+    PolicyBudget,
+    SafetyBudget,
+    OutstandingLimit,
+    ProfileLimit,
+}
+
+impl AdmissionBlock {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::PolicyBudget => "policy_run_budget",
+            Self::SafetyBudget => "system_safety_run_budget",
+            Self::OutstandingLimit => "system_safety_outstanding_limit",
+            Self::ProfileLimit => "profile_concurrency_limit",
+        }
+    }
+
+    fn is_capacity(&self) -> bool {
+        matches!(self, Self::OutstandingLimit | Self::ProfileLimit)
+    }
+}
+
+struct Dispatch<'a> {
+    run: &'a Rev8Run,
+    policy: &'a CompiledPolicy,
+    admission: &'a Admission,
+    config: &'a FileSystemConfig,
+}
+
+impl PolicyStore {
+    pub(super) async fn synchronous_permit_store(&self) -> Result<bool, PolicyError> {
+        Ok(
+            sqlx::query_scalar::<_, u64>("SELECT CAST(@@GLOBAL.innodb_flush_log_at_trx_commit AS UNSIGNED)")
+                .fetch_one(&self.pool)
+                .await?
+                == 1,
+        )
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn request_rev8_run(&self, id: u64, actor: &str) -> Result<u64, PolicyError> {
+        let mut tx = self.lock_configuration().await?;
+        let row: Option<(u64, Json<Value>)> = sqlx::query_as(
+            "SELECT revision, definition FROM policies WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL FOR UPDATE",
+        ).bind(id).fetch_optional(&mut *tx).await?;
+        let (revision, definition) = row.ok_or(PolicyError::NotFound(id))?;
+        if definition["spec"]["enabled"] == false {
+            return Err(invalid("the policy is disabled"));
+        }
+        if definition["spec"]["mode"] == "one_shot"
+            && let Some(existing) = existing_one_shot_run(&mut tx, id, revision, &definition).await?
+        {
+            return Ok(existing);
+        }
+        let run = sqlx::query("INSERT INTO rev8_runs (policy_id, revision, requested_by) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(revision)
+            .bind(actor)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_id();
+        tx.commit().await?;
+        Ok(run)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn list_rev8_runs(&self, id: u64, after: u64) -> Result<Vec<Rev8Run>, PolicyError> {
+        let exists = sqlx::query_scalar::<_, u64>("SELECT id FROM policies WHERE id = ? AND revision IS NOT NULL")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(PolicyError::NotFound(id));
+        }
+        Ok(sqlx::query_as(&format!(
+            "SELECT {RUN_FIELDS} FROM rev8_runs WHERE policy_id = ? AND id > ? ORDER BY id LIMIT 100"
+        ))
+        .bind(id)
+        .bind(after)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn list_rev8_operations(
+        &self, policy: u64, run: u64, after: u64,
+    ) -> Result<Vec<Rev8Operation>, PolicyError> {
+        let exists = sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_runs WHERE id = ? AND policy_id = ?")
+            .bind(run)
+            .bind(policy)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(PolicyError::NotFound(run));
+        }
+        Ok(sqlx::query_as(&format!(
+            "SELECT {OPERATION_FIELDS} FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id
+            WHERE r.id = ? AND o.id > ? ORDER BY o.id LIMIT 100"
+        ))
+        .bind(run)
+        .bind(after)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn reset_rev8_breaker(&self, id: u64, actor: &str) -> Result<(), PolicyError> {
+        let mut tx = self.lock_configuration().await?;
+        let active = sqlx::query_scalar::<_, u64>(
+            "SELECT id FROM policies WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if active.is_none() {
+            return Err(PolicyError::NotFound(id));
+        }
+        sqlx::query(
+            "INSERT INTO rev8_breakers (policy_id, reset_by, reset_at)
+             VALUES (?, ?, UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE
+             reset_by = VALUES(reset_by), reset_at = VALUES(reset_at), opened = FALSE",
+        )
+        .bind(id)
+        .bind(actor)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Advance a bounded batch. The database lock serializes workers that share
+    /// a catalog. The submission record uses a separate, committed transaction.
+    #[tracing::instrument(skip_all, fields(worker = "rev8"))]
+    pub async fn process_rev8(&self, entries: &EntryStore) -> Result<(), PolicyError> {
+        let mut worker = self.pool.begin().await?;
+        sqlx::query_scalar::<_, u8>("SELECT id FROM rev8_worker_lock WHERE id = 1 FOR UPDATE")
+            .fetch_one(&mut *worker)
+            .await?;
+
+        self.reconcile_operations(entries).await?;
+        self.enqueue_due_policies().await?;
+        let run: Option<Rev8Run> = sqlx::query_as(&format!(
+            "SELECT {RUN_FIELDS} FROM rev8_runs WHERE state IN ('queued', 'running') ORDER BY updated_at, id LIMIT 1"
+        ))
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(run) = run {
+            self.advance_run(entries, run, &mut worker).await?;
+        }
+        worker.commit().await?;
+        Ok(())
+    }
+
+    async fn enqueue_due_policies(&self) -> Result<(), PolicyError> {
+        let mut tx = self.lock_configuration().await?;
+        let due: Vec<(u64, u64, Json<Value>)> = sqlx::query_as(
+            "SELECT p.id, p.revision, p.definition FROM policies p
+             WHERE p.enabled AND p.rev8_next_run <= UTC_TIMESTAMP(6) AND NOT EXISTS (
+                SELECT 1 FROM rev8_runs r WHERE r.policy_id = p.id AND r.revision = p.revision
+                AND r.state IN ('queued','running'))
+             ORDER BY p.rev8_next_run, p.id LIMIT 64 FOR UPDATE",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for (id, revision, definition) in due {
+            let policy = rev8::parse(&definition)?;
+            let next = policy.next_run(Utc::now())?;
+            sqlx::query("UPDATE policies SET rev8_next_run = ? WHERE id = ?")
+                .bind(next)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            if next.is_none()
+                && existing_one_shot_run(&mut tx, id, revision, &definition)
+                    .await?
+                    .is_some()
+            {
+                continue;
+            }
+            sqlx::query("INSERT INTO rev8_runs (policy_id, revision) VALUES (?, ?)")
+                .bind(id)
+                .bind(revision)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, fields(run_id = run.id, policy_id = run.policy_id, revision = run.revision))]
+    async fn advance_run(
+        &self, entries: &EntryStore, mut run: Rev8Run, worker: &mut Transaction<'_, MySql>,
+    ) -> Result<(), PolicyError> {
+        let Some(row) = self.get_rev8(run.policy_id).await? else {
+            return self.finish_run(run.id, "cancelled", Some("policy_deleted")).await;
+        };
+        if row.revision != run.revision || row.definition["spec"]["enabled"] == false {
+            return self
+                .finish_run(run.id, "cancelled", Some("policy_revision_inactive"))
+                .await;
+        }
+        let bindings = row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default();
+        let policy = self.compile_revision(&row.definition, &bindings).await?;
+        let preview = if run.candidate_count.is_none() {
+            match policy.preview(entries, row.revision, bindings.clone()).await {
+                Ok(preview) => Some(preview),
+                Err(PolicyError::InvalidPolicy(reason)) => {
+                    return self.finish_run(run.id, "deferred", Some(&reason)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let now = Utc::now();
+        if let Some(preview) = preview {
+            let state = if policy.enforced { "running" } else { "previewed" };
+            sqlx::query(
+                "UPDATE rev8_runs SET state = ?, candidate_count = ?, estimated_bytes = ?, started_at = ? WHERE id = ?",
+            )
+            .bind(state)
+            .bind(preview.candidate_count)
+            .bind(preview.estimated_bytes)
+            .bind(now)
+            .bind(run.id)
+            .execute(&self.pool)
+            .await?;
+            if !policy.enforced {
+                return Ok(());
+            }
+        }
+        run.started_at.get_or_insert(now);
+        let Some(runtime) = self.runtime.as_ref() else {
+            return self
+                .finish_run(run.id, "deferred", Some("workload_identity_unavailable"))
+                .await;
+        };
+        let config = match rev8::validate_filesystem(entries, &policy.filesystem).await {
+            Ok(config) => config,
+            Err(PolicyError::InvalidPolicy(reason)) => return self.finish_run(run.id, "deferred", Some(&reason)).await,
+            Err(error) => return Err(error),
+        };
+        let mut tx = self.pool.begin().await?;
+        let admission = Self::compile_admission(&mut tx, &policy, &bindings, runtime.principal.clone()).await;
+        tx.commit().await?;
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(PolicyError::InvalidPolicy(reason)) => return self.finish_run(run.id, "deferred", Some(&reason)).await,
+            Err(error) => return Err(error),
+        };
+        if !self.synchronous_permit_store().await? {
+            return self
+                .finish_run(run.id, "deferred", Some("permit_store_requires_synchronous_commit"))
+                .await;
+        }
+        if !admission.window_open(Utc::now()) {
+            return self
+                .finish_run(run.id, "deferred", Some("admission_window_closed"))
+                .await;
+        }
+        let dispatch = Dispatch {
+            run: &run,
+            policy: &policy,
+            admission: &admission,
+            config: &config,
+        };
+        self.dispatch_batch(dispatch, worker).await
+    }
+
+    async fn finish_run(&self, id: u64, state: &str, reason: Option<&str>) -> Result<(), PolicyError> {
+        sqlx::query("UPDATE rev8_runs SET state = ?, reason = ?, updated_at = UTC_TIMESTAMP(6) WHERE id = ?")
+            .bind(state)
+            .bind(reason.map(short_reason))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn dispatch_batch(
+        &self, dispatch: Dispatch<'_>, worker: &mut Transaction<'_, MySql>,
+    ) -> Result<(), PolicyError> {
+        let run = dispatch.run;
+        let policy = dispatch.policy;
+        let cursor: Option<Vec<u8>> = sqlx::query_scalar("SELECT cursor_id FROM rev8_runs WHERE id = ?")
+            .bind(run.id)
+            .fetch_one(&self.pool)
+            .await?;
+        let cursor = cursor.unwrap_or_else(|| vec![0; 16]);
+        let sql = format!(
+            "SELECT object_id AS fid, size, mtime, ctime, CAST(({}) AS SIGNED) AS branch
+             FROM scoped_entries AS entries WHERE filesystem_id = ? AND object_kind = 0 AND object_id > ?
+             AND ({}) HAVING branch > 0 ORDER BY object_id LIMIT {BATCH_SIZE}",
+            policy.decision, policy.where_clause,
+        );
+        let mut query = sqlx::query_as::<_, Candidate>(&sql);
+        for param in &policy.decision_params {
+            query = match param {
+                QueryParam::Int(value) => query.bind(*value),
+                QueryParam::Str(value) => query.bind(value),
+            };
+        }
+        query = query.bind(policy.filesystem.as_str()).bind(cursor);
+        for param in &policy.params {
+            query = match param {
+                QueryParam::Int(value) => query.bind(*value),
+                QueryParam::Str(value) => query.bind(value),
+            };
+        }
+        let candidates = query.fetch_all(&self.pool).await?;
+        for candidate in &candidates {
+            if !dispatch.admission.window_open(Utc::now()) {
+                return self
+                    .finish_run(run.id, "deferred", Some("admission_window_closed"))
+                    .await;
+            }
+            if self.breaker_open(run.policy_id, &dispatch.admission.profile).await? {
+                return self
+                    .finish_run(run.id, "deferred", Some("policy_circuit_breaker_open"))
+                    .await;
+            }
+            let invocation = policy.actions[candidate.branch as usize - 1];
+            let stats: Vec<Usage> = sqlx::query_as(
+                "SELECT action, CAST(COUNT(*) AS UNSIGNED) AS operations, CAST(SUM(attempted OR state = 'submitting') AS UNSIGNED) AS attempts,
+                 CAST(SUM(size) AS UNSIGNED) AS bytes FROM rev8_operations WHERE run_id = ? AND state <> 'deferred' GROUP BY action",
+            ).bind(run.id).fetch_all(&self.pool).await?;
+            if usage_for_scope(&stats, policy.filesystem.as_str(), None).exhausted(policy.budget, elapsed_ms(run)) {
+                return self.finish_run(run.id, "finished", Some("policy_run_budget")).await;
+            }
+            if let Some(block) = self
+                .block_reason(&dispatch, invocation.kind, candidate.size, &stats)
+                .await?
+            {
+                if policy.one_shot && block.is_capacity() {
+                    return self.finish_run(run.id, "running", Some(block.reason())).await;
+                }
+                self.record_deferred(&dispatch, candidate, invocation, block.reason())
+                    .await?;
+                continue;
+            }
+            self.admit_candidate(&dispatch, candidate, invocation, worker).await?;
+        }
+        if candidates.len() < BATCH_SIZE {
+            self.finish_run(run.id, "finished", None).await?;
+        } else if let Some(last) = candidates.last() {
+            sqlx::query("UPDATE rev8_runs SET cursor_id = ? WHERE id = ?")
+                .bind(&last.fid)
+                .bind(run.id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn block_reason(
+        &self, dispatch: &Dispatch<'_>, action: ActionKind, size: u64, stats: &[Usage],
+    ) -> Result<Option<AdmissionBlock>, PolicyError> {
+        let elapsed = elapsed_ms(dispatch.run);
+        let sum = |scope| usage_for_scope(stats, dispatch.policy.filesystem.as_str(), scope);
+        if sum(None).exceeds(dispatch.policy.budget, size, elapsed) {
+            return Ok(Some(AdmissionBlock::PolicyBudget));
+        }
+        for safety in &dispatch.admission.safety {
+            if !safety_matches(safety, dispatch.policy.filesystem.as_str(), action) {
+                continue;
+            }
+            if sum(Some(safety)).exceeds(BudgetLimits::from_safety(safety), size, elapsed) {
+                return Ok(Some(AdmissionBlock::SafetyBudget));
+            }
+            if let Some(max) = safety["limits"]["maxUnknownOutstanding"].as_u64() {
+                let rows: Vec<Outstanding> = sqlx::query_as(
+                    "SELECT filesystem, action, COUNT(*) AS operations FROM rev8_operations
+                     WHERE pending_fid IS NOT NULL GROUP BY filesystem, action",
+                )
+                .fetch_all(&self.pool)
+                .await?;
+                let pending: u64 = rows
+                    .iter()
+                    .filter(|row| {
+                        ActionKind::from_name(&row.action)
+                            .is_some_and(|action| safety_matches(safety, &row.filesystem, action))
+                    })
+                    .map(|row| row.operations as u64)
+                    .sum();
+                if pending >= max {
+                    return Ok(Some(AdmissionBlock::OutstandingLimit));
+                }
+            }
+        }
+        let profile = &dispatch.admission.profile;
+        let active = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM rev8_operations WHERE execution_profile = ? AND pending_fid IS NOT NULL",
+        )
+        .bind(&profile.name)
+        .fetch_one(&self.pool)
+        .await?;
+        if active as u64 >= profile.slots {
+            return Ok(Some(AdmissionBlock::ProfileLimit));
+        }
+        Ok(None)
+    }
+
+    async fn breaker_open(&self, id: u64, profile: &Profile) -> Result<bool, PolicyError> {
+        if profile.breakers.is_empty() {
+            return Ok(false);
+        }
+        let (reset_at, open) = sqlx::query_as::<_, (Option<DateTime<Utc>>, bool)>(
+            "SELECT reset_at, opened FROM rev8_breakers WHERE policy_id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_default();
+        if open {
+            return Ok(true);
+        }
+        for breaker in &profile.breakers {
+            // The native adapter currently has two definitive error classes.
+            let first = breaker.classes[0].name();
+            let second = breaker.classes.get(1).map_or(first, |class| class.name());
+            let last_other: Option<(DateTime<Utc>, u64)> = sqlx::query_as(
+                "SELECT o.finished_at, o.id FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id
+                 WHERE r.policy_id = ? AND o.finished_at IS NOT NULL AND (? IS NULL OR o.finished_at > ?)
+                 AND (o.terminal_error_class IS NULL OR o.terminal_error_class NOT IN (?, ?))
+                 ORDER BY o.finished_at DESC, o.id DESC LIMIT 1",
+            )
+            .bind(id)
+            .bind(reset_at)
+            .bind(reset_at)
+            .bind(first)
+            .bind(second)
+            .fetch_optional(&self.pool)
+            .await?;
+            let (finished_at, operation_id) = last_other.map_or((None, 0), |(time, id)| (Some(time), id));
+            let failures = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id
+                 WHERE r.policy_id = ? AND (? IS NULL OR o.finished_at > ?) AND o.terminal_error_class IN (?, ?)
+                 AND (? IS NULL OR (o.finished_at, o.id) > (?, ?))",
+            )
+            .bind(id)
+            .bind(reset_at)
+            .bind(reset_at)
+            .bind(first)
+            .bind(second)
+            .bind(finished_at)
+            .bind(finished_at)
+            .bind(operation_id)
+            .fetch_one(&self.pool)
+            .await?;
+            if failures as u64 >= breaker.threshold {
+                sqlx::query(
+                    "INSERT INTO rev8_breakers (policy_id, reset_at, opened) VALUES (?, ?, TRUE)
+                     ON DUPLICATE KEY UPDATE opened = IF(reset_at <=> VALUES(reset_at), TRUE, opened)",
+                )
+                .bind(id)
+                .bind(reset_at)
+                .execute(&self.pool)
+                .await?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn admit_candidate(
+        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, mut invocation: Invocation,
+        worker: &mut Transaction<'_, MySql>,
+    ) -> Result<(), PolicyError> {
+        let fs = dispatch.policy.filesystem.as_str();
+        let existing = sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_operations WHERE run_id = ? AND fid = ?")
+            .bind(dispatch.run.id)
+            .bind(&candidate.fid)
+            .fetch_optional(&self.pool)
+            .await?;
+        if existing.is_some() {
+            return Ok(());
+        }
+        let in_flight =
+            sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_operations WHERE filesystem = ? AND pending_fid = ?")
+                .bind(fs)
+                .bind(&candidate.fid)
+                .fetch_optional(&self.pool)
+                .await?;
+        if in_flight.is_some() {
+            return self
+                .record_deferred(dispatch, candidate, invocation, "unresolved_operation")
+                .await;
+        }
+        let fid = decode_fid(&candidate.fid)?;
+        let mount = &dispatch.config.mount_path;
+        let snapshot = match self.backend().observe(mount, fid).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return self
+                    .record_deferred(dispatch, candidate, invocation, "fid_missing")
+                    .await;
+            }
+            Err(error) => return self.record_deferred(dispatch, candidate, invocation, &error).await,
+        };
+        let seen = &snapshot.generation;
+        if seen.size != candidate.size || seen.mtime != candidate.mtime || seen.ctime != candidate.ctime {
+            return self
+                .record_deferred(dispatch, candidate, invocation, "catalog_generation_changed")
+                .await;
+        }
+        if invocation.kind != ActionKind::Archive {
+            invocation.archive_id = snapshot.state.archive_id;
+        }
+        if let Decision::Defer(reason) = dispatch.admission.authorize(fs, invocation) {
+            return self.record_deferred(dispatch, candidate, invocation, &reason).await;
+        }
+        if let Err(reason) = invocation.precondition(&snapshot.state) {
+            return self.record_deferred(dispatch, candidate, invocation, reason).await;
+        }
+        let runtime = self.runtime.as_ref().expect("dispatch requires a runtime");
+        let operation = sqlx::query(
+            "INSERT INTO rev8_operations (run_id, filesystem, fid, action, archive_id, state, generation, size, principal, execution_profile)
+             VALUES (?, ?, ?, ?, ?, 'submitting', ?, ?, ?, ?)",
+        ).bind(dispatch.run.id).bind(fs).bind(&candidate.fid).bind(invocation.kind.name()).bind(invocation.archive_id)
+            .bind(Json(seen)).bind(seen.size).bind(Json(&runtime.principal)).bind(&dispatch.admission.profile.name)
+            .execute(&self.pool).await?.last_insert_id();
+
+        // Hold the policy head through revalidation and the request. A disable,
+        // replacement or delete cannot commit in the middle of issuing it.
+        let mut tx = self.pool.begin().await?;
+        let active = current_revision(&mut tx, dispatch.run).await?;
+        let owns_permit: Option<u64> =
+            sqlx::query_scalar("SELECT id FROM rev8_operations WHERE id = ? AND state = 'submitting' FOR UPDATE")
+                .bind(operation)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if owns_permit.is_none() {
+            return Ok(());
+        }
+        let (state, attempted, reason, terminal_class) = if !active || !dispatch.admission.window_open(Utc::now()) {
+            ("deferred", false, Some("policy_or_window_inactive".into()), None)
+        } else {
+            let live = self.backend().observe(mount, fid).await;
+            match live {
+                Ok(Some(current)) if current.generation == snapshot.generation && current.state == snapshot.state => {
+                    if !dispatch.admission.window_open(Utc::now()) {
+                        ("deferred", false, Some("admission_window_closed".into()), None)
+                    } else if let Some(reason) = self.deadline_elapsed(dispatch, invocation.kind) {
+                        ("deferred", false, Some(reason.into()), None)
+                    } else {
+                        // Verify that the worker transaction still owns its lock.
+                        // The committed operation reserves the FID and budget even
+                        // if the connection is lost after this check.
+                        let permit_store = sqlx::query_scalar::<_, u8>(
+                            "SELECT id FROM rev8_worker_lock WHERE id = 1 AND @@GLOBAL.innodb_flush_log_at_trx_commit = 1 FOR UPDATE",
+                        ).fetch_optional(&mut **worker).await?;
+                        if permit_store.is_none() {
+                            (
+                                "deferred",
+                                false,
+                                Some("permit_store_requires_synchronous_commit".into()),
+                                None,
+                            )
+                        } else {
+                            match self.backend().submit(mount, fid, invocation).await {
+                                Submission::Accepted => ("submitted", true, None, None),
+                                Submission::Rejected { error, class } => {
+                                    ("failed", true, Some(error), class.map(|class| class.name()))
+                                }
+                                Submission::Unknown(error) => ("unknown", true, Some(error), None),
+                            }
+                        }
+                    }
+                }
+                _ => ("deferred", false, Some("target_changed_before_submit".into()), None),
+            }
+        };
+        sqlx::query(
+            "UPDATE rev8_operations SET state = ?, attempted = ?, reason = ?, terminal_error_class = ?,
+             accepted_at = CASE WHEN ? = 'submitted' THEN UTC_TIMESTAMP(6) ELSE NULL END,
+             finished_at = CASE WHEN ? = 'failed' THEN UTC_TIMESTAMP(6) ELSE NULL END WHERE id = ? AND state = 'submitting'",
+        ).bind(state).bind(attempted).bind(reason.as_deref().map(short_reason)).bind(terminal_class)
+            .bind(state).bind(state).bind(operation).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    fn deadline_elapsed(&self, dispatch: &Dispatch<'_>, action: ActionKind) -> Option<&'static str> {
+        let elapsed = elapsed_ms(dispatch.run);
+        if dispatch.policy.budget.duration_ms.is_some_and(|limit| elapsed >= limit) {
+            return Some("policy_run_duration");
+        }
+        dispatch
+            .admission
+            .safety
+            .iter()
+            .any(|scope| {
+                safety_matches(scope, dispatch.policy.filesystem.as_str(), action)
+                    && BudgetLimits::from_safety(scope)
+                        .duration_ms
+                        .is_some_and(|limit| elapsed >= limit)
+            })
+            .then_some("system_safety_run_duration")
+    }
+
+    async fn record_deferred(
+        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: Invocation, reason: &str,
+    ) -> Result<(), PolicyError> {
+        sqlx::query(
+            "INSERT INTO rev8_operations (run_id, filesystem, fid, action, archive_id, state, reason, size)
+             VALUES (?, ?, ?, ?, ?, 'deferred', ?, ?) ON DUPLICATE KEY UPDATE id = id",
+        )
+        .bind(dispatch.run.id)
+        .bind(dispatch.policy.filesystem.as_str())
+        .bind(&candidate.fid)
+        .bind(invocation.kind.name())
+        .bind(invocation.archive_id)
+        .bind(short_reason(reason))
+        .bind(candidate.size)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn reconcile_operations(&self, entries: &EntryStore) -> Result<(), PolicyError> {
+        let pending: Vec<Rev8Operation> = sqlx::query_as(&format!(
+            "SELECT {OPERATION_FIELDS} FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id
+             WHERE o.pending_fid IS NOT NULL ORDER BY o.checked_at, o.id LIMIT {BATCH_SIZE}"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        for operation in pending {
+            let filesystem = rbh_entry_store::FileSystemId::new(&operation.filesystem)
+                .map_err(|error| PolicyError::Store(error.to_string()))?;
+            let action =
+                ActionKind::from_name(&operation.action).ok_or_else(|| invalid("unknown persisted HSM action"))?;
+            let invocation = Invocation {
+                kind: action,
+                archive_id: operation.archive_id,
+                requires_human: false,
+            };
+            let fid = decode_fid(&operation.fid)?;
+            let config = rev8::validate_filesystem(entries, &filesystem).await;
+            let observation = match config {
+                Ok(config) => self.backend().observe(&config.mount_path, fid).await,
+                Err(PolicyError::InvalidPolicy(reason)) => Err(reason),
+                Err(error) => return Err(error),
+            };
+            let mut state = operation.state.as_str();
+            let mut reason = operation.reason.as_deref();
+            let mut evidence = None;
+            if let (Some(generation), Ok(Some(observed))) = (&operation.generation, &observation)
+                && generation.same_content(&observed.generation)
+                && invocation.completed(&observed.state)
+            {
+                state = "completed";
+                reason = None;
+                evidence = Some(Json(serde_json::json!({
+                    "source": "lustre_hsm_state",
+                    "observedAt": Utc::now(),
+                    "state": observed.state,
+                    "generation": observed.generation,
+                })));
+            } else if state == "submitting" {
+                // The worker died after the durable intent. Retain ownership
+                // without inferring non-submission from a quiet coordinator.
+                state = "unknown";
+                reason = Some("interrupted_submission");
+            }
+            sqlx::query(
+                "UPDATE rev8_operations SET state = ?, reason = ?, checked_at = UTC_TIMESTAMP(6),
+                 finished_at = CASE WHEN ? = 'completed' THEN UTC_TIMESTAMP(6) ELSE NULL END,
+                 completion_evidence = ?, attempted = TRUE WHERE id = ? AND state = ? AND pending_fid IS NOT NULL",
+            )
+            .bind(state)
+            .bind(reason)
+            .bind(state)
+            .bind(evidence)
+            .bind(operation.id)
+            .bind(&operation.state)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn backend(&self) -> &dyn NativeHsm {
+        self.runtime.as_ref().map_or(&LustreHsm, |runtime| runtime.hsm.as_ref())
+    }
+}
+
+async fn existing_one_shot_run(
+    tx: &mut Transaction<'_, MySql>, id: u64, revision: u64, definition: &Json<Value>,
+) -> Result<Option<u64>, PolicyError> {
+    // Safety policy changes create revisions for the same business definition.
+    // A run that has already evaluated or dispatched work stays consumed.
+    Ok(sqlx::query_scalar(
+        "SELECT r.id FROM rev8_runs r JOIN rev8_policy_revisions rev
+         ON rev.policy_id = r.policy_id AND rev.revision = r.revision
+         WHERE r.policy_id = ? AND (r.revision = ? OR (
+           BINARY rev.definition = BINARY ? AND (
+             r.state IN ('previewed','finished') OR EXISTS (
+               SELECT 1 FROM rev8_operations o WHERE o.run_id = r.id AND o.state <> 'deferred'
+             )
+           )
+         )) ORDER BY r.id LIMIT 1",
+    )
+    .bind(id)
+    .bind(revision)
+    .bind(definition)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+async fn current_revision(tx: &mut Transaction<'_, MySql>, run: &Rev8Run) -> Result<bool, PolicyError> {
+    let revision = sqlx::query_scalar::<_, u64>(
+        "SELECT revision FROM policies WHERE id = ? AND enabled AND revision IS NOT NULL AND name IS NOT NULL FOR UPDATE",
+    ).bind(run.policy_id).fetch_optional(&mut **tx).await?;
+    Ok(revision == Some(run.revision))
+}
+
+fn elapsed_ms(run: &Rev8Run) -> u64 {
+    (Utc::now() - run.started_at.expect("run started"))
+        .num_milliseconds()
+        .max(0) as u64
+}
+
+fn usage_for_scope(stats: &[Usage], filesystem: &str, scope: Option<&Value>) -> Usage {
+    let mut sum = Usage::default();
+    for usage in stats {
+        if scope.is_none_or(|scope| {
+            ActionKind::from_name(&usage.action).is_some_and(|kind| safety_matches(scope, filesystem, kind))
+        }) {
+            sum.add(usage);
+        }
+    }
+    sum
+}
+
+fn short_reason(reason: &str) -> String {
+    reason.chars().take(255).collect()
+}

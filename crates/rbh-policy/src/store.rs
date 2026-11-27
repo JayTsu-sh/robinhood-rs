@@ -8,14 +8,17 @@ use crate::model::{PolicyDef, PolicyRow};
 use crate::rev8::{self, PreviewResult, resources::ResourceBinding};
 use rbh_entry_store::EntryStore;
 
+mod rev8_execution;
 mod rev8_resources;
 use crate::trigger_parser::parse_trigger;
+pub use rev8_execution::{Rev8Operation, Rev8Run};
 pub use rev8_resources::ResourceRevision;
 
 /// MariaDB-backed action policy store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PolicyStore {
     pool: MySqlPool,
+    runtime: Option<rev8::execution::Runtime>,
 }
 
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
@@ -30,7 +33,12 @@ pub struct Rev8PolicyRow {
 
 impl PolicyStore {
     pub fn new(pool: MySqlPool) -> Self {
-        Self { pool }
+        Self { pool, runtime: None }
+    }
+
+    pub fn with_rev8_runtime(mut self, runtime: rev8::execution::Runtime) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     pub async fn check_schema(&self) -> Result<(), PolicyError> {
@@ -149,24 +157,62 @@ impl PolicyStore {
         &self, entries: &EntryStore, id: Option<u64>, document: &serde_json::Value, actor: &str,
     ) -> Result<u64, PolicyError> {
         let input = rev8::parse(document)?;
-        rev8::validate_filesystem(entries, input.filesystem()).await?;
+        let config = rev8::validate_filesystem(entries, input.filesystem()).await?;
+        let activation = if input.enforced_and_enabled() {
+            if !self.synchronous_permit_store().await? {
+                return Err(rev8::invalid(
+                    "enforced activation requires MariaDB innodb_flush_log_at_trx_commit=1",
+                ));
+            }
+            let runtime = self.runtime.as_ref().ok_or_else(|| {
+                PolicyError::InvalidPolicy("enforced activation requires a daemon HSM workload identity".into())
+            })?;
+            runtime.hsm.filesystem_name(&config.mount_path).await.map_err(|error| {
+                PolicyError::InvalidPolicy(format!(
+                    "enforced activation requires an accessible Lustre mount: {error}"
+                ))
+            })?;
+            Some(runtime.principal.clone())
+        } else {
+            None
+        };
+        let next_run = input.schedule_after(Utc::now())?;
         let mut tx = self.lock_configuration().await?;
         let (policy, bindings) = Self::bind_policy(&mut tx, input).await?;
+        if let Some(principal) = activation {
+            if policy.actions.is_empty() {
+                return Err(PolicyError::InvalidPolicy(
+                    "enforced activation requires an execute rule".into(),
+                ));
+            }
+            Self::compile_admission(&mut tx, &policy, &bindings, principal).await?;
+        }
+        let next_run = next_run.filter(|_| policy.enabled);
         let id = if let Some(id) = id {
             let result = sqlx::query(
-                "UPDATE policies SET name = ?, definition = ?, revision = revision + 1 WHERE id = ? AND revision IS NOT NULL",
-            ).bind(&policy.name).bind(Json(document)).bind(id).execute(&mut *tx).await
-                .map_err(|error| policy_write_error(error, &policy.name))?;
+                "UPDATE policies SET name = ?, definition = ?, revision = revision + 1, enabled = ?, rev8_next_run = ?
+                 WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL",
+            )
+            .bind(&policy.name)
+            .bind(Json(document))
+            .bind(policy.enabled)
+            .bind(next_run)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| policy_write_error(error, &policy.name))?;
             if result.rows_affected() == 0 {
                 return Err(PolicyError::NotFound(id));
             }
             id
         } else {
             sqlx::query(
-                "INSERT INTO policies (name, kind, definition, enabled, revision) VALUES (?, 'Policy', ?, FALSE, 1)",
+                "INSERT INTO policies (name, kind, definition, enabled, revision, rev8_next_run) VALUES (?, 'Policy', ?, ?, 1, ?)",
             )
             .bind(&policy.name)
             .bind(Json(document))
+            .bind(policy.enabled)
+            .bind(next_run)
             .execute(&mut *tx)
             .await
             .map_err(|error| policy_write_error(error, &policy.name))?
@@ -181,7 +227,7 @@ impl PolicyStore {
     pub async fn get_rev8(&self, id: u64) -> Result<Option<Rev8PolicyRow>, PolicyError> {
         Ok(sqlx::query_as(
             "SELECT r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by
-             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.id = ?",
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.id = ? AND p.name IS NOT NULL",
         ).bind(id).fetch_optional(&self.pool).await?)
     }
 
@@ -189,7 +235,7 @@ impl PolicyStore {
     pub async fn list_rev8(&self) -> Result<Vec<Rev8PolicyRow>, PolicyError> {
         Ok(sqlx::query_as(
             "SELECT r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by
-             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision ORDER BY p.id",
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.name IS NOT NULL ORDER BY p.id",
         ).fetch_all(&self.pool).await?)
     }
 
@@ -204,6 +250,23 @@ impl PolicyStore {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(PolicyError::NotFound(id))
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn delete_rev8(&self, id: u64) -> Result<(), PolicyError> {
+        let mut tx = self.lock_configuration().await?;
+        let result = sqlx::query(
+            "UPDATE policies SET name = NULL, enabled = FALSE, rev8_next_run = NULL
+             WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(PolicyError::NotFound(id));
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, entries))]

@@ -145,9 +145,13 @@ fn hsm_state_get_on_plain_file() {
         return;
     }
     let api = LustreApi::new();
-    let (path, _cleanup) = make_test_file("rbh_hsm", b"hsm test");
+    let mount = std::env::var_os("RBH_TEST_LUSTRE_MOUNT").map_or_else(|| PathBuf::from(LUSTRE_MOUNT), PathBuf::from);
+    let path = mount.join(unique_name("rbh_hsm"));
+    let _cleanup = Cleanup(path.clone());
+    fs::write(&path, b"hsm test").expect("write test file");
 
-    let state = api.hsm_state_get(&path).expect("hsm_state_get");
+    let state = api.hsm_state_and_action(&path).expect("authoritative HSM state");
+    assert!(!state.has_active_action(), "{state:?}");
     println!("{} hsm state: {state:?}", path.display());
     // A brand-new file that HSM has never touched should have either empty
     // flags or HS_EXISTS only.

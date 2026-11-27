@@ -17,7 +17,8 @@ scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", featur
 
 async-trait = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
+chrono-tz = { version = "0.10", features = ["serde"] }
+libc = "0.2"
 jsonschema = { version = "0.63", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }

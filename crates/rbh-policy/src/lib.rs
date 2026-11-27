@@ -27,7 +27,7 @@ pub use rbh_entry_store::FileSystemId;
 pub use reconcile::reconcile_triggers;
 pub use store::PolicyStore;
 pub use task::TargetFilter;
-pub use task::{PolicyRunTask, PolicyRuntime, init_runtime};
+pub use task::{PolicyRunTask, PolicyRuntime, Rev8TickTask, init_runtime};
 pub use trigger_parser::parse_trigger;
 pub use validation::{validate_policy_for_filesystem, validate_target_for_filesystem};
 

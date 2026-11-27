@@ -32,6 +32,26 @@ fn runtime() -> &'static Arc<PolicyRuntime> {
         .expect("PolicyRuntime not initialized — call init_runtime() at startup")
 }
 
+/// Wake the durable Rev.8 run queue and reconcile pending native operations.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Rev8TickTask;
+
+#[async_trait]
+impl Task for Rev8TickTask {
+    const TYPE_NAME: &'static str = "rbh.rev8_tick";
+
+    async fn run(&self, ctx: &TaskContext) -> TaskResult {
+        if ctx.cancellation_token.is_cancelled() {
+            return Ok(());
+        }
+        let rt = runtime();
+        rt.policy_store
+            .process_rev8(&rt.entry_store)
+            .await
+            .map_err(|error| SchedulerError::ExecutionError(error.to_string()))
+    }
+}
+
 /// Narrow a policy run to a specific subset of the filesystem.
 /// Injected by threshold triggers at fire time.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

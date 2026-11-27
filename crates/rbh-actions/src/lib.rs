@@ -12,6 +12,9 @@
 
 mod backend;
 mod executor;
+mod hsm;
+
+pub use hsm::{hsm_fid_path, submit_hsm};
 
 pub use backend::{ActionBackend, BackendAction, BackendActionOutcome, BackendAlert, BackendBackup};
 
