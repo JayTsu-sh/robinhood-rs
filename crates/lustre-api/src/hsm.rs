@@ -14,13 +14,13 @@
 
 use std::{
     ffi::CString,
-    fs::OpenOptions,
+    fs::{File, Metadata, OpenOptions},
     ops::ControlFlow,
     os::{
         fd::AsRawFd,
         unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use core::mem::{MaybeUninit, size_of};
@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::LustreApi;
 use crate::error::{HsmOp, Result, check_rc_hsm, hsm_error};
 use crate::fid::LuFid;
+use crate::mount::{mount_id, mount_source, open_directory};
 use crate::sys;
 
 bitflags! {
@@ -102,6 +103,21 @@ impl HsmUserStateInfo {
         // Lustre 2.16 can pair NOOP with WAITING when no coordinator item exists.
         self.in_progress_action != sys::HUA_NONE && (self.in_progress_action != 0 || self.in_progress_state != 0)
     }
+
+    /// A successful current-action query found no queued or running action.
+    pub fn coordinator_idle(&self) -> bool {
+        use sys::bindings::{hsm_progress_states_HPS_NONE, hsm_progress_states_HPS_WAITING};
+        // NOOP + WAITING is the default when the 2.16 coordinator finds no record.
+        self.in_progress_action == sys::HUA_NONE
+            && [hsm_progress_states_HPS_NONE, hsm_progress_states_HPS_WAITING].contains(&self.in_progress_state)
+    }
+}
+
+/// A live FID lookup bound to the source of the opened Lustre root.
+pub struct HsmFidLookup {
+    pub mount_source: String,
+    pub filesystem_name: String,
+    pub file: Option<(Metadata, HsmUserStateInfo)>,
 }
 
 bitflags! {
@@ -200,7 +216,7 @@ impl HsmRequestBuilder {
     /// lookup. A break returns the supplied reason without issuing the ioctl.
     #[tracing::instrument(name = "lustre.hsm_request_guarded", skip(self, before_ioctl), fields(action = ?self.action))]
     pub fn submit_guarded<D>(
-        &self, mount_root: &Path, before_ioctl: impl FnOnce() -> ControlFlow<D>,
+        &self, mount_root: &Path, before_ioctl: impl FnOnce(&File) -> ControlFlow<D>,
     ) -> Result<ControlFlow<D>> {
         let buf = self.encode()?;
         // OpenOptions sets O_CLOEXEC atomically. The configured path already
@@ -210,7 +226,7 @@ impl HsmRequestBuilder {
             .custom_flags(libc::O_DIRECTORY)
             .open(mount_root)
             .map_err(|error| hsm_error(error.raw_os_error().unwrap_or(libc::EIO), HsmOp::OpenRoot))?;
-        if let ControlFlow::Break(reason) = before_ioctl() {
+        if let ControlFlow::Break(reason) = before_ioctl(&root) {
             return Ok(ControlFlow::Break(reason));
         }
 
@@ -284,6 +300,50 @@ impl HsmRequestBuilder {
 }
 
 impl LustreApi {
+    /// Read the Lustre source from the same root descriptor used for a request.
+    pub fn hsm_mount_source(&self, root: &File) -> Result<Option<String>> {
+        Ok(mount_source(root.as_raw_fd())?)
+    }
+
+    /// Observe HSM state, or confirm ENOENT under the pinned Lustre FID directory.
+    pub fn hsm_lookup_fid(&self, mount: &Path, fid: LuFid) -> Result<HsmFidLookup> {
+        let root = open_directory(mount)?;
+        let mount_source = self
+            .hsm_mount_source(&root)?
+            .ok_or_else(|| crate::LustreApiError::NotALustreMount(mount.to_owned()))?;
+        let anchored = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+        let filesystem_name = self.hsm_filesystem(&anchored)?;
+        let fids = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(anchored.join(".lustre/fid"))?;
+        // LU_OBF_FID in lustre_fid.h identifies the filesystem's
+        // special open-by-FID directory, including through path aliases.
+        const FID_DIRECTORY: LuFid = LuFid::new(0x200000002, 2, 0);
+        let mut directory_fid = LuFid::ZERO.into_raw();
+        // SAFETY: fids is open and directory_fid is writable for the call.
+        let rc = unsafe { sys::llapi_fd2fid(fids.as_raw_fd(), &mut directory_fid) };
+        crate::error::check_rc(rc, "llapi_fd2fid")?;
+        if LuFid::from_raw(directory_fid) != FID_DIRECTORY || mount_id(fids.as_raw_fd())? != mount_id(root.as_raw_fd())?
+        {
+            return Err(crate::LustreApiError::NotALustreMount(mount.to_owned()));
+        }
+        let path = PathBuf::from(format!("/proc/self/fd/{}/{}", fids.as_raw_fd(), fid));
+        let file = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => Some((metadata, self.hsm_state_and_action(&path)?)),
+            Ok(_) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "FID is not a regular file").into());
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(HsmFidLookup {
+            mount_source,
+            filesystem_name,
+            file,
+        })
+    }
+
     /// Identify the verified Lustre mount for FID-scoped HSM requests.
     pub fn hsm_filesystem(&self, mount: &Path) -> Result<String> {
         crate::stripe::validate_mount(mount)?;
@@ -398,7 +458,7 @@ mod tests {
     fn guarded_hsm_request_checks_admission_between_root_open_and_ioctl() {
         // A non-directory must fail to open even if the admission gate would break.
         let request = HsmRequestBuilder::new(HsmAction::None);
-        let closed = || ControlFlow::Break("window closed");
+        let closed = |_: &File| ControlFlow::Break("window closed");
         let failed_open = request.submit_guarded(Path::new("/dev/null"), closed);
         assert!(matches!(
             failed_open,

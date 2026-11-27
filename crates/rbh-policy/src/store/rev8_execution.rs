@@ -7,7 +7,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use lustre_api::{LuFid, migration::MigrationPlan};
+use lustre_api::{HsmState, LuFid, migration::MigrationPlan};
 use rbh_entry_store::{EntryStore, FileSystemConfig, fid_codec};
 use serde::Serialize;
 use serde_json::Value;
@@ -19,8 +19,8 @@ use crate::{
     rev8::{
         self, ActionKind, BudgetLimits, CompiledPolicy, DB_EPOCH_MICROS, Invocation,
         execution::{
-            Admission, Decision, Generation, LustreHsm, NativeHsm, Profile, Submission, SubmissionDeferral,
-            SubmissionGate,
+            Admission, Decision, FidObservation, Generation, LustreHsm, NativeHsm, Profile, Submission,
+            SubmissionDeferral, SubmissionGate,
         },
         heat::{self, HeatProfile},
         invalid, push_expression,
@@ -666,9 +666,11 @@ impl PolicyStore {
             // The native adapter currently has two definitive error classes.
             let first = breaker.classes[0].name();
             let second = breaker.classes.get(1).map_or(first, |class| class.name());
+            // Accepted requests that fail later are reconciliation outcomes, outside the submission streak.
             let last_other: Option<(DateTime<Utc>, u64)> = sqlx::query_as(
                 "SELECT o.finished_at, o.id FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id
                  WHERE r.policy_id = ? AND o.finished_at IS NOT NULL AND (? IS NULL OR o.finished_at > ?)
+                 AND NOT (o.state = 'failed' AND o.accepted_at IS NOT NULL)
                  AND (o.terminal_error_class IS NULL OR o.terminal_error_class NOT IN (?, ?))
                  ORDER BY o.finished_at DESC, o.id DESC LIMIT 1",
             )
@@ -737,8 +739,8 @@ impl PolicyStore {
         let fid = decode_fid(&candidate.fid)?;
         let mount = &dispatch.config.mount_path;
         let snapshot = match self.backend().observe(mount, fid).await {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
+            Ok(FidObservation::Present(snapshot)) => snapshot,
+            Ok(FidObservation::Missing { .. }) => {
                 return self
                     .record_deferred(dispatch, candidate, &invocation, "fid_missing")
                     .await;
@@ -781,7 +783,9 @@ impl PolicyStore {
         } else {
             let live = self.backend().observe(mount, fid).await;
             match live {
-                Ok(Some(current)) if current.generation == snapshot.generation && current.state == snapshot.state => {
+                Ok(FidObservation::Present(current))
+                    if current.generation == snapshot.generation && current.state == snapshot.state =>
+                {
                     let gate = native_submission_gate(dispatch, invocation.kind);
                     if let ControlFlow::Break(reason) = gate.check() {
                         ("deferred", false, Some(reason.reason().into()), None)
@@ -797,7 +801,7 @@ impl PolicyStore {
                                 None,
                             )
                         } else {
-                            match self.backend().submit(mount, fid, invocation, gate).await {
+                            match self.backend().submit(mount, fid, invocation, seen, gate).await {
                                 Submission::Accepted => ("submitted", true, None, None),
                                 Submission::Deferred(reason) => ("deferred", false, Some(reason.reason().into()), None),
                                 Submission::Rejected { error, class } => {
@@ -888,36 +892,82 @@ impl PolicyStore {
                 migration: None,
             };
             let fid = decode_fid(&operation.fid)?;
-            let config = rev8::validate_filesystem(entries, &filesystem).await;
-            let observation = match config {
-                Ok(config) => self.backend().observe(&config.mount_path, fid).await,
-                Err(PolicyError::InvalidPolicy(reason)) => Err(reason),
+            let config = match rev8::validate_filesystem(entries, &filesystem).await {
+                Ok(config) => Some(config),
+                Err(PolicyError::InvalidPolicy(_)) => None,
                 Err(error) => return Err(error),
             };
+            let mut observation = None;
+            let mut confirmed_idle = false;
+            if let Some(config) = config {
+                let backend = self.backend();
+                let observe = || async {
+                    backend.observe(&config.mount_path, fid).await.inspect_err(|error| {
+                        tracing::debug!(%filesystem, %fid, operation_id = operation.id, %error, "HSM observation unavailable");
+                    }).ok()
+                };
+                observation = observe().await;
+                if operation.state == "submitted"
+                    && let (Some(generation), Some(FidObservation::Present(observed))) =
+                        (&operation.generation, &observation)
+                    && generation.mount_source_id.is_some()
+                    && generation.same_content(&observed.generation)
+                    && observed.state.coordinator_idle()
+                    && !invocation.completed(&observed.state)
+                {
+                    // The first flags could predate completion because the current
+                    // action is queried last. Reread flags after the idle observation.
+                    observation = observe().await;
+                    confirmed_idle = true;
+                }
+            }
             let mut state = operation.state.as_str();
             let mut reason = operation.reason.as_deref();
             let mut evidence = None;
-            if let (Some(generation), Ok(Some(observed))) = (&operation.generation, &observation)
-                && generation.same_content(&observed.generation)
-                && invocation.completed(&observed.state)
-            {
-                state = "completed";
-                reason = None;
-                evidence = Some(Json(serde_json::json!({
-                    "source": "lustre_hsm_state",
-                    "observedAt": Utc::now(),
-                    "state": observed.state,
-                    "generation": observed.generation,
-                })));
-            } else if state == "submitting" {
-                // The worker died after the durable intent. Retain ownership
-                // without inferring non-submission from a quiet coordinator.
+            match (&operation.generation, observation) {
+                (Some(generation), Some(FidObservation::Present(observed)))
+                    if generation.same_content(&observed.generation) =>
+                {
+                    let source = if invocation.completed(&observed.state) {
+                        state = "completed";
+                        reason = None;
+                        Some("lustre_hsm_state")
+                    } else if confirmed_idle
+                        && observed.state.coordinator_idle()
+                        && consistent_hsm_flags(observed.state.states)
+                    {
+                        state = "failed";
+                        reason = Some("hsm_target_state_not_reached");
+                        Some("lustre_hsm_current_action")
+                    } else {
+                        None
+                    };
+                    evidence = source.map(|source| {
+                        Json(serde_json::json!({
+                            "source": source, "observedAt": Utc::now(),
+                            "state": observed.state, "generation": observed.generation,
+                        }))
+                    });
+                }
+                (Some(generation), Some(FidObservation::Missing { mount_source_id }))
+                    if state == "submitted" && generation.mount_source_id.as_deref() == Some(&mount_source_id) =>
+                {
+                    state = "failed";
+                    reason = Some("fid_missing");
+                    evidence = Some(Json(serde_json::json!({
+                        "source": "lustre_fid_lookup", "observedAt": Utc::now(), "mountSourceId": mount_source_id,
+                    })));
+                }
+                _ => {}
+            }
+            // An interrupted ioctl may still be in progress even if the coordinator looks idle.
+            if state == "submitting" {
                 state = "unknown";
                 reason = Some("interrupted_submission");
             }
             sqlx::query(
                 "UPDATE rev8_operations SET state = ?, reason = ?, checked_at = UTC_TIMESTAMP(6),
-                 finished_at = CASE WHEN ? = 'completed' THEN UTC_TIMESTAMP(6) ELSE NULL END,
+                 finished_at = CASE WHEN ? IN ('completed', 'failed') THEN UTC_TIMESTAMP(6) ELSE NULL END,
                  completion_evidence = ?, attempted = TRUE WHERE id = ? AND state = ? AND pending_fid IS NOT NULL",
             )
             .bind(state)
@@ -991,6 +1041,14 @@ fn elapsed_ms(run: &Rev8Run) -> u64 {
     (Utc::now() - run.started_at.expect("run started"))
         .num_milliseconds()
         .max(0) as u64
+}
+
+fn consistent_hsm_flags(flags: HsmState) -> bool {
+    use HsmState as S;
+    HsmState::from_bits(flags.bits()).is_some()
+        && (!flags.contains(S::DIRTY) || flags.contains(S::EXISTS) && !flags.contains(S::RELEASED))
+        && (!flags.contains(S::RELEASED) || flags.contains(S::ARCHIVED))
+        && (!flags.contains(S::LOST) || flags.contains(S::ARCHIVED))
 }
 
 fn native_submission_gate(dispatch: &Dispatch<'_>, action: ActionKind) -> SubmissionGate {

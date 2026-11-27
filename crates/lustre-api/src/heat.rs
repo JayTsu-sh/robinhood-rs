@@ -2,15 +2,20 @@
 
 use std::{
     ffi::{CStr, CString, c_int},
-    fs::{File, OpenOptions},
+    fs::File,
     io,
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LuFid, error::check_rc, sys};
+use crate::{
+    LuFid,
+    error::check_rc,
+    mount::{mount_source, open_directory},
+    sys,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Decay {
@@ -158,37 +163,6 @@ impl HeatMount {
         let _ = &self.root;
         Err(io::Error::new(io::ErrorKind::Unsupported, "Lustre heat API unavailable").into())
     }
-}
-
-fn open_directory(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(path)
-}
-
-/// Use mountinfo for the pinned descriptor so aliases and bind mounts resolve
-/// to the actual Lustre source. The source also distinguishes clusters with
-/// the same filesystem and target names.
-fn mount_source(fd: c_int) -> io::Result<Option<String>> {
-    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
-    let mount_id = info
-        .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:"))
-        .map(str::trim)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "mount ID is unavailable"))?;
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
-    let fields = mounts.lines().find_map(|line| {
-        let (left, right) = line.split_once(" - ")?;
-        (left.split_ascii_whitespace().next() == Some(mount_id)).then(|| right.split_ascii_whitespace())
-    });
-    let Some(mut fields) = fields else {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "mount source is unavailable"));
-    };
-    if fields.next() != Some("lustre") {
-        return Ok(None);
-    }
-    fields
-        .next()
-        .map(|source| Some(source.to_owned()))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Lustre mount source is empty"))
 }
 
 #[cfg(lustre_heat_abi)]

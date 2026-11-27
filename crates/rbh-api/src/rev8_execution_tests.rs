@@ -21,7 +21,8 @@ use rbh_policy::{
     rev8::{
         ActionKind, Invocation,
         execution::{
-            Generation, NativeHsm, Observation, Principal, Runtime, Submission, SubmissionGate, TerminalError,
+            FidObservation, Generation, NativeHsm, Observation, Principal, Runtime, Submission, SubmissionGate,
+            TerminalError,
         },
     },
 };
@@ -35,6 +36,7 @@ use crate::handlers::scoped_api_tests::{
 #[derive(Default)]
 struct HsmFixture {
     files: Mutex<HashMap<LuFid, Observation>>,
+    finish_after_observation: Mutex<Option<(LuFid, HsmUserStateInfo)>>,
     submitted: Mutex<Vec<(LuFid, ActionKind, u32)>>,
     interrupt_request: AtomicBool,
     reject_request: AtomicBool,
@@ -45,6 +47,7 @@ struct HsmFixture {
     hold_submission: AtomicBool,
     submission_started: Notify,
     resume_submission: Notify,
+    missing_on_other_source: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -57,7 +60,7 @@ impl NativeHsm for HsmFixture {
         }
     }
 
-    async fn observe(&self, _: &Path, fid: LuFid) -> Result<Option<Observation>, String> {
+    async fn observe(&self, _: &Path, fid: LuFid) -> Result<FidObservation, String> {
         let held = {
             let mut hold = self.hold_observation.lock().unwrap();
             *hold == Some(fid) && hold.take().is_some()
@@ -66,10 +69,31 @@ impl NativeHsm for HsmFixture {
             self.observation_started.notify_one();
             self.resume_observation.notified().await;
         }
-        Ok(self.files.lock().unwrap().get(&fid).cloned())
+        let mut finish = self.finish_after_observation.lock().unwrap();
+        let mut files = self.files.lock().unwrap();
+        let observed = files.get(&fid).cloned();
+        if finish.as_ref().is_some_and(|(target, _)| *target == fid)
+            && let Some((_, completed)) = finish.take()
+            && let Some(current) = files.get_mut(&fid)
+        {
+            current.state = completed;
+        }
+        Ok(observed.map_or_else(
+            || FidObservation::Missing {
+                mount_source_id: if self.missing_on_other_source.load(Ordering::SeqCst) {
+                    "other-fixture"
+                } else {
+                    "fixture"
+                }
+                .into(),
+            },
+            FidObservation::Present,
+        ))
     }
 
-    async fn submit(&self, _: &Path, fid: LuFid, invocation: Invocation, gate: SubmissionGate) -> Submission {
+    async fn submit(
+        &self, _: &Path, fid: LuFid, invocation: Invocation, _: &Generation, gate: SubmissionGate,
+    ) -> Submission {
         if self.hold_submission.swap(false, Ordering::SeqCst) {
             self.submission_started.notify_one();
             self.resume_submission.notified().await;
@@ -143,6 +167,7 @@ impl Scenario {
             Observation {
                 generation: Generation {
                     filesystem_name: "fixture".into(),
+                    mount_source_id: Some("fixture".into()),
                     size,
                     mtime: 10,
                     mtime_nanos: 0,
@@ -632,4 +657,79 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     env.tick().await;
     assert_eq!(env.operations(budgeted_id, next_run).await[0]["state"], "submitted");
     assert_eq!(env.submitted().last(), Some(&(late, ActionKind::Archive, 17)));
+
+    const HUA_NONE: u32 = 1;
+    const HUA_ARCHIVE: u32 = 10;
+    const HPS_WAITING: u32 = 1;
+    {
+        let mut files = env.hsm.files.lock().unwrap();
+        let state = &mut files.get_mut(&late).unwrap().state;
+        state.in_progress_state = HPS_WAITING;
+        state.in_progress_action = HUA_ARCHIVE;
+    }
+    env.tick().await;
+    assert_eq!(env.operations(budgeted_id, next_run).await[0]["state"], "submitted");
+
+    // A later query reports NOOP and the requested archive is still absent.
+    env.hsm
+        .files
+        .lock()
+        .unwrap()
+        .get_mut(&late)
+        .unwrap()
+        .state
+        .in_progress_action = HUA_NONE;
+    let fresh = open_policy_store(&env.entries, env.hsm.clone());
+    fresh.process_rev8(&env.entries).await.unwrap();
+    let terminal = &env.operations(budgeted_id, next_run).await[0];
+    assert_eq!(terminal["state"], "failed");
+    assert_eq!(terminal["reason"], "hsm_target_state_not_reached");
+    assert_eq!(terminal["completionEvidence"]["source"], "lustre_hsm_current_action");
+    assert!(terminal["acceptedAt"].is_string());
+
+    let retry = env.queue(budgeted_id).await;
+    env.tick().await;
+    assert_eq!(env.operations(budgeted_id, retry).await[0]["state"], "submitted");
+    env.hsm.files.lock().unwrap().remove(&late).unwrap();
+    env.hsm.missing_on_other_source.store(true, Ordering::SeqCst);
+    env.tick().await;
+    assert_eq!(env.operations(budgeted_id, retry).await[0]["state"], "submitted");
+    env.hsm.missing_on_other_source.store(false, Ordering::SeqCst);
+    env.tick().await;
+    let missing = &env.operations(budgeted_id, retry).await[0];
+    assert_eq!(missing["state"], "failed");
+    assert_eq!(missing["reason"], "fid_missing");
+    assert_eq!(missing["completionEvidence"]["source"], "lustre_fid_lookup");
+
+    // Archive completes between the initial flags and current-action queries.
+    let finishing = env.file(5, 2048, HsmState::empty(), 0).await;
+    let mut confirming = budgeted;
+    confirming["metadata"]["name"] = format!("{}-confirming", env.filesystem).into();
+    confirming["spec"]["rules"]["entries"][0]["match"]["value"] = 2048.into();
+    let confirming_id = env.create(&confirming).await;
+    let confirming_run = env.queue(confirming_id).await;
+    env.tick().await;
+    assert_eq!(
+        env.operations(confirming_id, confirming_run).await[0]["state"],
+        "submitted"
+    );
+    let idle = HsmUserStateInfo {
+        in_progress_action: HUA_NONE,
+        in_progress_state: HPS_WAITING,
+        ..Default::default()
+    };
+    env.hsm.files.lock().unwrap().get_mut(&finishing).unwrap().state = idle.clone();
+    *env.hsm.finish_after_observation.lock().unwrap() = Some((
+        finishing,
+        HsmUserStateInfo {
+            states: copies,
+            archive_id: 17,
+            ..idle
+        },
+    ));
+    env.tick().await;
+    assert_eq!(
+        env.operations(confirming_id, confirming_run).await[0]["state"],
+        "completed"
+    );
 }

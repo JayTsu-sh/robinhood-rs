@@ -7,6 +7,7 @@ use std::{ops::ControlFlow, os::unix::fs::MetadataExt, path::Path, sync::Arc};
 use async_trait::async_trait;
 use lustre_api::{HsmAction, HsmRequestBuilder, HsmState, HsmUserStateInfo, LuFid, LustreApi};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{ActionKind, Invocation};
 pub(crate) use governance::{Admission, Decision, Profile, Window};
@@ -30,6 +31,8 @@ pub struct Runtime {
 #[serde(rename_all = "camelCase")]
 pub struct Generation {
     pub filesystem_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_source_id: Option<String>,
     pub size: u64,
     pub mtime: i64,
     pub mtime_nanos: i64,
@@ -40,10 +43,19 @@ pub struct Generation {
 impl Generation {
     pub(crate) fn same_content(&self, current: &Self) -> bool {
         self.filesystem_name == current.filesystem_name
+            && self
+                .mount_source_id
+                .as_ref()
+                .is_none_or(|source| current.mount_source_id.as_ref() == Some(source))
             && self.size == current.size
             && self.mtime == current.mtime
             && self.mtime_nanos == current.mtime_nanos
     }
+}
+
+pub enum FidObservation {
+    Present(Observation),
+    Missing { mount_source_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +81,8 @@ pub enum SubmissionDeferral {
     WindowClosed,
     PolicyRunDuration,
     SystemSafetyRunDuration,
+    MountChanged,
+    MountIdentityUnavailable,
 }
 
 impl SubmissionDeferral {
@@ -77,6 +91,8 @@ impl SubmissionDeferral {
             Self::WindowClosed => "admission_window_closed",
             Self::PolicyRunDuration => "policy_run_duration",
             Self::SystemSafetyRunDuration => "system_safety_run_duration",
+            Self::MountChanged => "hsm_mount_changed",
+            Self::MountIdentityUnavailable => "hsm_mount_identity_unavailable",
         }
     }
 }
@@ -115,9 +131,11 @@ impl TerminalError {
 #[async_trait]
 pub trait NativeHsm: Send + Sync {
     async fn filesystem_name(&self, mount: &Path) -> Result<String, String>;
-    async fn observe(&self, mount: &Path, fid: LuFid) -> Result<Option<Observation>, String>;
+    async fn observe(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String>;
     /// Apply the gate after blocking preparation and before issuing the request.
-    async fn submit(&self, mount: &Path, fid: LuFid, invocation: Invocation, gate: SubmissionGate) -> Submission;
+    async fn submit(
+        &self, mount: &Path, fid: LuFid, invocation: Invocation, expected: &Generation, gate: SubmissionGate,
+    ) -> Submission;
 }
 
 pub struct LustreHsm;
@@ -141,23 +159,20 @@ impl NativeHsm for LustreHsm {
         .map_err(|error| error.to_string())?
     }
 
-    async fn observe(&self, mount: &Path, fid: LuFid) -> Result<Option<Observation>, String> {
+    async fn observe(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
         let mount = mount.to_owned();
         tokio::task::spawn_blocking(move || {
-            let filesystem_name = LustreApi.hsm_filesystem(&mount).map_err(|error| error.to_string())?;
-            let path = rbh_actions::hsm_fid_path(&mount, fid);
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_file() => metadata,
-                Ok(_) => return Err("FID is not a regular file".into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.to_string()),
+            let lookup = LustreApi
+                .hsm_lookup_fid(&mount, fid)
+                .map_err(|error| format!("{error:?}"))?;
+            let mount_source_id = source_id(&lookup.mount_source);
+            let Some((metadata, state)) = lookup.file else {
+                return Ok(FidObservation::Missing { mount_source_id });
             };
-            let state = LustreApi
-                .hsm_state_and_action(&path)
-                .map_err(|error| error.to_string())?;
-            Ok(Some(Observation {
+            Ok(FidObservation::Present(Observation {
                 generation: Generation {
-                    filesystem_name,
+                    filesystem_name: lookup.filesystem_name,
+                    mount_source_id: Some(mount_source_id),
                     size: metadata.size(),
                     mtime: metadata.mtime(),
                     mtime_nanos: metadata.mtime_nsec(),
@@ -171,13 +186,16 @@ impl NativeHsm for LustreHsm {
         .map_err(|error| error.to_string())?
     }
 
-    async fn submit(&self, mount: &Path, fid: LuFid, invocation: Invocation, gate: SubmissionGate) -> Submission {
+    async fn submit(
+        &self, mount: &Path, fid: LuFid, invocation: Invocation, expected: &Generation, gate: SubmissionGate,
+    ) -> Submission {
         use lustre_api::error::{
             HsmOp,
             LustreApiError::{Ffi, Hsm, Io},
         };
 
         let mount = mount.to_owned();
+        let expected_source_id = expected.mount_source_id.clone();
         let result = tokio::task::spawn_blocking(move || {
             let Ok(_guard) = NATIVE_SUBMISSION.try_lock() else {
                 return Submission::Rejected {
@@ -213,7 +231,14 @@ impl NativeHsm for LustreHsm {
                 0
             };
             let request = HsmRequestBuilder::new(action).archive_id(archive_id).add_fid(fid);
-            match request.submit_guarded(&mount, || gate.check()) {
+            match request.submit_guarded(&mount, |root| match LustreApi.hsm_mount_source(root) {
+                Ok(Some(source)) if expected_source_id.as_ref() == Some(&source_id(&source)) => gate.check(),
+                Ok(_) => ControlFlow::Break(SubmissionDeferral::MountChanged),
+                Err(error) => {
+                    tracing::debug!(%fid, ?error, "HSM submission mount identity unavailable");
+                    ControlFlow::Break(SubmissionDeferral::MountIdentityUnavailable)
+                }
+            }) {
                 Ok(ControlFlow::Continue(())) => Submission::Accepted,
                 Ok(ControlFlow::Break(reason)) => Submission::Deferred(reason),
                 Err(
@@ -252,6 +277,10 @@ impl NativeHsm for LustreHsm {
         .await;
         result.unwrap_or_else(|error| Submission::Unknown(error.to_string()))
     }
+}
+
+fn source_id(source: &str) -> String {
+    format!("{:x}", Sha256::digest(source.as_bytes()))
 }
 
 impl Invocation {

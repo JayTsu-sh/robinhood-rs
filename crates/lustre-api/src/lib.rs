@@ -26,6 +26,7 @@
 // Remove this allow once Stage D lands and the whole crate is in use.
 #![allow(dead_code)]
 
+mod mount;
 mod sys;
 
 pub mod changelog;
