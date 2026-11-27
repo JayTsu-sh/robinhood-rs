@@ -45,3 +45,4 @@ NNN_short_description.sql
 | `012_lustre_layout_observed_at.sql` | Lustre layout observation timestamp |
 | `013_rev8_resources.sql` | versioned Rev.8 resources and policy bindings |
 | `014_rev8_execution.sql` | durable run queue, per-FID operation journal, and breaker resets |
+| `015_rev8_pool_migration.sql` | persistent pool migration plan and one pending migration per filesystem |

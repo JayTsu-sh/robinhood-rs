@@ -160,6 +160,23 @@ unsafe extern "C" {
         path: *mut c_char, type_: u32, index: u32, stat_buf: *mut obd_statfs, uuid_buf: *mut obd_uuid,
     ) -> c_int;
 
+    // Online pool migration -------------------------------------------------
+
+    pub(crate) fn llapi_get_poolmembers(
+        pool: *const c_char, list: *mut *mut c_char, count: c_int, buffer: *mut c_char, size: c_int,
+    ) -> c_int;
+    pub(crate) fn llapi_file_fget_mdtidx(fd: c_int, index: *mut c_int) -> c_int;
+    pub(crate) fn llapi_create_volatile_param(
+        directory: *const c_char, mdt: c_int, flags: c_int, mode: libc::mode_t,
+        stripe: *const bindings::llapi_stripe_param,
+    ) -> c_int;
+    pub(crate) fn llapi_group_lock(fd: c_int, gid: c_int) -> c_int;
+    pub(crate) fn llapi_group_unlock(fd: c_int, gid: c_int) -> c_int;
+    pub(crate) fn llapi_get_data_version(fd: c_int, version: *mut u64, flags: u64) -> c_int;
+    pub(crate) fn llapi_fswap_layouts_grouplock(
+        src: c_int, dst: c_int, src_version: u64, dst_version: u64, gid: c_int, flags: u64,
+    ) -> c_int;
+
     // HSM -------------------------------------------------------------------
 
     pub(crate) fn llapi_get_fsname(path: *const c_char, name: *mut c_char, len: usize) -> c_int;

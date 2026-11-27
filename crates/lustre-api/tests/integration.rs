@@ -161,3 +161,83 @@ fn hsm_state_get_on_plain_file() {
         state.states,
     );
 }
+
+#[test]
+fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
+    use lustre_api::migration::{FileVersion, MigrationPlacement, MigrationPlan};
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::time::{Duration, Instant};
+
+    let Some(root) = std::env::var_os("RBH_TEST_MIGRATION_HOT_DIR") else {
+        return;
+    };
+    let mount = std::env::var_os("RBH_TEST_LUSTRE_MOUNT").expect("set the Lustre mount");
+    let mount = Path::new(&mount);
+    let path = Path::new(&root).join(unique_name("rbh_sparse"));
+    let file = fs::File::create_new(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    file.write_all_at(b"hot", 0).unwrap();
+    file.write_all_at(b"cold", 2 * 1024 * 1024).unwrap();
+    file.set_len(6 * 1024 * 1024).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let link = path.with_extension("link");
+    fs::hard_link(&path, &link).unwrap();
+    let _cleanup_link = Cleanup(link.clone());
+    let bytes = fs::read(&path).unwrap();
+    let metadata = fs::metadata(&path).unwrap();
+
+    let api = LustreApi;
+    let fid = api.path_to_fid(&path).unwrap();
+    let stripe = api.migration_source_layout(mount, &fid).unwrap();
+    assert_eq!(stripe.pool.as_deref(), Some("hot"));
+    let plan = MigrationPlan {
+        source_pool: "hot".into(),
+        target_pool: "cold".into(),
+        stripe_count: 1,
+        stripe_size: 1024 * 1024,
+    };
+    let generation = FileVersion::from(&metadata);
+    assert!(matches!(
+        api.migrate_pool(mount, &fid, &plan, generation, Instant::now()),
+        Err(lustre_api::migration::MigrationError::Deferred(
+            "migration_deadline_elapsed"
+        ))
+    ));
+    assert_eq!(api.migration_source_layout(mount, &fid).unwrap(), stripe);
+    let target = api
+        .migrate_pool(mount, &fid, &plan, generation, Instant::now() + Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(target.layout.pool_name.as_deref(), Some("cold"));
+    assert_eq!(target.layout.stripe_items.len(), 1);
+    assert!(
+        api.pool_members(mount, "cold")
+            .unwrap()
+            .contains(&target.layout.stripe_items[0])
+    );
+    let fsname = api.hsm_filesystem(mount).unwrap();
+    assert!(matches!(
+        api.reconcile_pool_migration(mount, &fid, &plan, generation, &fsname)
+            .unwrap(),
+        MigrationPlacement::Target(_)
+    ));
+    assert_eq!(api.path_to_fid(&link).unwrap(), fid);
+    assert_eq!(api.path_to_fid(&path).unwrap(), fid);
+    assert_eq!(fs::read(&link).unwrap(), bytes);
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(metadata.ino(), after.ino());
+    assert_eq!(after.nlink(), 2);
+    assert_eq!(metadata.mtime_nsec(), after.mtime_nsec());
+    assert!(after.blocks() * 512 < after.size() / 2);
+
+    let modified = fs::OpenOptions::new().write(true).open(&link).unwrap();
+    modified.write_all_at(b"changed after migration", 0).unwrap();
+    modified.set_len(metadata.size() + 1).unwrap();
+    modified.sync_all().unwrap();
+    assert_ne!(FileVersion::from(&modified.metadata().unwrap()), generation);
+    assert!(matches!(
+        api.reconcile_pool_migration(mount, &fid, &plan, generation, &fsname)
+            .unwrap(),
+        MigrationPlacement::Target(_)
+    ));
+}

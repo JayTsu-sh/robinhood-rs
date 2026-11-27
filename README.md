@@ -237,6 +237,58 @@ return the bindings in `resourceBindings`. Read the pinned definitions at
 policy binding at `GET /api/policies/{id}/revisions/{revision}`. References
 from enabled policies and from other selectors block resource deletion.
 
+### Rev.8 Lustre pool migration
+
+Register the Lustre mount with HSM, stripe and OST capabilities. A pool
+migration policy has a periodic trigger and one pool pair on that filesystem.
+The action contract is available at `GET /api/action-contracts/lustre.pool_migrate`.
+For example, use these fields in a Rev.8 policy:
+
+```json
+{
+  "target": {
+    "filesystem": "lustre",
+    "objectType": "file",
+    "where": {
+      "all": [
+        {"field": "lustre.pool", "op": "eq", "value": "hot"},
+        {"field": "object.tags.temperature", "op": "eq", "value": "coolable"},
+        {"field": "object.last_modified", "op": "older_than", "value": "7d"}
+      ]
+    }
+  },
+  "trigger": {"type": "periodic", "interval": "1h"},
+  "objective": {"type": "exhaust"},
+  "rules": {
+    "entries": [{
+      "match": true,
+      "decision": "execute",
+      "action": {
+        "type": "lustre.pool_migrate",
+        "targetRef": "current.object",
+        "params": {"sourcePool": "hot", "targetPool": "cold", "maxFileBytes": "64GiB"}
+      }
+    }]
+  }
+}
+```
+
+Merge these fields into `spec` and bind the execution and governance resources
+described above. For enforced execution, authorize `lustre.pool_migrate`, provide
+matching system safety and approval policies, and set the run budget including
+`maxDuration`. The candidate count uses indexed conditions and source pool.
+Execution rechecks the source placement and HSM state. Classifier tags come
+from the catalog and are rechecked on the locked candidate row along with its
+indexed file generation. Optional `stripeCount`
+and `stripeSize` override the source stripe geometry. The first release handles
+online regular files with an initialized single-component RAID0 layout.
+
+The blocking copy checks the deadline between I/O calls. An I/O call already
+inside Lustre retains its filesystem slot until it exits and can be reconciled.
+A completed operation includes the actual pool and OSTs from a fresh open by
+FID. If the catalog write fails, the pending operation retains the slot and
+the restarted daemon reconciles the live layout before any new migration.
+
 ## Configuration
 
 All runtime knobs are environment variables (hot-reloadable subset via

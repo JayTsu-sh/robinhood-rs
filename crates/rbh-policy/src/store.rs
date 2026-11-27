@@ -179,6 +179,10 @@ impl PolicyStore {
         let next_run = input.schedule_after(Utc::now())?;
         let mut tx = self.lock_configuration().await?;
         let (policy, bindings) = Self::bind_policy(&mut tx, input).await?;
+        policy.validate_capabilities(&config)?;
+        if let Some(migration) = policy.pool_migration() {
+            migration.validate_pools(&config.mount_path).await?;
+        }
         if let Some(principal) = activation {
             if policy.actions.is_empty() {
                 return Err(PolicyError::InvalidPolicy(

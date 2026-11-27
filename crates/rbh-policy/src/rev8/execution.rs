@@ -168,6 +168,12 @@ impl NativeHsm for LustreHsm {
                 ActionKind::Archive => HsmAction::Archive,
                 ActionKind::Release => HsmAction::Release,
                 ActionKind::Restore => HsmAction::Restore,
+                ActionKind::PoolMigrate => {
+                    return Submission::Rejected {
+                        error: "pool migration requires the layout executor".into(),
+                        class: None,
+                    };
+                }
             };
             let archive_id = if action == HsmAction::Archive {
                 invocation.archive_id
@@ -195,7 +201,7 @@ impl NativeHsm for LustreHsm {
 }
 
 impl Invocation {
-    pub(crate) fn precondition(self, state: &HsmUserStateInfo) -> Result<(), &'static str> {
+    pub(crate) fn precondition(&self, state: &HsmUserStateInfo) -> Result<(), &'static str> {
         use HsmState as S;
         if state.has_active_action() {
             return Err("hsm_action_active");
@@ -217,11 +223,12 @@ impl Invocation {
             ActionKind::Archive => !flags.intersects(S::NOARCHIVE | S::RELEASED) && !clean_copy,
             ActionKind::Release => clean_copy && !flags.intersects(S::RELEASED | S::NORELEASE),
             ActionKind::Restore => clean_copy && flags.contains(S::RELEASED),
+            ActionKind::PoolMigrate => return lustre_api::migration::check_migration_hsm(state),
         };
         if eligible { Ok(()) } else { Err("hsm_state_ineligible") }
     }
 
-    pub(crate) fn completed(self, state: &HsmUserStateInfo) -> bool {
+    pub(crate) fn completed(&self, state: &HsmUserStateInfo) -> bool {
         use HsmState as S;
         let flags = state.states;
         if state.has_active_action()
@@ -235,6 +242,7 @@ impl Invocation {
             ActionKind::Archive => self.archive_id == 0 || self.archive_id == state.archive_id,
             ActionKind::Release => flags.contains(S::RELEASED) && self.archive_id == state.archive_id,
             ActionKind::Restore => !flags.contains(S::RELEASED) && self.archive_id == state.archive_id,
+            ActionKind::PoolMigrate => false,
         }
     }
 }

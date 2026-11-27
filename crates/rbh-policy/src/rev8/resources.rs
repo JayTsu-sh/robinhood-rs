@@ -156,10 +156,15 @@ pub struct ResourceBinding {
 // Published server revisions are append-only. A new contract goes in a new
 // revision and leaves the existing builder available for historical reads.
 pub fn action_contract(action: ActionKind) -> Value {
-    let (completion, readiness) = match action {
-        ActionKind::Archive => ("archive_completed", "file_archive_eligible"),
-        ActionKind::Release => ("release_completed", "file_release_eligible"),
-        ActionKind::Restore => ("restore_completed", "file_restore_eligible"),
+    let (completion, readiness, evidence) = match action {
+        ActionKind::Archive => ("archive_completed", "file_archive_eligible", "authoritative_hsm_state"),
+        ActionKind::Release => ("release_completed", "file_release_eligible", "authoritative_hsm_state"),
+        ActionKind::Restore => ("restore_completed", "file_restore_eligible", "authoritative_hsm_state"),
+        ActionKind::PoolMigrate => (
+            "pool_migration_completed",
+            "online_file_in_source_pool",
+            "verified_lustre_layout",
+        ),
     };
     let name = action.name();
     let effect = action.effect();
@@ -176,7 +181,7 @@ pub fn action_contract(action: ActionKind) -> Value {
                 {"key": "maxObjectLogicalBytes", "required": true, "unit": "bytes", "basis": "object_logical_size_at_admission", "chargeAt": "admission"}
             ],
             "compatibility": {"default": "reject"},
-            "completionGuarantees": [{"name": completion, "evidence": "authoritative_hsm_state"}],
+            "completionGuarantees": [{"name": completion, "evidence": evidence}],
             "preconditions": {"beforeSubmit": [
                 {"name": "source_generation_matches", "requiredWhen": "always"},
                 {"name": readiness, "requiredWhen": "always"}

@@ -156,7 +156,7 @@ impl Admission {
         };
         for invocation in &policy.actions {
             let filesystem = policy.filesystem.as_str();
-            match admission.governance(filesystem, *invocation) {
+            match admission.governance(filesystem, invocation) {
                 Decision::Defer(reason) => return Err(invalid(reason)),
                 Decision::Allow => {}
             }
@@ -169,7 +169,16 @@ impl Admission {
                     "enforced native HSM does not support namespacePrefixes or ostNames authorization scopes",
                 ));
             }
-            if invocation.kind == ActionKind::Archive {
+            if invocation.kind == ActionKind::PoolMigrate
+                && statements
+                    .iter()
+                    .any(|statement| statement["scope"].get("archiveIds").is_some())
+            {
+                return Err(invalid(
+                    "pool migration does not support archiveIds authorization scopes",
+                ));
+            }
+            if matches!(invocation.kind, ActionKind::Archive | ActionKind::PoolMigrate) {
                 if let Decision::Defer(reason) = admission.authorize_archive_id(&statements, invocation.archive_id) {
                     return Err(invalid(reason));
                 }
@@ -188,11 +197,11 @@ impl Admission {
         self.windows.iter().all(|window| window.contains(now))
     }
 
-    pub(crate) fn authorize(&self, filesystem: &str, invocation: Invocation) -> Decision {
+    pub(crate) fn authorize(&self, filesystem: &str, invocation: &Invocation) -> Decision {
         self.authorize_archive_id(&self.statements(filesystem, invocation.kind), invocation.archive_id)
     }
 
-    fn governance(&self, filesystem: &str, invocation: Invocation) -> Decision {
+    fn governance(&self, filesystem: &str, invocation: &Invocation) -> Decision {
         let action = invocation.kind;
         let matching: Vec<_> = self
             .safety

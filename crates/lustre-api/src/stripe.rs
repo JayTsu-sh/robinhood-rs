@@ -1,7 +1,7 @@
 //! Read Lustre file layouts and the OSTs actually assigned to them.
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -66,24 +66,26 @@ impl LustreApi {
     /// an empty layout.
     #[tracing::instrument(skip(self), fields(mount = %mount.display(), %fid))]
     pub fn get_ost_layout_by_fid(&self, mount: &Path, fid: &LuFid) -> Result<Option<OstLayout>> {
-        validate_mount(mount)?;
-        let path = CString::new(mount.as_os_str().as_bytes())?;
-        let raw_fid = fid.into_raw();
-        // SAFETY: path and raw_fid are valid for the call. On success the
-        // caller owns the descriptor.
-        let fd = unsafe { sys::llapi_open_by_fid(path.as_ptr(), &raw_fid, libc::O_RDONLY | libc::O_NONBLOCK) };
-        if fd == -libc::ENOENT || fd == -libc::ESTALE {
+        let Some(fd) = open_by_fid(mount, fid, libc::O_RDONLY | libc::O_NONBLOCK)? else {
             return Ok(None);
-        }
-        check_rc(fd, "llapi_open_by_fid")?;
-        // SAFETY: the successful open returned an owned file descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        // SAFETY: fd is live and flags=0 requests the actual layout.
+        };
         let observed_at = layout_read_time();
-        let raw = unsafe { sys::llapi_layout_get_by_fd(fd.as_raw_fd(), 0) };
-        let layout = Layout::from_raw(raw, "llapi_layout_get_by_fd")?;
-        Ok(Some(layout.ost_layout(observed_at)?))
+        Ok(Some(Layout::from_fd(fd.as_raw_fd())?.ost_layout(observed_at)?))
     }
+}
+
+pub(crate) fn open_by_fid(mount: &Path, fid: &LuFid, flags: libc::c_int) -> Result<Option<OwnedFd>> {
+    validate_mount(mount)?;
+    let path = CString::new(mount.as_os_str().as_bytes())?;
+    let raw_fid = fid.into_raw();
+    // SAFETY: path and raw_fid are valid for the call.
+    let fd = unsafe { sys::llapi_open_by_fid(path.as_ptr(), &raw_fid, flags | libc::O_CLOEXEC) };
+    if fd == -libc::ENOENT || fd == -libc::ESTALE {
+        return Ok(None);
+    }
+    check_rc(fd, "llapi_open_by_fid")?;
+    // SAFETY: the successful open returned an owned file descriptor.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
 /// Check the kernel filesystem type before a FID operation.
@@ -116,6 +118,12 @@ impl Layout {
         // SAFETY: path is NUL-terminated and valid for the call.
         let raw = unsafe { sys::llapi_layout_get_by_path(path.as_ptr(), 0) };
         Self::from_raw(raw, "llapi_layout_get_by_path")
+    }
+
+    fn from_fd(fd: RawFd) -> Result<Self> {
+        // SAFETY: fd is borrowed from a live descriptor at each call site.
+        let raw = unsafe { sys::llapi_layout_get_by_fd(fd, 0) };
+        Self::from_raw(raw, "llapi_layout_get_by_fd")
     }
 
     fn from_raw(layout: *mut c_void, op: &'static str) -> Result<Self> {
@@ -223,7 +231,46 @@ impl Layout {
     }
 }
 
-fn layout_read_time() -> i64 {
+/// Only an initialized single-component RAID0 layout can be moved.
+pub(crate) fn simple_layout(fd: RawFd) -> Result<Option<StripeInfo>> {
+    let layout = match Layout::from_fd(fd) {
+        Err(LustreApiError::Ffi {
+            errno: libc::ENODATA, ..
+        }) => return Ok(None),
+        result => result?,
+    };
+    let ptr = layout.0.as_ptr();
+    let mut pattern = 0;
+    // SAFETY: the layout is live and pattern is a writable u64.
+    if unsafe { sys::llapi_layout_is_composite(ptr) } {
+        return Ok(None);
+    }
+    check_layout_rc(
+        unsafe { sys::llapi_layout_pattern_get(ptr, &mut pattern) },
+        "llapi_layout_pattern_get",
+    )?;
+    if pattern != 0 {
+        // LLAPI_LAYOUT_RAID0
+        return Ok(None);
+    }
+    Ok(layout
+        .read_current()?
+        .filter(|stripe| stripe.ost_indices.len() == stripe.count as usize))
+}
+
+impl StripeInfo {
+    pub(crate) fn observation(self, observed_at: i64) -> Result<OstLayout> {
+        Ok(OstLayout {
+            observed_at: Some(observed_at),
+            stripe_count: Some(u16::try_from(self.count).map_err(|_| LustreApiError::IntegerOverflow("stripe count"))?),
+            stripe_size: Some(u32::try_from(self.size).map_err(|_| LustreApiError::IntegerOverflow("stripe size"))?),
+            pool_name: self.pool,
+            stripe_items: self.ost_indices,
+        })
+    }
+}
+
+pub(crate) fn layout_read_time() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

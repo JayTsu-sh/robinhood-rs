@@ -1234,6 +1234,27 @@ impl EntryStore {
     pub async fn refresh_lustre_layout(
         &self, filesystem: &FileSystemId, fid: &LuFid, layout: lustre_api::stripe::OstLayout,
     ) -> Result<bool> {
+        self.refresh_lustre_layout_observation(filesystem, fid, layout, None)
+            .await
+    }
+
+    /// Publish verified migration placement without treating a layout-only
+    /// ctime change as an unobserved modification on the next run.
+    #[tracing::instrument(skip(self, placement, source), fields(%filesystem, %fid))]
+    pub async fn refresh_lustre_migration(
+        &self, filesystem: &FileSystemId, fid: &LuFid, placement: lustre_api::migration::VerifiedPlacement,
+        source: lustre_api::migration::FileVersion,
+    ) -> Result<bool> {
+        self.refresh_lustre_layout_observation(filesystem, fid, placement.layout, Some((placement.metadata, source)))
+            .await
+    }
+
+    async fn refresh_lustre_layout_observation(
+        &self, filesystem: &FileSystemId, fid: &LuFid, layout: lustre_api::stripe::OstLayout,
+        migration: Option<(std::fs::Metadata, lustre_api::migration::FileVersion)>,
+    ) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
         let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
         let mut tx = self.pool.begin().await?;
         let Some((mut entry, previous_observation)) = lock_scoped_entry(&mut tx, &key).await? else {
@@ -1241,6 +1262,15 @@ impl EntryStore {
         };
         if entry.kind != EntryKind::File || layout.observed_at <= previous_observation {
             return Ok(false);
+        }
+        if let Some((metadata, source)) = migration
+            && (entry.size, entry.mtime, entry.ctime) == (source.size, source.mtime, source.ctime)
+            && (metadata.size(), metadata.mtime(), metadata.mtime_nsec())
+                == (source.size, source.mtime, source.mtime_nanos)
+            && (entry.uid, entry.gid, entry.mode, u64::from(entry.nlink))
+                == (metadata.uid(), metadata.gid(), metadata.mode(), metadata.nlink())
+        {
+            entry.ctime = metadata.ctime();
         }
         entry.stripe_count = layout.stripe_count;
         entry.stripe_size = layout.stripe_size;

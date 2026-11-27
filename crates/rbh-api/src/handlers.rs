@@ -1419,7 +1419,18 @@ pub(crate) mod scoped_api_tests {
         let response = server.get("/api/action-contracts").await;
         response.assert_status_ok();
         let contracts = response.json::<Vec<serde_json::Value>>();
-        assert_eq!(contracts.len(), 3);
+        assert_eq!(contracts.len(), 4);
+        let migration = server.get("/api/action-contracts/lustre.pool_migrate").await;
+        migration.assert_status_ok();
+        let migration = migration.json::<serde_json::Value>();
+        assert_eq!(
+            migration["parametersSchema"]["required"],
+            serde_json::json!(["sourcePool", "targetPool", "maxFileBytes"])
+        );
+        assert_eq!(
+            migration["definition"]["spec"]["completionGuarantees"][0]["evidence"],
+            "verified_lustre_layout"
+        );
         let url = "/api/action-contracts/lustre.hsm.archive";
         let entry = server.get(url).await;
         entry.assert_status_ok();

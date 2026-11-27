@@ -1,5 +1,7 @@
+mod migration;
+
 use chrono::{DateTime, Utc};
-use lustre_api::LuFid;
+use lustre_api::{LuFid, migration::MigrationPlan};
 use rbh_entry_store::{EntryStore, FileSystemConfig, fid_codec, store::QueryParam};
 use serde::Serialize;
 use serde_json::Value;
@@ -21,7 +23,7 @@ const RUN_FIELDS: &str =
     "id, policy_id, revision, state, reason, candidate_count, estimated_bytes, requested_by, created_at, started_at";
 const OPERATION_FIELDS: &str =
     "o.id, o.run_id, r.policy_id, r.revision, o.filesystem, o.fid, o.action, o.archive_id, o.state,
-     o.reason, o.attempted, o.generation, o.principal, o.size, o.accepted_at, o.completion_evidence";
+     o.reason, o.attempted, o.generation, o.principal, o.size, o.accepted_at, o.completion_evidence, o.migration_plan";
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +60,8 @@ pub struct Rev8Operation {
     pub size: u64,
     pub accepted_at: Option<DateTime<Utc>>,
     pub completion_evidence: Option<Json<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_plan: Option<Json<MigrationPlan>>,
 }
 
 fn serialize_fid<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -117,6 +121,7 @@ enum AdmissionBlock {
     SafetyBudget,
     OutstandingLimit,
     ProfileLimit,
+    MigrationBusy,
 }
 
 impl AdmissionBlock {
@@ -126,11 +131,12 @@ impl AdmissionBlock {
             Self::SafetyBudget => "system_safety_run_budget",
             Self::OutstandingLimit => "system_safety_outstanding_limit",
             Self::ProfileLimit => "profile_concurrency_limit",
+            Self::MigrationBusy => "filesystem_migration_busy",
         }
     }
 
     fn is_capacity(&self) -> bool {
-        matches!(self, Self::OutstandingLimit | Self::ProfileLimit)
+        matches!(self, Self::OutstandingLimit | Self::ProfileLimit | Self::MigrationBusy)
     }
 }
 
@@ -354,6 +360,9 @@ impl PolicyStore {
             Err(PolicyError::InvalidPolicy(reason)) => return self.finish_run(run.id, "deferred", Some(&reason)).await,
             Err(error) => return Err(error),
         };
+        if let Err(PolicyError::InvalidPolicy(reason)) = policy.validate_capabilities(&config) {
+            return self.finish_run(run.id, "deferred", Some(&reason)).await;
+        }
         let mut tx = self.pool.begin().await?;
         let admission = Self::compile_admission(&mut tx, &policy, &bindings, runtime.principal.clone()).await;
         tx.commit().await?;
@@ -433,7 +442,7 @@ impl PolicyStore {
                     .finish_run(run.id, "deferred", Some("policy_circuit_breaker_open"))
                     .await;
             }
-            let invocation = policy.actions[candidate.branch as usize - 1];
+            let invocation = policy.actions[candidate.branch as usize - 1].clone();
             let stats: Vec<Usage> = sqlx::query_as(
                 "SELECT action, CAST(COUNT(*) AS UNSIGNED) AS operations, CAST(SUM(attempted OR state = 'submitting') AS UNSIGNED) AS attempts,
                  CAST(SUM(size) AS UNSIGNED) AS bytes FROM rev8_operations WHERE run_id = ? AND state <> 'deferred' GROUP BY action",
@@ -448,7 +457,7 @@ impl PolicyStore {
                 if policy.one_shot && block.is_capacity() {
                     return self.finish_run(run.id, "running", Some(block.reason())).await;
                 }
-                self.record_deferred(&dispatch, candidate, invocation, block.reason())
+                self.record_deferred(&dispatch, candidate, &invocation, block.reason())
                     .await?;
                 continue;
             }
@@ -499,6 +508,16 @@ impl PolicyStore {
                 if pending >= max {
                     return Ok(Some(AdmissionBlock::OutstandingLimit));
                 }
+            }
+        }
+        if action == ActionKind::PoolMigrate {
+            let occupied =
+                sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_operations WHERE pending_migration_fs = ?")
+                    .bind(dispatch.policy.filesystem.as_str())
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if occupied.is_some() {
+                return Ok(Some(AdmissionBlock::MigrationBusy));
             }
         }
         let profile = &dispatch.admission.profile;
@@ -597,7 +616,7 @@ impl PolicyStore {
                 .await?;
         if in_flight.is_some() {
             return self
-                .record_deferred(dispatch, candidate, invocation, "unresolved_operation")
+                .record_deferred(dispatch, candidate, &invocation, "unresolved_operation")
                 .await;
         }
         let fid = decode_fid(&candidate.fid)?;
@@ -606,44 +625,40 @@ impl PolicyStore {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
                 return self
-                    .record_deferred(dispatch, candidate, invocation, "fid_missing")
+                    .record_deferred(dispatch, candidate, &invocation, "fid_missing")
                     .await;
             }
-            Err(error) => return self.record_deferred(dispatch, candidate, invocation, &error).await,
+            Err(error) => return self.record_deferred(dispatch, candidate, &invocation, &error).await,
         };
         let seen = &snapshot.generation;
         if seen.size != candidate.size || seen.mtime != candidate.mtime || seen.ctime != candidate.ctime {
             return self
-                .record_deferred(dispatch, candidate, invocation, "catalog_generation_changed")
+                .record_deferred(dispatch, candidate, &invocation, "catalog_generation_changed")
                 .await;
         }
-        if invocation.kind != ActionKind::Archive {
+        if matches!(invocation.kind, ActionKind::Release | ActionKind::Restore) {
             invocation.archive_id = snapshot.state.archive_id;
         }
-        if let Decision::Defer(reason) = dispatch.admission.authorize(fs, invocation) {
-            return self.record_deferred(dispatch, candidate, invocation, &reason).await;
+        if let Decision::Defer(reason) = dispatch.admission.authorize(fs, &invocation) {
+            return self.record_deferred(dispatch, candidate, &invocation, &reason).await;
         }
         if let Err(reason) = invocation.precondition(&snapshot.state) {
-            return self.record_deferred(dispatch, candidate, invocation, reason).await;
+            return self.record_deferred(dispatch, candidate, &invocation, reason).await;
         }
-        let runtime = self.runtime.as_ref().expect("dispatch requires a runtime");
-        let operation = sqlx::query(
-            "INSERT INTO rev8_operations (run_id, filesystem, fid, action, archive_id, state, generation, size, principal, execution_profile)
-             VALUES (?, ?, ?, ?, ?, 'submitting', ?, ?, ?, ?)",
-        ).bind(dispatch.run.id).bind(fs).bind(&candidate.fid).bind(invocation.kind.name()).bind(invocation.archive_id)
-            .bind(Json(seen)).bind(seen.size).bind(Json(&runtime.principal)).bind(&dispatch.admission.profile.name)
-            .execute(&self.pool).await?.last_insert_id();
+        if invocation.migration.is_some() {
+            return self
+                .admit_pool_migration(dispatch, candidate, &invocation, seen, worker)
+                .await;
+        }
+        let operation = self
+            .reserve_operation(dispatch, candidate, &invocation, seen, None)
+            .await?;
 
         // Hold the policy head through revalidation and the request. A disable,
         // replacement or delete cannot commit in the middle of issuing it.
         let mut tx = self.pool.begin().await?;
         let active = current_revision(&mut tx, dispatch.run).await?;
-        let owns_permit: Option<u64> =
-            sqlx::query_scalar("SELECT id FROM rev8_operations WHERE id = ? AND state = 'submitting' FOR UPDATE")
-                .bind(operation)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if owns_permit.is_none() {
+        if !lock_permit(&mut tx, operation).await? {
             return Ok(());
         }
         let (state, attempted, reason, terminal_class) = if !active || !dispatch.admission.window_open(Utc::now()) {
@@ -660,10 +675,7 @@ impl PolicyStore {
                         // Verify that the worker transaction still owns its lock.
                         // The committed operation reserves the FID and budget even
                         // if the connection is lost after this check.
-                        let permit_store = sqlx::query_scalar::<_, u8>(
-                            "SELECT id FROM rev8_worker_lock WHERE id = 1 AND @@GLOBAL.innodb_flush_log_at_trx_commit = 1 FOR UPDATE",
-                        ).fetch_optional(&mut **worker).await?;
-                        if permit_store.is_none() {
+                        if !verify_worker_permit(worker).await? {
                             (
                                 "deferred",
                                 false,
@@ -712,8 +724,33 @@ impl PolicyStore {
             .then_some("system_safety_run_duration")
     }
 
+    async fn reserve_operation(
+        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: &Invocation, generation: &Generation,
+        migration: Option<&MigrationPlan>,
+    ) -> Result<u64, PolicyError> {
+        let runtime = self.runtime.as_ref().expect("dispatch requires a runtime");
+        Ok(sqlx::query(
+            "INSERT INTO rev8_operations (run_id, filesystem, fid, action, archive_id, state, generation, size,
+                 principal, execution_profile, migration_plan)
+             VALUES (?, ?, ?, ?, ?, 'submitting', ?, ?, ?, ?, ?)",
+        )
+        .bind(dispatch.run.id)
+        .bind(dispatch.policy.filesystem.as_str())
+        .bind(&candidate.fid)
+        .bind(invocation.kind.name())
+        .bind(invocation.archive_id)
+        .bind(Json(generation))
+        .bind(generation.size)
+        .bind(Json(&runtime.principal))
+        .bind(&dispatch.admission.profile.name)
+        .bind(migration.map(Json))
+        .execute(&self.pool)
+        .await?
+        .last_insert_id())
+    }
+
     async fn record_deferred(
-        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: Invocation, reason: &str,
+        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: &Invocation, reason: &str,
     ) -> Result<(), PolicyError> {
         sqlx::query(
             "INSERT INTO rev8_operations (run_id, filesystem, fid, action, archive_id, state, reason, size)
@@ -741,12 +778,17 @@ impl PolicyStore {
         for operation in pending {
             let filesystem = rbh_entry_store::FileSystemId::new(&operation.filesystem)
                 .map_err(|error| PolicyError::Store(error.to_string()))?;
+            if operation.action == ActionKind::PoolMigrate.name() {
+                self.reconcile_pool_operation(entries, &filesystem, &operation).await?;
+                continue;
+            }
             let action =
                 ActionKind::from_name(&operation.action).ok_or_else(|| invalid("unknown persisted HSM action"))?;
             let invocation = Invocation {
                 kind: action,
                 archive_id: operation.archive_id,
                 requires_human: false,
+                migration: None,
             };
             let fid = decode_fid(&operation.fid)?;
             let config = rev8::validate_filesystem(entries, &filesystem).await;
@@ -796,6 +838,26 @@ impl PolicyStore {
     fn backend(&self) -> &dyn NativeHsm {
         self.runtime.as_ref().map_or(&LustreHsm, |runtime| runtime.hsm.as_ref())
     }
+}
+
+async fn lock_permit(tx: &mut Transaction<'_, MySql>, operation: u64) -> Result<bool, PolicyError> {
+    Ok(
+        sqlx::query_scalar::<_, u64>("SELECT id FROM rev8_operations WHERE id = ? AND state = 'submitting' FOR UPDATE")
+            .bind(operation)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+    )
+}
+
+async fn verify_worker_permit(worker: &mut Transaction<'_, MySql>) -> Result<bool, PolicyError> {
+    // The committed intent still reserves the FID and budget across a loss of this lock.
+    Ok(sqlx::query_scalar::<_, u8>(
+        "SELECT id FROM rev8_worker_lock WHERE id = 1 AND @@GLOBAL.innodb_flush_log_at_trx_commit = 1 FOR UPDATE",
+    )
+    .fetch_optional(&mut **worker)
+    .await?
+    .is_some())
 }
 
 async fn existing_one_shot_run(

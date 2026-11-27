@@ -7,7 +7,9 @@ use std::{
 
 pub mod execution;
 pub mod resources;
+mod tiering;
 use resources::{ResourceBinding, ResourceKind};
+pub use tiering::PoolMigration;
 
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use rbh_entry_store::store::{EntryStore, QueryParam};
@@ -146,10 +148,30 @@ impl Policy {
             children: vec![files, target_condition],
         });
         let rules = spec.rules.compile(&mut conditions)?;
+        let mut params = query_params(params);
+        if let Some(migration) = rules
+            .actions
+            .iter()
+            .find_map(|invocation| invocation.migration.as_ref())
+        {
+            if !matches!(spec.trigger, Trigger::Periodic { .. }) {
+                return Err(invalid("lustre.pool_migrate requires a periodic trigger"));
+            }
+            if rules
+                .actions
+                .iter()
+                .any(|invocation| invocation.migration.as_ref() != Some(migration))
+            {
+                return Err(invalid(
+                    "a tiering policy requires one source pool, destination pool and set of migration parameters",
+                ));
+            }
+            where_clause.push_str(" AND CAST(pool_name AS BINARY) = CAST(? AS BINARY)");
+            params.push(QueryParam::Str(migration.source_pool.clone()));
+        }
         where_clause.push_str(" AND ");
         where_clause.push_str(&rules.excludes);
         let decision_params = query_params(rules.params);
-        let mut params = query_params(params);
         params.extend(query_params(rules.exclude_params));
         Ok(CompiledPolicy {
             name: self.metadata.name,
@@ -201,11 +223,25 @@ pub(crate) async fn validate_filesystem(
 }
 
 impl CompiledPolicy {
+    pub(crate) fn pool_migration(&self) -> Option<&PoolMigration> {
+        self.actions.iter().find_map(|invocation| invocation.migration.as_ref())
+    }
+
+    pub(crate) fn validate_capabilities(&self, config: &rbh_entry_store::FileSystemConfig) -> Result<(), PolicyError> {
+        if self.pool_migration().is_some() && !(config.capabilities.stripe && config.capabilities.ost) {
+            return Err(invalid(
+                "lustre.pool_migrate requires filesystem stripe and OST capabilities",
+            ));
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(skip_all, fields(filesystem = %self.filesystem, revision))]
     pub async fn preview(
         &self, entries: &EntryStore, revision: u64, resource_bindings: Vec<ResourceBinding>,
     ) -> Result<PreviewResult, PolicyError> {
-        validate_filesystem(entries, &self.filesystem).await?;
+        let config = validate_filesystem(entries, &self.filesystem).await?;
+        self.validate_capabilities(&config)?;
         let where_clause = format!("{} AND ({}) > 0", self.where_clause, self.decision);
         let params: Vec<_> = self.params.iter().chain(&self.decision_params).cloned().collect();
         let (candidate_count, estimated_bytes) = entries
@@ -412,7 +448,7 @@ impl Rules {
             let kind = action
                 .kind
                 .ok_or_else(|| invalid("spec.rules.defaults.action.type is required"))?;
-            action.archive_id(kind, "spec.rules.defaults")?;
+            action.validate_defaults(kind)?;
         }
         let mut rules: Vec<_> = self.entries.into_iter().enumerate().collect();
         rules.sort_by_key(|(_, rule)| std::cmp::Reverse(rule.priority));
@@ -440,20 +476,20 @@ impl Rules {
                         .ok_or_else(|| {
                             invalid(format!("{path}.action.type is required when no default action is set"))
                         })?;
-                    let default_archive = default_action
+                    let mut params = default_action
                         .as_ref()
                         .filter(|action| action.kind == Some(kind))
-                        .and_then(|action| action.params.as_ref())
-                        .and_then(|params| params.archive_id);
-                    let rule_archive = match &rule.action {
-                        Some(action) => action.archive_id(kind, &path)?,
-                        None => None,
-                    };
-                    actions.push(Invocation {
+                        .and_then(|action| action.params.clone())
+                        .unwrap_or_default();
+                    if let Some(rule_params) = rule.action.and_then(|action| action.params) {
+                        params.extend(rule_params);
+                    }
+                    actions.push(Invocation::parse(
                         kind,
-                        archive_id: rule_archive.or(default_archive).unwrap_or_default(),
-                        requires_human: matches!(rule.decision, Decision::RequireApproval),
-                    });
+                        params,
+                        matches!(rule.decision, Decision::RequireApproval),
+                        &path,
+                    )?);
                     actions.len()
                 }
                 Decision::Skip if rule.action.is_some() => {
@@ -527,20 +563,22 @@ enum Decision {
 struct Action {
     #[serde(rename = "type")]
     kind: Option<ActionKind>,
-    params: Option<ArchiveParams>,
+    params: Option<serde_json::Map<String, JsonValue>>,
     #[serde(rename = "targetRef")]
     _target_ref: Option<ActionTarget>,
 }
 
 impl Action {
-    fn archive_id(&self, kind: ActionKind, path: &str) -> Result<Option<u32>, PolicyError> {
-        let id = self.params.as_ref().and_then(|params| params.archive_id);
-        if id.is_some() && kind != ActionKind::Archive {
-            return Err(invalid(format!(
-                "{path}.action.params.archiveId is only supported for archive"
-            )));
+    fn validate_defaults(&self, kind: ActionKind) -> Result<(), PolicyError> {
+        let Some(params) = self.params.clone() else {
+            return Ok(());
+        };
+        let path = "spec.rules.defaults";
+        if kind == ActionKind::PoolMigrate {
+            tiering::validate_parameter_names(&params, path)
+        } else {
+            Invocation::parse(kind, params, false, path).map(|_| ())
         }
-        Ok(id)
     }
 }
 
@@ -552,16 +590,19 @@ pub enum ActionKind {
     Release,
     #[serde(rename = "lustre.hsm.restore")]
     Restore,
+    #[serde(rename = "lustre.pool_migrate")]
+    PoolMigrate,
 }
 
 impl ActionKind {
-    pub const ALL: [Self; 3] = [Self::Archive, Self::Release, Self::Restore];
+    pub const ALL: [Self; 4] = [Self::Archive, Self::Release, Self::Restore, Self::PoolMigrate];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Archive => "lustre.hsm.archive",
             Self::Release => "lustre.hsm.release",
             Self::Restore => "lustre.hsm.restore",
+            Self::PoolMigrate => "lustre.pool_migrate",
         }
     }
 
@@ -569,7 +610,7 @@ impl ActionKind {
         match self {
             Self::Archive => "data_copy",
             Self::Release => "data_release",
-            Self::Restore => "data_copy",
+            Self::Restore | Self::PoolMigrate => "data_copy",
         }
     }
 
@@ -578,12 +619,38 @@ impl ActionKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Invocation {
     pub kind: ActionKind,
     pub archive_id: u32,
     pub(crate) requires_human: bool,
+    pub(crate) migration: Option<PoolMigration>,
+}
+
+impl Invocation {
+    fn parse(
+        kind: ActionKind, params: serde_json::Map<String, JsonValue>, requires_human: bool, path: &str,
+    ) -> Result<Self, PolicyError> {
+        let (archive_id, migration) = if kind == ActionKind::PoolMigrate {
+            (0, Some(PoolMigration::parse(params, path)?))
+        } else {
+            let params: ArchiveParams = serde_path_to_error::deserialize(&JsonValue::Object(params))
+                .map_err(|error| invalid(format!("{path}.action.params: {error}")))?;
+            if params.archive_id.is_some() && kind != ActionKind::Archive {
+                return Err(invalid(format!(
+                    "{path}.action.params.archiveId is only supported for archive"
+                )));
+            }
+            (params.archive_id.unwrap_or_default(), None)
+        };
+        Ok(Self {
+            kind,
+            archive_id,
+            requires_human,
+            migration,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -607,6 +674,77 @@ struct FieldCondition {
     value: JsonValue,
 }
 
+impl FieldCondition {
+    fn compile(self, path: &str, now: DateTime<Utc>) -> Result<Predicate, PolicyError> {
+        let as_string = || {
+            self.value
+                .as_str()
+                .ok_or_else(|| invalid(format!("{path}.value must be a string")))
+        };
+        match self.field.as_str() {
+            "object.size" => {
+                let bytes = size_bytes(&self.value)
+                    .and_then(|v| i64::try_from(v).ok())
+                    .ok_or_else(|| invalid(format!("{path}.value must be a size within the supported range")))?;
+                Ok(Predicate::Cmp {
+                    field: Field::Size,
+                    cmp: self.op.ordinal(path)?,
+                    value: Value::Num(bytes),
+                })
+            }
+            "object.last_modified" if matches!(self.op, Comparison::OlderThan) => {
+                let age = as_string()
+                    .ok()
+                    .and_then(duration_millis)
+                    .and_then(|ms| i64::try_from(ms.div_ceil(1000)).ok())
+                    .ok_or_else(|| invalid(format!("{path}.value must be a positive Rev.8 duration")))?;
+                let cutoff = now
+                    .timestamp()
+                    .checked_sub(age)
+                    .ok_or_else(|| invalid(format!("{path}.value exceeds the timestamp range")))?;
+                Ok(Predicate::Cmp {
+                    field: Field::Mtime,
+                    cmp: CmpOp::Le,
+                    value: Value::Num(cutoff),
+                })
+            }
+            "object.last_modified" => Err(invalid(format!(
+                "{path}.op must be older_than for object.last_modified"
+            ))),
+            "lustre.pool" => {
+                let cmp = self.op.equality(path)?;
+                let pool = as_string()?;
+                if !lustre_api::migration::valid_pool_name(pool) {
+                    return Err(invalid(format!("{path}.value must be a Lustre pool name")));
+                }
+                let predicate = Predicate::InPool { pool: pool.into() };
+                Ok(if matches!(cmp, CmpOp::Ne) {
+                    Predicate::Not {
+                        inner: Box::new(predicate),
+                    }
+                } else {
+                    predicate
+                })
+            }
+            field if field.starts_with("object.tags.") => {
+                let key = &field["object.tags.".len()..];
+                if key.is_empty()
+                    || key.len() > 64
+                    || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                {
+                    return Err(invalid(format!("{path}.field requires a classifier tag name")));
+                }
+                Ok(Predicate::Xattr {
+                    key: key.into(),
+                    cmp: self.op.equality(path)?,
+                    value: Value::Str(as_string()?.into()),
+                })
+            }
+            field => Err(invalid(format!("{path}.field is unsupported: {field}"))),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Comparison {
@@ -616,17 +754,27 @@ enum Comparison {
     Lte,
     Gt,
     Gte,
+    OlderThan,
 }
 
-impl From<Comparison> for CmpOp {
-    fn from(comparison: Comparison) -> Self {
-        match comparison {
-            Comparison::Eq => Self::Eq,
-            Comparison::Ne => Self::Ne,
-            Comparison::Lt => Self::Lt,
-            Comparison::Lte => Self::Le,
-            Comparison::Gt => Self::Gt,
-            Comparison::Gte => Self::Ge,
+impl Comparison {
+    fn ordinal(self, path: &str) -> Result<CmpOp, PolicyError> {
+        Ok(match self {
+            Self::Eq => CmpOp::Eq,
+            Self::Ne => CmpOp::Ne,
+            Self::Lt => CmpOp::Lt,
+            Self::Lte => CmpOp::Le,
+            Self::Gt => CmpOp::Gt,
+            Self::Gte => CmpOp::Ge,
+            Self::OlderThan => return Err(invalid(format!("{path}.op older_than requires object.last_modified"))),
+        })
+    }
+
+    fn equality(self, path: &str) -> Result<CmpOp, PolicyError> {
+        match self {
+            Self::Eq => Ok(CmpOp::Eq),
+            Self::Ne => Ok(CmpOp::Ne),
+            _ => Err(invalid(format!("{path}.op requires eq or ne"))),
         }
     }
 }
@@ -641,6 +789,7 @@ struct ConditionCompiler<'a> {
     stack: Vec<String>,
     referenced: BTreeSet<String>,
     remaining: usize,
+    now: DateTime<Utc>,
 }
 
 impl<'a> ConditionCompiler<'a> {
@@ -650,6 +799,7 @@ impl<'a> ConditionCompiler<'a> {
             stack: Vec::new(),
             referenced: BTreeSet::new(),
             remaining: 4096,
+            now: Utc::now(),
         }
     }
 
@@ -682,17 +832,7 @@ impl<'a> ConditionCompiler<'a> {
                     invalid(format!("{path}.{field}: {message}"))
                 }
             })?;
-            if condition.field != "object.size" {
-                return Err(invalid(format!("{path}.field is unsupported: {}", condition.field)));
-            }
-            let bytes = size_bytes(&condition.value)
-                .and_then(|size| i64::try_from(size).ok())
-                .ok_or_else(|| invalid(format!("{path}.value must be a size within the supported range")))?;
-            return Ok(Predicate::Cmp {
-                field: Field::Size,
-                cmp: condition.op.into(),
-                value: Value::Num(bytes),
-            });
+            return condition.compile(path, self.now);
         }
         let Some((key, operand)) = fields.iter().next().filter(|_| fields.len() == 1) else {
             return Err(invalid(format!("{path} must contain exactly one condition operator")));

@@ -102,15 +102,30 @@ async fn delete_resource(
 }
 
 fn contract_response(action: ActionKind, revision: u64, definition: Value) -> Value {
-    let properties = if action == ActionKind::Archive {
-        serde_json::json!({"archiveId": {"type": "integer", "minimum": 0, "maximum": u32::MAX}})
-    } else {
-        serde_json::json!({})
-    };
+    let mut schema = serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false});
+    match action {
+        ActionKind::Archive => {
+            schema["properties"]["archiveId"] =
+                serde_json::json!({"type": "integer", "minimum": 0, "maximum": u32::MAX});
+        }
+        ActionKind::PoolMigrate => {
+            let size = serde_json::json!({"oneOf": [
+                {"type": "integer", "minimum": 1},
+                {"type": "string", "pattern": "^[1-9][0-9]*(B|KiB|MiB|GiB|TiB|PiB)$"}
+            ]});
+            let pool = serde_json::json!({"type":"string","pattern":"^[a-zA-Z0-9_-]{1,15}$"});
+            schema["required"] = serde_json::json!(["sourcePool", "targetPool", "maxFileBytes"]);
+            schema["properties"] = serde_json::json!({
+                "sourcePool": pool, "targetPool": pool, "maxFileBytes": size, "stripeSize": size,
+                "stripeCount": {"type": "integer", "minimum": 1, "maximum": u16::MAX}
+            });
+        }
+        _ => {}
+    }
     serde_json::json!({
         "revision": revision,
         "definition": definition,
-        "parametersSchema": {"type": "object", "properties": properties, "additionalProperties": false}
+        "parametersSchema": schema
     })
 }
 
