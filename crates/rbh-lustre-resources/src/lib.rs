@@ -8,7 +8,7 @@ mod repository;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use application::ResourceObservations;
+pub use application::{ResourceObservations, ResourceUpdate};
 pub use observation::{ResourceSnapshot, ResourceView};
 
 fn unix_now() -> u64 {

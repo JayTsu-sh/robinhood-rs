@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 type Inventory<T> =
   | { status: 'loading' }
@@ -15,20 +15,33 @@ export function requestError(error: unknown): string {
 export function useInventory<T>(
   load: (signal: AbortSignal) => Promise<T>,
   reload: (signal: AbortSignal) => Promise<T> = load,
-  { keepPrevious = false, refreshKey = 0 } = {},
+  { keepPrevious = false, refreshKey = 0, queueRefresh = false } = {},
 ) {
   const [state, setState] = useState<Inventory<T>>({ status: 'loading' });
   const [attempt, setAttempt] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
-  const refresh = useCallback(() => {
+  const inFlight = useRef(true);
+  const queued = useRef(false);
+  const startRefresh = useCallback(() => {
+    inFlight.current = true;
     setState((previous) => keepPrevious && previous.status === 'ready'
-      ? { status: 'ready', data: previous.data } : { status: 'loading' });
+      ? (queueRefresh ? previous : { status: 'ready', data: previous.data })
+      : { status: 'loading' });
     setRefreshing(true);
     setAttempt((value) => value + 1);
-  }, [keepPrevious]);
+  }, [keepPrevious, queueRefresh]);
+
+  const refresh = useCallback(() => {
+    if (queueRefresh && inFlight.current) {
+      queued.current = true;
+      return;
+    }
+    startRefresh();
+  }, [queueRefresh, startRefresh]);
 
   useEffect(() => {
     const controller = new AbortController();
+    inFlight.current = true;
     const request = attempt === 0 ? load : reload;
     request(controller.signal).then(
       (data) => {
@@ -40,9 +53,18 @@ export function useInventory<T>(
         setState((previous) => keepPrevious && previous.status === 'ready'
           ? { ...previous, refreshError: message } : { status: 'error', message });
       },
-    ).finally(() => { if (!controller.signal.aborted) setRefreshing(false); });
+    ).finally(() => {
+      if (controller.signal.aborted) return;
+      inFlight.current = false;
+      if (queued.current) {
+        queued.current = false;
+        startRefresh();
+      } else {
+        setRefreshing(false);
+      }
+    });
     return () => controller.abort();
-  }, [attempt, keepPrevious, load, reload, refreshKey]);
+  }, [attempt, keepPrevious, load, reload, refreshKey, startRefresh]);
 
   return { state, refresh, refreshing };
 }

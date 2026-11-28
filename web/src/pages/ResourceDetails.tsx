@@ -2,16 +2,17 @@ import { ArrowLeftOutlined } from '@ant-design/icons';
 import { ProTable, type ProColumns } from '@ant-design/pro-components';
 import { Link, useNavigate, useSearchParams } from '@umijs/max';
 import { Alert, Button, Descriptions, Empty, Result, Space, Spin, Tabs, Tag, Typography } from 'antd';
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
 import ResourceManagement, { useResourceManagement } from '@/components/ResourceManagement';
 import {
   Availability, CapacityStatus, CollectionStatus, MountStatus, Reason, formatBytes,
   formatObservationTime, formatUsage, useObservationClock,
 } from '@/components/ResourceStatus';
-import { getFilesystem, listTieringPolicies, refreshFilesystem, type FilesystemResource, type PoolResource } from '@/services/tiering';
+import { getFilesystem, listTieringPolicies, type FilesystemResource, type PoolResource } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
 import { poolTiers, resourceOwnerLabels, type ResourceRegistration } from '@/services/resourceManagement';
+import { useResourceEvents } from '@/services/useResourceEvents';
 import './resource-details.css';
 
 function RelatedPolicies({ filesystem }: { filesystem: string }) {
@@ -127,10 +128,12 @@ function MountInformation({ resource, registration }: { resource: FilesystemReso
 
 function ResourceDetails({ id }: { id: string }) {
   const load = useCallback((signal: AbortSignal) => getFilesystem(id, signal), [id]);
-  const reload = useCallback((signal: AbortSignal) => refreshFilesystem(id, signal), [id]);
-  const { state, refresh } = useInventory(load, reload);
-  const { management, refresh: reloadManagement } = useResourceManagement();
+  const { state, refresh } = useInventory(load, load, { keepPrevious: true, queueRefresh: true });
+  const { management, error: managementError, refresh: reloadManagement } = useResourceManagement();
+  useResourceEvents(refresh, reloadManagement, id);
   const registration = management?.resources.find((candidate) => candidate.id === id);
+  const [removing, setRemoving] = useState<ResourceRegistration>();
+  const editableRegistration = registration ?? removing;
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const requestedTab = params.get('tab');
@@ -138,18 +141,28 @@ function ResourceDetails({ id }: { id: string }) {
   const now = useObservationClock();
   const resource = state.status === 'ready' ? state.data : null;
 
+  function refreshResources() {
+    refresh();
+    reloadManagement();
+  }
+
   return (
     <>
       <Link to="/resources" className="resource-back"><ArrowLeftOutlined /> 返回 Lustre 集群列表</Link>
       <InventoryPage title={registration?.name || id} status={state.status}
-        error={state.status === 'error' ? state.message : undefined} refresh={() => { refresh(); reloadManagement(); }}
-        action={management && registration && <ResourceManagement management={management} resource={registration}
+        error={state.status === 'error' ? state.message : undefined}
+        refreshError={state.status === 'ready' ? state.refreshError : undefined} retry={refreshResources}
+        action={management && editableRegistration && (resource || removing) && <ResourceManagement
+          management={management} resource={editableRegistration} onRemoving={setRemoving}
           pools={resource?.pools?.map(({ name }) => name)}
           mounted={resource?.mountStatus === 'mounted'}
           onRefresh={(removed) => {
             if (removed) navigate('/resources');
-            else { refresh(); reloadManagement(); }
+            else refreshResources();
           }} />}>
+        {managementError && <Alert type="warning" showIcon message="集群接入信息读取失败" description={managementError}
+          action={<Button onClick={reloadManagement}>重试</Button>} />}
+        {state.status === 'ready' && !resource && <Result status="404" title="Lustre 文件系统未注册" />}
         {resource && (
           <div className="resource-panel">
             {registration?.lastMountError && <Alert type="warning" showIcon message="最近挂载失败"

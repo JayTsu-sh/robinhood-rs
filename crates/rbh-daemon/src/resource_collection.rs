@@ -17,6 +17,8 @@ impl Task for CollectLustreResources {
         let resources = RESOURCES
             .get()
             .expect("console collections require a registered runtime");
+        // External mount discovery is independent of registered snapshot collection.
+        resources.management_changed(None);
         tokio::select! {
             _ = ctx.cancellation_token.cancelled() => Ok(()),
             result = resources.refresh(None) => result.map_err(SchedulerError::ExecutionError),

@@ -10,7 +10,8 @@ use std::{
 use axum::{
     Extension, Json, Router,
     extract::{Path as ApiPath, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
     routing::{get, post},
 };
 use rbh_entry_store::{BackendCapabilities, BackendKind, FileSystemConfig, FileSystemId, error::StoreError};
@@ -240,7 +241,7 @@ impl ResourceAdministration {
             ApiError::BadRequest(message) | ApiError::ServiceUnavailable(message) => message.clone(),
             _ => "无法挂载文件系统".into(),
         });
-        self.save(resource).await?;
+        self.save_and_notify(resource).await?;
         result
     }
 
@@ -267,6 +268,12 @@ impl ResourceAdministration {
 
     async fn save(&self, registration: &Registration) -> Result<(), ApiError> {
         self.write_registration(registration, self.app.entry_store.pool()).await
+    }
+
+    async fn save_and_notify(&self, registration: &Registration) -> Result<(), ApiError> {
+        self.save(registration).await?;
+        self.observations.management_changed(Some(registration.id.clone()));
+        Ok(())
     }
 
     async fn write_registration<'e>(
@@ -440,7 +447,7 @@ impl ResourceAdministration {
 }
 
 #[tracing::instrument(skip_all)]
-async fn list(State(admin): State<ResourceAdministration>) -> Result<Json<ManagementView>, ApiError> {
+async fn list(State(admin): State<ResourceAdministration>) -> Result<impl IntoResponse, ApiError> {
     let mut resources: Vec<_> = admin
         .records()
         .await
@@ -480,11 +487,14 @@ async fn list(State(admin): State<ResourceAdministration>) -> Result<Json<Manage
             Some(DetectedMount { path, source: source? })
         })
         .collect();
-    Ok(Json(ManagementView {
-        can_create_mount: admin.managed_root.is_some(),
-        resources,
-        available_mounts,
-    }))
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ManagementView {
+            can_create_mount: admin.managed_root.is_some(),
+            resources,
+            available_mounts,
+        }),
+    ))
 }
 
 #[tracing::instrument(skip_all)]
@@ -542,6 +552,7 @@ async fn register(
         .register_runtime(&resource)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
+    admin.observations.management_changed(Some(resource.id.clone()));
     if mount_now && let Err(error) = admin.mount_and_record(&mut resource).await {
         tracing::warn!(filesystem = %resource.id, ?error, "registered Lustre mount is pending");
     }
@@ -568,7 +579,7 @@ async fn change(
     ApiPath(id): ApiPath<FileSystemId>, headers: HeaderMap, Json(change): Json<Change>,
 ) -> Result<StatusCode, ApiError> {
     let actor = writers.authorize(&headers)?;
-    let _change = admin.changes.lock().await;
+    let change_guard = admin.changes.clone().lock_owned().await;
     let mut resource =
         match admin.records().await.map_err(database_error)?.into_iter().find(|r| {
             r.id == id && !r.removed && (r.owner == Owner::Deployment || !admin.deployment_ids.contains(&r.id))
@@ -601,7 +612,7 @@ async fn change(
     match change {
         Change::Rename { name } => {
             resource.name = valid_name(&name)?;
-            admin.save(&resource).await?;
+            admin.save_and_notify(&resource).await?;
         }
         Change::SetTier { pool, tier } => {
             if !lustre_api::pools::valid_pool_name(&pool) {
@@ -612,11 +623,11 @@ async fn change(
             } else {
                 resource.tiers.remove(&pool);
             }
-            admin.save(&resource).await?;
+            admin.save_and_notify(&resource).await?;
         }
         Change::SetAutoMount { enabled } if resource.owner == Owner::Daemon => {
             resource.auto_mount = enabled;
-            admin.save(&resource).await?;
+            admin.save_and_notify(&resource).await?;
         }
         Change::Mount if resource.owner == Owner::Daemon => {
             resource.desired_mounted = true;
@@ -642,6 +653,7 @@ async fn change(
             resource.last_mount_error = None;
             admin.write_registration(&resource, &mut *tx).await?;
             tx.commit().await.map_err(database_error)?;
+            admin.observations.management_changed(Some(id.clone()));
             admin
                 .observations
                 .refresh(Some(&id))
@@ -652,10 +664,22 @@ async fn change(
             let mut tx = admin.app.entry_store.pool().begin().await.map_err(database_error)?;
             admin.require_idle(&id, true, &mut tx).await?;
             resource.removed = true;
-            admin.save(&resource).await?;
-            admin.app.policy_store.set_filesystem_configured(&id, false);
-            admin.observations.unregister(&id);
-            tx.commit().await.map_err(database_error)?;
+            admin.write_registration(&resource, &mut *tx).await?;
+            let removed_id = id.clone();
+            // Finish the state transition even if the HTTP request goes away during commit.
+            tokio::spawn(async move {
+                let _change = change_guard;
+                admin.app.policy_store.set_filesystem_configured(&removed_id, false);
+                if let Err(error) = tx.commit().await {
+                    admin.app.policy_store.set_filesystem_configured(&removed_id, true);
+                    return Err(database_error(error));
+                }
+                admin.observations.unregister(&removed_id);
+                admin.observations.management_changed(Some(removed_id));
+                Ok(())
+            })
+            .await
+            .map_err(|error| ApiError::Internal(format!("remove Lustre registration: {error}")))??;
         }
         _ => return Err(bad("当前挂载由部署或外部运维管理")),
     }
