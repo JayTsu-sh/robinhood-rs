@@ -10,7 +10,6 @@ const id = 'qa-managed';
 const label = '容器验收集群';
 const renamed = '容器验收改名';
 const api = '/api/filesystems/management';
-const resource = (page: Page) => page.goto('/console/#/resources/detail?filesystem=' + id);
 const select = async (dialog: Locator, label: string, option: string | RegExp, page: Page) => {
   await dialog.getByRole('combobox', { name: new RegExp(label + "$") }).press("ArrowDown");
   await page.getByRole('option', { name: option, exact: true }).click();
@@ -29,7 +28,7 @@ test('creates and manages a real Lustre mount through the GUI', { tag: '@daemon'
   await page.goto('/console/#/resources');
   await page.getByRole('button', { name: '添加集群' }).click();
   const add = page.getByRole('dialog', { name: '添加集群' });
-  await select(add, '接入方式', '创建新挂载', page);
+  await expect(add.getByLabel('接入方式')).toHaveCount(0);
   await add.getByLabel('文件系统 ID').fill(id);
   await add.getByLabel('集群名称').fill(label);
   await add.getByLabel('Lustre 文件系统名称').fill(filesystem!);
@@ -37,7 +36,10 @@ test('creates and manages a real Lustre mount through the GUI', { tag: '@daemon'
   await confirm(add, '测试连接', false);
   await expect(add.getByText('MGS NID 可达。', { exact: false })).toBeVisible();
   await confirm(add, '添加');
-  await page.getByRole('link', { name: new RegExp(label + "$") }).click();
+  const cluster = page.getByRole('link', { name: label, exact: true });
+  const row = page.getByRole('row').filter({ has: cluster });
+  await expect(row.getByRole('cell', { name: `/mnt/${id}`, exact: true })).toBeVisible();
+  await cluster.click();
   await expect(page.getByRole('heading', { name: new RegExp(label + "$") })).toBeVisible();
   await expect(page.getByRole('button', { name: '卸载', exact: true })).toBeVisible();
   await expect.poll(async () => {
@@ -71,10 +73,13 @@ test('creates and manages a real Lustre mount through the GUI', { tag: '@daemon'
   await page.screenshot({ path: testInfo.outputPath('managed-mount.png'), fullPage: true });
 });
 
-test('restores after container restart and supports unmount, remount and removal', { tag: '@daemon' }, async ({ page, request }) => {
+test('restores after container restart and keeps the cluster after unmount', { tag: '@daemon' }, async ({ page, request }) => {
   test.skip(!mountSource || !token, 'requires the container Lustre fixture');
   test.setTimeout(120_000);
-  await resource(page);
+  await page.goto('/console/#/resources');
+  const row = page.getByRole('row').filter({ has: page.getByRole('link', { name: renamed, exact: true }) });
+  await expect(row).toContainText('已挂载');
+  await row.getByRole('link', { name: renamed, exact: true }).click();
   await expect(page.getByRole('heading', { name: renamed, exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '卸载', exact: true })).toBeVisible();
   await page.getByRole('tab', { name: '存储资源' }).click();
@@ -87,30 +92,22 @@ test('restores after container restart and supports unmount, remount and removal
   await expect(page.getByRole('button', { name: '卸载', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '卸载', exact: true }).click();
   await confirm(page.getByRole('dialog', { name: '卸载' }), '确认');
-  await page.getByRole('button', { name: '移除接入' }).click();
-  await confirm(page.getByRole('dialog', { name: '移除接入' }), '确认');
-  await expect(page.getByRole('heading', { name: 'Lustre 集群', exact: true })).toBeVisible();
-  await expect.poll(async () => (await (await request.get(api)).json()).resources.length).toBe(0);
+  await expect(page.getByRole('button', { name: '移除接入' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '挂载', exact: true })).toBeVisible();
+  await expect.poll(async () => (await (await request.get(api)).json()).resources
+    .find((item: { id: string }) => item.id === id)).toMatchObject({ mounted: false, desiredMounted: false, autoMount: true });
+  await page.getByRole('link', { name: '返回 Lustre 集群列表' }).click();
+  await expect(row).toContainText('未挂载');
 });
 
-test('attaches an actual existing mount and keeps it mounted after removing the registration', { tag: '@daemon' }, async ({ page, request }) => {
+test('shows an actual external mount directly in the cluster list', { tag: '@daemon' }, async ({ page }) => {
   test.skip(!mountSource || !token, 'requires the container Lustre fixture');
   test.setTimeout(90_000);
   await page.goto('/console/#/resources');
-  await page.getByRole('button', { name: '添加集群' }).click();
-  const add = page.getByRole('dialog', { name: '添加集群' });
-  await add.getByLabel('文件系统 ID').fill('qa-external');
-  await add.getByLabel('集群名称').fill('外部挂载验收');
-  await select(add, '本机 Lustre 挂载', /^\/mnt\/qa-existing · /, page);
-  await confirm(add, '检查挂载', false);
-  await expect(add.getByText('已确认本机 Lustre 挂载。', { exact: true })).toBeVisible();
-  await confirm(add, '添加');
-  await page.getByRole('link', { name: '外部挂载验收', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '外部挂载验收', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '移除接入' }).click();
-  await confirm(page.getByRole('dialog', { name: '移除接入' }), '确认');
-  await expect.poll(async () => (await (await request.get(api)).json()).availableMounts
-    .some(({ path }: { path: string }) => path === '/mnt/qa-existing')).toBe(true);
+  const row = page.getByRole('row').filter({ hasText: '/mnt/qa-existing' });
+  await expect(row).toContainText(mountSource!);
+  await expect(row).toContainText('已挂载');
+  await expect(row.getByRole('link')).toHaveCount(0);
 });
 
 test('authenticates pause, resume, cancel and approval against MariaDB', { tag: '@daemon' }, async ({ page, request }) => {

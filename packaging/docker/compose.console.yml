@@ -1,0 +1,24 @@
+services:
+  rbh-daemon:
+    environment:
+      RBH_TRUSTED_GATEWAY_WRITES: "true"
+      RBH_POLICY_WRITERS_FILE: ""
+      RBH_TRUSTED_GATEWAY_SOCKET: /run/rbh-gateway/daemon.sock
+    volumes:
+      - console_gateway_run:/run/rbh-gateway
+  console-gateway:
+    image: nginx:alpine
+    network_mode: host
+    restart: unless-stopped
+    depends_on: [rbh-daemon]
+    environment:
+      RBH_CONSOLE_HTTP_LISTEN: "${RBH_CONSOLE_HTTP_LISTEN:?set the console's private IP and port}"
+      RBH_CONSOLE_HTTP_HOST: "${RBH_CONSOLE_HTTP_HOST:?set the console's hostname or IP}"
+      RBH_CONSOLE_TRUSTED_CIDR: "${RBH_CONSOLE_TRUSTED_CIDR:?set the operator network CIDR}"
+      NGINX_ENVSUBST_FILTER: '^RBH_CONSOLE_(HTTP_LISTEN|HTTP_HOST|TRUSTED_CIDR)$$'
+    volumes:
+      - ./console.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - console_gateway_run:/run/rbh-gateway:ro
+
+volumes:
+  console_gateway_run:

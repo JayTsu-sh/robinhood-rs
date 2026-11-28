@@ -18,42 +18,33 @@ export function useResourceManagement() {
   };
 }
 
-type Management = Awaited<ReturnType<typeof listResourceManagement>>;
-type Action = 'add' | 'rename' | 'set_tier' | 'set_auto_mount' | 'mount' | 'unmount' | 'remove';
+type Action = 'add' | 'rename' | 'set_tier' | 'set_auto_mount' | 'mount' | 'unmount';
 const labels: Record<Action, string> = {
   add: '添加集群', rename: '编辑集群名称', set_tier: '编辑 Pool 层级', set_auto_mount: '设置自动恢复',
-  mount: '挂载', unmount: '卸载', remove: '移除接入',
+  mount: '挂载', unmount: '卸载',
 };
 
 type Values = {
   id: string;
   name: string;
-  mode: 'existing' | 'managed';
   path?: string;
   filesystem?: string;
   nids?: string;
   options?: string;
   autoMount?: boolean;
-  mountNow?: boolean;
   pool?: string;
   tier?: PoolTier | 'none';
 };
 
 interface Props {
-  management: Management;
   resource?: ResourceRegistration;
   pools?: string[];
   mounted?: boolean;
-  onRefresh: (removed?: boolean) => void;
-  canAdd?: boolean;
-  onRemoving?: (resource: ResourceRegistration | undefined) => void;
+  onRefresh: () => void;
 }
 
-export default function ResourceManagement({
-  management, resource, pools = [], mounted, onRefresh, canAdd = true, onRemoving,
-}: Props) {
+export default function ResourceManagement({ resource, pools = [], mounted, onRefresh }: Props) {
   const [form] = Form.useForm<Values>();
-  const mode = Form.useWatch('mode', form) ?? 'existing';
   const [action, setAction] = useState<Action>();
   const [operation, setOperation] = useState<'check' | 'save'>();
   const [retry, setRetry] = useState<'check' | 'save'>();
@@ -66,7 +57,7 @@ export default function ResourceManagement({
   function open(value: Action) {
     form.resetFields();
     form.setFieldsValue({
-      id: '', name: resource?.name ?? '', mode: 'existing', autoMount: resource?.autoMount ?? true, mountNow: true,
+      id: '', name: resource?.name ?? '', autoMount: resource?.autoMount ?? true,
     });
     setAction(value);
   }
@@ -89,10 +80,10 @@ export default function ResourceManagement({
     const path = action === 'add' ? (command === 'check' ? '/check' : '') : `/${encodeURIComponent(resource!.id)}`;
     const data = action === 'add' ? {
       id: values.id, name: values.name,
-      mount: values.mode === 'existing' ? { type: 'existing', path: values.path } : {
+      mount: {
         type: 'managed', filesystem: values.filesystem, mgsNids: values.nids?.trim(), path: values.path?.trim() || undefined,
         options: values.options?.split(',').map((value) => value.trim()).filter(Boolean), autoMount: values.autoMount,
-        mountNow: values.mountNow,
+        mountNow: true,
       },
     } : {
       action,
@@ -102,7 +93,6 @@ export default function ResourceManagement({
     };
     const request = new AbortController();
     pending.current = request;
-    if (action === 'remove') onRemoving?.(resource);
     setOperation(command);
     setNotice(undefined);
     setError(undefined);
@@ -112,10 +102,10 @@ export default function ResourceManagement({
       if (command === 'check') {
         setRetry(undefined);
         setToken('');
-        setNotice(values.mode === 'existing' ? '已确认本机 Lustre 挂载。' : 'MGS NID 可达。保存时将尝试挂载文件系统。');
+        setNotice('MGS NID 可达。添加时将尝试挂载文件系统。');
       } else {
         close();
-        onRefresh(action === 'remove');
+        onRefresh();
       }
     } catch (cause) {
       if (request.signal.aborted) return;
@@ -128,10 +118,7 @@ export default function ResourceManagement({
       }
     } finally {
       pending.current = undefined;
-      if (!request.signal.aborted) {
-        if (action === 'remove') onRemoving?.(undefined);
-        setOperation(undefined);
-      }
+      if (!request.signal.aborted) setOperation(undefined);
     }
   }
 
@@ -144,46 +131,33 @@ export default function ResourceManagement({
           <Button onClick={() => open('set_auto_mount')}>{labels.set_auto_mount}</Button>
           <Button onClick={() => open(mounted ? 'unmount' : 'mount')}>{mounted ? labels.unmount : labels.mount}</Button>
         </>}
-        {resource.owner !== 'deployment' && <Button danger onClick={() => open('remove')}>{labels.remove}</Button>}
-      </Space> : canAdd && <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={() => open('add')}>添加集群</Button>}
+      </Space> : <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={() => open('add')}>添加集群</Button>}
       <Modal title={action && labels[action]} open={action !== undefined} onCancel={close}
         closable={!operation} maskClosable={false} keyboard={!operation} destroyOnHidden
         footer={<Flex align="center" gap={8} justify="end">
           {action === 'add' && !retry && <Button disabled={!!operation} loading={operation === 'check'}
-            onClick={() => submit('check')}>{mode === 'existing' ? '检查挂载' : '测试连接'}</Button>}
+            onClick={() => submit('check')}>测试连接</Button>}
           <Button onClick={close} disabled={!!operation}>返回</Button>
-          <Button type="primary" danger={action === 'remove' || action === 'unmount'}
+          <Button type="primary" danger={action === 'unmount'}
             loading={!!operation} disabled={!!retry && !token.trim()}
             onClick={() => submit(retry ?? 'save')}>{retry ? '验证并继续' : action === 'add' ? '添加' : '确认'}</Button>
         </Flex>}>
         <Form form={form} layout="vertical" disabled={!!operation} onValuesChange={() => setNotice(undefined)} preserve={false}>
-          {action === 'add' && <>
-            <Form.Item name="mode" label="接入方式" rules={[{ required: true }]}>
-              <Select virtual={false} options={[
-                { value: 'existing', label: '接入已有挂载' },
-                { value: 'managed', label: '创建新挂载', disabled: !management.canCreateMount },
-              ]} onChange={() => { form.resetFields(['path']); }} />
-            </Form.Item>
+          {action === 'add' && (
             <Form.Item name="id" label="文件系统 ID" rules={[{ required: true, pattern: /^[A-Za-z0-9_.-]{1,64}$/ }]}>
               <Input />
             </Form.Item>
-          </>}
+          )}
           {(action === 'add' || action === 'rename') && <Form.Item name="name" label="集群名称" rules={[{ required: true, whitespace: true }]}>
             <Input maxLength={255} />
           </Form.Item>}
-          {action === 'add' && (mode === 'existing'
-            ? <Form.Item key="existing-path" name="path" label="本机 Lustre 挂载" rules={[{ required: true }]}>
-              <Select virtual={false} options={management.availableMounts.map(({ path, source }) => ({ value: path, label: `${path} · ${source}` }))}
-                notFoundContent="未发现未注册的 Lustre 挂载" />
-            </Form.Item>
-            : <>
-              <Form.Item name="filesystem" label="Lustre 文件系统名称" rules={[{ required: true, pattern: /^[A-Za-z0-9_-]{1,8}$/ }]}><Input /></Form.Item>
-              <Form.Item name="nids" label="MGS NID" rules={[{ required: true }]}><Input placeholder="10.0.0.10@tcp" /></Form.Item>
-              <Form.Item key="managed-path" name="path" label="挂载路径"><Input placeholder="留空时使用部署挂载目录下的文件系统 ID" /></Form.Item>
-              <Form.Item name="options" label="挂载参数"><Input placeholder="例如 flock,noatime" /></Form.Item>
-              <Form.Item name="mountNow" valuePropName="checked"><Checkbox>添加后立即挂载</Checkbox></Form.Item>
-              <Form.Item name="autoMount" valuePropName="checked"><Checkbox>daemon 重启后恢复挂载</Checkbox></Form.Item>
-            </>)}
+          {action === 'add' && <>
+            <Form.Item name="filesystem" label="Lustre 文件系统名称" rules={[{ required: true, pattern: /^[A-Za-z0-9_-]{1,8}$/ }]}><Input /></Form.Item>
+            <Form.Item name="nids" label="MGS NID" rules={[{ required: true }]}><Input placeholder="10.0.0.10@tcp" /></Form.Item>
+            <Form.Item name="path" label="挂载路径"><Input placeholder="留空时使用部署挂载目录下的文件系统 ID" /></Form.Item>
+            <Form.Item name="options" label="挂载参数"><Input placeholder="例如 flock,noatime" /></Form.Item>
+            <Form.Item name="autoMount" valuePropName="checked"><Checkbox>daemon 重启后恢复挂载</Checkbox></Form.Item>
+          </>}
           {action === 'set_tier' && <>
             <Form.Item name="pool" label="Pool" rules={[{ required: true }]}>
               <Select virtual={false} options={pools.map((pool) => ({ value: pool, label: pool }))}
@@ -196,8 +170,9 @@ export default function ResourceManagement({
           {action === 'set_auto_mount' && <Form.Item name="autoMount" valuePropName="checked">
             <Checkbox>daemon 重启后恢复挂载</Checkbox>
           </Form.Item>}
-          {action === 'unmount' && <Typography.Paragraph>卸载前需停用关联策略，并等待文件操作和扫描结束。</Typography.Paragraph>}
-          {action === 'remove' && <Typography.Paragraph>移除控制台接入，保留本机挂载和执行历史。</Typography.Paragraph>}
+          {action === 'unmount' && <Typography.Paragraph>
+            卸载前需停用关联策略，并等待文件操作和扫描结束。卸载后需手动重新挂载。
+          </Typography.Paragraph>}
           {retry && <label>写入令牌<Input.Password disabled={!!operation} value={token} autoComplete="off"
             onChange={(event) => setToken(event.target.value)} /></label>}
         </Form>

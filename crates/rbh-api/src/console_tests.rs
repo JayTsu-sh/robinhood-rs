@@ -132,6 +132,14 @@ async fn console_registration_is_authorized_and_restored_without_mounting() {
         .json(&json!({"action":"set_tier","pool":"cold","tier":"cold"}))
         .await
         .assert_status(StatusCode::NO_CONTENT);
+    let mount_path = root.join(id.as_str());
+    std::fs::create_dir(&mount_path).unwrap();
+    std::fs::write(mount_path.join("occupied"), "mount fixture").unwrap();
+    server
+        .post(&resource)
+        .json(&json!({"action":"mount"}))
+        .await
+        .assert_status_bad_request();
     let next = resources();
     let restarted = admin(next.clone());
     restarted.restore().await.unwrap();
@@ -141,12 +149,48 @@ async fn console_registration_is_authorized_and_restored_without_mounting() {
     let view = server.get(endpoint).await.json::<Value>();
     assert_eq!(view["resources"][0]["name"], "已改名");
     assert_eq!(view["resources"][0]["tiers"]["cold"], "cold");
+    assert_eq!(view["resources"][0]["mounted"], false);
+    assert_eq!(view["resources"][0]["desiredMounted"], true);
+    assert_eq!(view["resources"][0]["lastMountError"], "挂载目录必须为空");
     server
         .post(&resource)
         .json(&json!({"action":"remove"}))
         .await
+        .assert_status_bad_request();
+    server
+        .post(&resource)
+        .json(&json!({"action":"unmount"}))
+        .await
         .assert_status(StatusCode::NO_CONTENT);
-    assert!(!next.contains(&id));
+    let view = server.get(endpoint).await.json::<Value>();
+    assert_eq!(view["resources"][0]["id"], id.as_str());
+    assert_eq!(view["resources"][0]["desiredMounted"], false);
+    assert_eq!(view["resources"][0]["unmountPending"], false);
+    assert!(view["resources"][0].get("lastMountError").is_none());
+    assert!(next.contains(&id));
+    assert_eq!(
+        entries.get_filesystem(&id).await.unwrap().unwrap().mount_path,
+        mount_path
+    );
+
+    sqlx::query(
+        "UPDATE console_lustre_resources SET metadata = JSON_SET(metadata, '$.unmountPending', JSON_EXTRACT('true', '$'))
+         WHERE observer_id = ? AND filesystem_id = ?",
+    )
+    .bind(observer.as_bytes())
+    .bind(id.as_str())
+    .execute(entries.pool())
+    .await
+    .unwrap();
+    let restarted = admin(resources());
+    restarted.restore().await.unwrap();
+    let server = TestServer::builder()
+        .build(restarted.routes(PolicyWriters::default()))
+        .unwrap();
+    let view = server.get(endpoint).await.json::<Value>();
+    assert_eq!(view["resources"][0]["unmountPending"], false);
+    assert_eq!(view["resources"][0]["desiredMounted"], false);
+    assert_eq!(view["resources"][0]["mounted"], false);
 }
 
 #[tokio::test]

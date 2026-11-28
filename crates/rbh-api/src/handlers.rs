@@ -981,7 +981,14 @@ pub(crate) async fn start_scan(
         finished_at: None,
         error_message: None,
     };
-    state.scans.lock().await.insert(id.clone(), rec);
+    let mut scans = state.scans.lock().await;
+    if let Some(source) = state.policy_store.console_mount_source(&config.id)
+        && !crate::resource_management::registered_mount_present(&config.mount_path, &source)?
+    {
+        return Err(ApiError::BadRequest("registered Lustre mount is unavailable".into()));
+    }
+    scans.insert(id.clone(), rec);
+    drop(scans);
 
     // Detach a worker that drains the scan into the entry store.
     let scans = state.scans.clone();

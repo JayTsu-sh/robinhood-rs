@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 
-type RefreshTarget = 'snapshot' | 'management' | 'both';
+type RefreshTarget = 'management' | 'both';
 
 export function useResourceEvents(refreshSnapshot: () => void, refreshManagement: () => void, filesystem?: string) {
   useEffect(() => {
@@ -8,18 +8,15 @@ export function useResourceEvents(refreshSnapshot: () => void, refreshManagement
     let batchTimer: number | undefined;
     let reconnectTimer: number | undefined;
     let snapshotPending = false;
-    let managementPending = false;
 
     function schedule(target: RefreshTarget) {
       snapshotPending ||= target !== 'management';
-      managementPending ||= target !== 'snapshot';
       if (batchTimer !== undefined) return;
       batchTimer = window.setTimeout(() => {
         batchTimer = undefined;
         if (snapshotPending) refreshSnapshot();
-        if (managementPending) refreshManagement();
+        refreshManagement();
         snapshotPending = false;
-        managementPending = false;
       }, 150);
     }
 
@@ -29,7 +26,7 @@ export function useResourceEvents(refreshSnapshot: () => void, refreshManagement
       connection.addEventListener('open', () => schedule('both'));
       connection.addEventListener('resync', () => schedule('both'));
       connection.addEventListener('snapshot', ({ data }: MessageEvent<string>) => {
-        if (filesystem === undefined || filesystem === data) schedule('snapshot');
+        if (filesystem === undefined || filesystem === data) schedule('both');
       });
       connection.addEventListener('management', ({ data }: MessageEvent<string>) => {
         if (data === '*') schedule('management');

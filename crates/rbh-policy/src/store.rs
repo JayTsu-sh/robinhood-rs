@@ -152,7 +152,8 @@ impl PolicyStore {
             .insert(filesystem.clone(), source);
     }
 
-    fn console_mount_source(&self, filesystem: &FileSystemId) -> Option<String> {
+    /// Expected mount source for a registration managed by the console.
+    pub fn console_mount_source(&self, filesystem: &FileSystemId) -> Option<String> {
         self.console_mount_sources
             .read()
             .expect("console mount sources lock")

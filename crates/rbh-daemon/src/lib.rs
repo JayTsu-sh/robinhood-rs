@@ -14,7 +14,11 @@ mod resource_collection;
 mod runtime;
 mod signals;
 
-use std::sync::Arc;
+use std::{
+    os::unix::fs::{FileTypeExt, PermissionsExt},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use scheduler_rs::prelude::*;
@@ -32,7 +36,38 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing::info!("robinhood-rs daemon starting");
 
-    let writers = if let Some(path) = std::env::var_os("RBH_POLICY_WRITERS_FILE") {
+    let listen_addr = std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let writers_file = std::env::var_os("RBH_POLICY_WRITERS_FILE").filter(|path| !path.is_empty());
+    let trusted_gateway = match std::env::var("RBH_TRUSTED_GATEWAY_WRITES") {
+        Ok(value) => value
+            .parse::<bool>()
+            .context("RBH_TRUSTED_GATEWAY_WRITES must be true or false")?,
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => return Err(error).context("read RBH_TRUSTED_GATEWAY_WRITES"),
+    };
+    let gateway_socket = if trusted_gateway {
+        let path = std::env::var_os("RBH_TRUSTED_GATEWAY_SOCKET")
+            .map(PathBuf::from)
+            .context("trusted gateway writes require RBH_TRUSTED_GATEWAY_SOCKET")?;
+        anyhow::ensure!(path.is_absolute(), "the trusted gateway socket path must be absolute");
+        Some(path)
+    } else {
+        None
+    };
+    let writers = if trusted_gateway {
+        let addr: std::net::SocketAddr = listen_addr
+            .parse()
+            .context("trusted gateway writes require a loopback socket address")?;
+        anyhow::ensure!(
+            addr.ip().is_loopback(),
+            "trusted gateway writes require a loopback listener"
+        );
+        anyhow::ensure!(
+            writers_file.is_none(),
+            "trusted gateway writes and a writer file are mutually exclusive"
+        );
+        rbh_api::PolicyWriters::default()
+    } else if let Some(path) = writers_file {
         let json = tokio::fs::read_to_string(path)
             .await
             .context("read RBH_POLICY_WRITERS_FILE")?;
@@ -462,14 +497,44 @@ pub async fn run() -> anyhow::Result<()> {
         std::env::var_os("RBH_LUSTRE_MANAGED_ROOT").map(std::path::PathBuf::from),
     )?;
     administration.restore().await?;
-    let app = rbh_api::router_with_console(state, writers.clone(), console_resources.clone(), console_dir)
-        .merge(administration.routes(writers));
+    let app = rbh_api::router_with_console(
+        state.clone(),
+        writers.clone(),
+        console_resources.clone(),
+        console_dir.clone(),
+    )
+    .merge(administration.clone().routes(writers));
+    let app = if trusted_gateway {
+        app.layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                use axum::{
+                    http::{Method, StatusCode},
+                    response::IntoResponse,
+                };
+                if matches!(*request.method(), Method::GET | Method::HEAD) {
+                    next.run(request).await
+                } else {
+                    StatusCode::METHOD_NOT_ALLOWED.into_response()
+                }
+            },
+        ))
+    } else {
+        app
+    };
 
     // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
-    let listen_addr = std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
+    let gateway = if let Some(path) = gateway_socket {
+        let writers = rbh_api::PolicyWriters::trusted_gateway();
+        let root = rbh_api::router_with_console(state, writers.clone(), console_resources.clone(), console_dir)
+            .merge(administration.routes(writers))
+            .layer(axum::Extension(rbh_api::ConsoleGateway));
+        Some((bind_gateway_socket(&path).await?, root))
+    } else {
+        None
+    };
     resource_collection::register(
         &scheduler,
         console_resources.clone(),
@@ -481,9 +546,21 @@ pub async fn run() -> anyhow::Result<()> {
 
     let shutdown_cancel = daemon_cancel.clone();
     let server_task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { shutdown_cancel.cancelled().await })
-            .await
+        let gateway_cancel = shutdown_cancel.clone();
+        let tcp = async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { shutdown_cancel.cancelled().await })
+                .await
+        };
+        let gateway = async move {
+            if let Some((listener, app)) = gateway {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { gateway_cancel.cancelled().await })
+                    .await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        tokio::try_join!(tcp, gateway).map(|_| ())
     });
 
     // sd_notify(READY=1) — no-op outside systemd, used by `Type=notify`
@@ -535,6 +612,36 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing::info!("robinhood-rs daemon stopped");
     outcome
+}
+
+async fn bind_gateway_socket(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
+    let directory = path
+        .parent()
+        .context("trusted gateway socket needs a parent directory")?;
+    let metadata = std::fs::metadata(directory).context("inspect trusted gateway socket directory")?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.permissions().mode() & 0o022 == 0,
+        "the trusted gateway socket directory must forbid group and other writes"
+    );
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => match tokio::net::UnixStream::connect(path).await {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(path).context("remove stale gateway socket")?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => anyhow::bail!("gateway socket already in use at {}", path.display()),
+        },
+        Ok(_) => anyhow::bail!("gateway socket path already exists at {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect gateway socket"),
+    }
+    let listener =
+        tokio::net::UnixListener::bind(path).with_context(|| format!("bind gateway socket {}", path.display()))?;
+    // The socket's directory is shared exclusively with the gateway container.
+    // Allow the gateway's worker to connect across container UIDs.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).context("set gateway socket permissions")?;
+    tracing::info!(socket = %path.display(), "console gateway socket listening");
+    Ok(listener)
 }
 
 /// External legacy configuration compatibility for a sole Lustre runtime.
