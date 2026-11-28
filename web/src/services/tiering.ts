@@ -1,31 +1,14 @@
 import { request } from '@umijs/max';
 
-interface PolicyAction {
-  type?: string;
-  params?: { sourcePool?: string; targetPool?: string };
-}
-
-interface Rev8Policy {
-  id: number;
-  revision: number;
-  definition: {
-    metadata: { name: string };
-    spec: {
-      enabled?: boolean;
-      target: { filesystem: string };
-      rules: {
-        defaults?: { action?: PolicyAction };
-        entries: { decision: 'execute' | 'require_approval' | 'skip'; action?: PolicyAction }[];
-      };
-    };
-  };
-}
+import { policyPoolPair, readEditablePolicy } from '@/domain/tieringPolicy';
+import type { PolicyRevision } from './policies';
 
 export interface TieringPolicy {
   id: number;
   revision: number;
   name: string;
   enabled: boolean;
+  editable: boolean;
   filesystem: string;
   sourcePool: string;
   targetPool: string;
@@ -66,35 +49,19 @@ export interface FilesystemResource {
   reason: string | null;
 }
 
-const poolMigration = 'lustre.pool_migrate';
-
-function toTieringPolicy({ id, revision, definition }: Rev8Policy): TieringPolicy[] {
-  const { metadata, spec } = definition;
-  const defaults = spec.rules.defaults?.action;
-  const rule = spec.rules.entries.find(
-    ({ decision, action }) =>
-      decision !== 'skip' && (action?.type ?? defaults?.type) === poolMigration,
-  );
-  if (!rule) return [];
-
-  // Rev.8 requires all migration rules to resolve to the same pool pair.
-  const defaultParams = defaults?.type === poolMigration ? defaults.params : undefined;
-  const { sourcePool, targetPool } = { ...defaultParams, ...rule.action?.params };
-  if (!sourcePool || !targetPool) throw new Error(`策略 ${id} 缺少池对参数`);
-
+function toTieringPolicy({ id, revision, definition }: PolicyRevision): TieringPolicy[] {
+  const pair = policyPoolPair(definition);
+  if (!pair) return [];
   return [{
-    id,
-    revision,
-    name: metadata.name,
-    enabled: spec.enabled ?? true,
-    filesystem: spec.target.filesystem,
-    sourcePool,
-    targetPool,
+    id, revision, ...pair, name: definition.metadata.name,
+    enabled: definition.spec.enabled ?? true,
+    editable: readEditablePolicy(definition) !== null,
+    filesystem: definition.spec.target.filesystem,
   }];
 }
 
 export async function listTieringPolicies(signal: AbortSignal) {
-  const rows = await request<Rev8Policy[]>('/api/policies', {
+  const rows = await request<PolicyRevision[]>('/api/policies', {
     params: { configuredOnly: true },
     signal,
     timeout: 15000,

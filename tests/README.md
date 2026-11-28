@@ -107,6 +107,28 @@ RBH_TEST_DATABASE_URL=mysql://root@127.0.0.1/rbh_preview_test \
   cargo test --locked -p rbh-daemon lustre_link_events_keep_all_surviving_paths_on_replay -- --ignored
 ```
 
+### Console policy wizard
+
+The MariaDB revision test issues two edits with the same `If-Match: "1"`.
+One returns the saved revision and the other gets HTTP 409 with
+`currentRevision`. The immutable definition is available at
+`GET /api/policies/{id}/revisions/{revision}/definition`.
+
+```sh
+RBH_TEST_DATABASE_URL=mysql://root@127.0.0.1/rbh_wizard_test \
+  cargo test --locked -p rbh-api conditional_policy_edit_creates_one_revision_and_preserves_the_original -- --ignored
+```
+
+The Playwright wizard test can also run against the compiled console and a
+live, isolated daemon with a disposable database. Register a Lustre fixture
+root with writable `hot` and `cold` pools. Index three files on `hot` under
+`/team` with logical sizes of 100, 200, and 300 bytes and mtimes at least one
+second in the past. Link the 300-byte file outside `/team`. Configure an
+existing Rev.8 writer with `RBH_REV8_WRITERS_FILE` and provide its fixture
+token and registration ID to Playwright as `RBH_CONSOLE_WIZARD_TEST_TOKEN`
+and `RBH_CONSOLE_WIZARD_TEST_FS`. Set `RBH_CONSOLE_TEST_URL` to the test
+daemon and run `npm --prefix web run test:e2e`.
+
 ### What's covered where
 
 | Layer | File |

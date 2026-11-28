@@ -1,7 +1,7 @@
 //! HTTP request handlers for the robinhood-rs REST API.
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::IF_MATCH};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow};
 use rbh_entry_store::store::{AggregateKey, AggregateSort, QueryParam};
-use rbh_policy::{PolicyError, rev8, store::Rev8PolicyRow};
+use rbh_policy::{
+    PolicyError, rev8,
+    store::{Rev8PolicyRow, Rev8PolicyWrite, SavedRev8Policy},
+};
 use rbh_predicate::{Predicate, SortKey, SqlParam, to_sql};
 
 use crate::{
@@ -45,6 +48,10 @@ pub fn api_routes() -> Router<AppState> {
         .route("/policies/preview", post(preview_policy_document))
         .route("/policies/{id}/preview", post(preview_policy))
         .route("/policies/{id}/revisions/{revision}", get(get_policy_revision))
+        .route(
+            "/policies/{id}/revisions/{revision}/definition",
+            get(get_policy_definition),
+        )
         .route("/entries/count", get(entry_count))
         .route("/entries/query", post(query_entries))
         .route("/entries/{object_id}", get(get_entry))
@@ -106,17 +113,14 @@ async fn metrics_endpoint(State(state): State<AppState>) -> axum::response::Resp
 async fn create_policy(
     State(state): State<AppState>, Extension(writers): Extension<crate::Rev8Writers>, headers: HeaderMap,
     Json(document): Json<serde_json::Value>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+) -> Result<(StatusCode, Json<SavedRev8Policy>), ApiError> {
     rev8::validate_policy_version(&document)?;
     let actor = writers.authorize(&headers)?;
-    let id = state
+    let saved = state
         .policy_store
-        .save_rev8(&state.entry_store, None, &document, actor)
+        .save_rev8(&state.entry_store, Rev8PolicyWrite::Create, &document, actor)
         .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "id": id, "revision": 1 })),
-    ))
+    Ok((StatusCode::CREATED, Json(saved)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,14 +157,44 @@ async fn get_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Resul
 async fn update_policy(
     State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
     headers: HeaderMap, Json(document): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     rev8::validate_policy_version(&document)?;
     let actor = writers.authorize(&headers)?;
-    state
+    let expected_revision = expected_policy_revision(&headers)?;
+    let saved = state
         .policy_store
-        .save_rev8(&state.entry_store, Some(id), &document, actor)
+        .save_rev8(
+            &state.entry_store,
+            Rev8PolicyWrite::Update { id, expected_revision },
+            &document,
+            actor,
+        )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(if expected_revision.is_some() {
+        Json(saved).into_response()
+    } else {
+        StatusCode::NO_CONTENT.into_response()
+    })
+}
+
+fn expected_policy_revision(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
+    let mut values = headers.get_all(IF_MATCH).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    let revision = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.strip_prefix('"')?.strip_suffix('"'))
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    match (revision, values.next()) {
+        (Some(revision), None) => Ok(Some(revision)),
+        _ => Err(ApiError::BadRequest(
+            "If-Match must contain one quoted policy revision".into(),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +232,15 @@ async fn get_policy_revision(
     State(state): State<AppState>, Path((id, revision)): Path<(u64, u64)>,
 ) -> Result<Json<Rev8PolicyRow>, ApiError> {
     Ok(Json(state.policy_store.get_rev8_revision(id, revision).await?))
+}
+
+#[tracing::instrument(skip(state))]
+async fn get_policy_definition(
+    State(state): State<AppState>, Path((id, revision)): Path<(u64, u64)>,
+) -> Result<Response, ApiError> {
+    let row = state.policy_store.get_rev8_revision(id, revision).await?;
+    let body = serde_json::to_string_pretty(&row.definition.0).map_err(PolicyError::from)?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1159,7 +1202,21 @@ impl IntoResponse for ApiError {
             }
             ApiError::Policy(PolicyError::InvalidTrigger(msg)) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Policy(PolicyError::InvalidPolicy(msg)) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::Policy(PolicyError::InvalidPolicyField { field, message }) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": message, "field": field })),
+                )
+                    .into_response();
+            }
             ApiError::Policy(error @ PolicyError::NameConflict(_)) => (StatusCode::CONFLICT, error.to_string()),
+            ApiError::Policy(error @ PolicyError::RevisionConflict { current, .. }) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": error.to_string(), "currentRevision": current })),
+                )
+                    .into_response();
+            }
             ApiError::Policy(error @ PolicyError::ResourceInUse(_)) => (StatusCode::CONFLICT, error.to_string()),
             ApiError::Policy(error @ PolicyError::ResourceNotFound(_)) => (StatusCode::NOT_FOUND, error.to_string()),
             ApiError::Unauthorized => {
@@ -1261,6 +1318,77 @@ pub(crate) mod scoped_api_tests {
                 "governance": {"authorizationRef": "builtin-preview", "approvalPolicyRef": "builtin-preview"}
             }
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated MariaDB"]
+    async fn conditional_policy_edit_creates_one_revision_and_preserves_the_original() {
+        use serde_json::{Value, json};
+
+        let entries = rbh_entry_store::EntryStore::connect(&std::env::var("RBH_TEST_DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        let filesystem = FileSystemId::new(format!("revisions-{}", uuid::Uuid::new_v4().simple())).unwrap();
+        entries
+            .register_filesystem(&rbh_entry_store::FileSystemConfig {
+                id: filesystem.clone(),
+                backend: rbh_entry_store::BackendKind::Lustre,
+                mount_path: "/unused".into(),
+                capabilities: rbh_entry_store::BackendCapabilities {
+                    hsm: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let mut state = state_without_database_connection();
+        state.policy_store = rbh_policy::PolicyStore::new(entries.pool().clone());
+        state.entry_store = entries;
+        let server = rev8_test_server(state);
+        let mut document = rev8_archive_policy(filesystem.as_str(), filesystem.as_str());
+        document["spec"]["enabled"] = false.into();
+        document["spec"]["execution"]["budget"]["run"]["maxObjectLogicalBytes"] = json!(9_007_199_254_740_993_u64);
+        let response = server.post("/api/policies").json(&document).await;
+        response.assert_status(StatusCode::CREATED);
+        let id = response.json::<Value>()["id"].as_u64().unwrap();
+        let path = format!("/api/policies/{id}");
+        let mut left = document.clone();
+        left["metadata"]["description"] = "left edit".into();
+        let mut right = document.clone();
+        right["metadata"]["description"] = "right edit".into();
+
+        let invalid = server.put(&path).add_header(IF_MATCH, "*").json(&left).await;
+        invalid.assert_status_bad_request();
+        let (left_response, right_response) = tokio::join!(
+            server.put(&path).add_header(IF_MATCH, "\"1\"").json(&left),
+            server.put(&path).add_header(IF_MATCH, "\"1\"").json(&right),
+        );
+        let (winner, loser, saved) = if left_response.status_code() == StatusCode::OK {
+            (left_response, right_response, &left)
+        } else {
+            (right_response, left_response, &right)
+        };
+        winner.assert_status_ok();
+        assert_eq!(winner.json::<Value>(), json!({ "id": id, "revision": 2 }));
+        loser.assert_status(StatusCode::CONFLICT);
+        assert_eq!(loser.json::<Value>()["currentRevision"], 2);
+        let mut stale = document.clone();
+        stale["spec"]["target"]["filesystem"] = "unavailable-filesystem".into();
+        let response = server.put(&path).add_header(IF_MATCH, "\"1\"").json(&stale).await;
+        response.assert_status(StatusCode::CONFLICT);
+        assert_eq!(response.json::<Value>()["currentRevision"], 2);
+        let current = server.get(&path).await;
+        assert_eq!(current.json::<Value>()["definition"], *saved);
+        let old = server.get(&format!("{path}/revisions/1/definition")).await;
+        old.assert_status_ok();
+        assert_eq!(old.json::<Value>(), document);
+
+        server
+            .put(&path)
+            .json(&document)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(server.get(&path).await.json::<Value>()["revision"], 3);
     }
 
     #[tokio::test]

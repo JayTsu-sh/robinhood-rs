@@ -142,6 +142,33 @@ async fn scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_r
     assert!(preview["resourceBindings"].as_array().unwrap().iter().any(|binding| {
         binding["name"] == "lustre.pool_migrate" && binding["revision"].as_u64().is_some_and(|revision| revision > 0)
     }));
+    let mut ordered = document.clone();
+    let rules = &mut ordered["spec"]["rules"];
+    let action = rules["entries"][0]["action"].clone();
+    rules["defaults"] = json!({"action": action});
+    rules["entries"] = json!([
+        {"name": "keep", "priority": 2, "match": true, "decision": "skip"},
+        {"name": "migrate", "priority": 1, "match": {"field": "object.size", "op": "gte", "value": 64}, "decision": "execute"}
+    ]);
+    let response = server.post("/api/policies/preview").json(&ordered).await;
+    response.assert_status_ok();
+    assert_eq!(response.json::<serde_json::Value>()["candidateCount"], 0);
+    ordered["spec"]["rules"]["entries"][1]["priority"] = 3.into();
+    let response = server.post("/api/policies/preview").json(&ordered).await;
+    response.assert_status_ok();
+    assert_eq!(response.json::<serde_json::Value>()["candidateCount"], 1);
+    ordered["spec"]["rules"]["entries"].as_array_mut().unwrap().pop();
+    let response = server.post("/api/policies/preview").json(&ordered).await;
+    response.assert_status_ok();
+    let dormant = response.json::<serde_json::Value>();
+    assert_eq!(dormant["candidateCount"], 0);
+    assert!(
+        dormant["resourceBindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|binding| { binding["name"] == "lustre.pool_migrate" })
+    );
     let mut heat_preview = document.clone();
     heat_preview["spec"]["target"]["where"] = json!({"field": "lustre.heat.readsample", "op": "gte", "value": 3});
     let response = server.post("/api/policies/preview").json(&heat_preview).await;

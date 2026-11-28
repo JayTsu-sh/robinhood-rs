@@ -38,6 +38,7 @@ pub struct CompiledPolicy {
     pub(crate) uses_read_heat: bool,
     pub(crate) uses_last_access: bool,
     directory_scope: Option<DirectoryScope>,
+    pool_migration: Option<PoolMigration>,
     pub(crate) where_clause: String,
     pub(crate) params: Vec<QueryParam>,
     pub(crate) actions: Vec<Invocation>,
@@ -166,6 +167,11 @@ impl Policy {
             cmp: CmpOp::Eq,
             value: Value::Num(EntryKind::File as i64),
         };
+        let retained_pool = if directory_scope.is_some() && spec.enabled == Some(false) {
+            spec.rules.retained_pool_migration()?
+        } else {
+            None
+        };
         let CompiledRules {
             excludes,
             decision,
@@ -186,7 +192,11 @@ impl Policy {
             .activation
             .is_some_and(|activation| activation.mode == ActivationMode::Enforced);
         let mut params = query_params(scope.params);
-        if let Some(migration) = actions.iter().find_map(|invocation| invocation.migration.as_ref()) {
+        let pool_migration = actions
+            .iter()
+            .find_map(|invocation| invocation.migration.clone())
+            .or(retained_pool);
+        if let Some(migration) = &pool_migration {
             if !matches!(spec.trigger, Trigger::Periodic { .. }) {
                 return Err(invalid("lustre.pool_migrate requires a periodic trigger"));
             }
@@ -228,6 +238,7 @@ impl Policy {
             decision_params: query_params(decision_params),
             uses_read_heat,
             directory_scope,
+            pool_migration,
             uses_last_access: conditions.uses_last_access,
             enabled: spec.enabled.unwrap_or(true),
             enforced,
@@ -283,7 +294,7 @@ pub(crate) async fn validate_filesystem(
 
 impl CompiledPolicy {
     pub(crate) fn pool_migration(&self) -> Option<&PoolMigration> {
-        self.actions.iter().find_map(|invocation| invocation.migration.as_ref())
+        self.pool_migration.as_ref()
     }
 
     pub(crate) fn has_directory_scope(&self) -> bool {
@@ -566,6 +577,23 @@ struct CompiledRules {
 }
 
 impl Rules {
+    // A disabled scoped strategy can retain every file while still defining its pool pair.
+    fn retained_pool_migration(&self) -> Result<Option<PoolMigration>, PolicyError> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| !matches!(entry.decision, Decision::Skip))
+        {
+            return Ok(None);
+        }
+        self.defaults
+            .as_ref()
+            .and_then(|defaults| defaults.action.as_ref())
+            .filter(|action| action.kind == Some(ActionKind::PoolMigrate))
+            .map(|action| PoolMigration::parse(action.params.clone().unwrap_or_default(), "spec.rules.defaults"))
+            .transpose()
+    }
+
     fn compile(self, conditions: &mut ConditionCompiler<'_>) -> Result<CompiledRules, PolicyError> {
         if self.entries.is_empty() {
             return Err(invalid("spec.rules.entries must contain at least one rule"));

@@ -48,6 +48,31 @@ pub struct Rev8PolicyRow {
     pub modified_by: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Rev8PolicyWrite {
+    Create,
+    Update { id: u64, expected_revision: Option<u64> },
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SavedRev8Policy {
+    pub id: u64,
+    pub revision: u64,
+}
+
+const POLICY_HEAD_REVISION: &str =
+    "SELECT revision FROM policies WHERE id = ? AND name IS NOT NULL AND revision IS NOT NULL";
+
+fn check_policy_revision(id: u64, expected: Option<u64>, current: Option<u64>) -> Result<u64, PolicyError> {
+    let current = current.ok_or(PolicyError::NotFound(id))?;
+    if let Some(expected) = expected
+        && expected != current
+    {
+        return Err(PolicyError::RevisionConflict { id, expected, current });
+    }
+    Ok(current)
+}
+
 impl PolicyStore {
     pub fn new(pool: MySqlPool) -> Self {
         Self {
@@ -110,9 +135,21 @@ impl PolicyStore {
 
     #[tracing::instrument(skip(self, entries, document))]
     pub async fn save_rev8(
-        &self, entries: &EntryStore, id: Option<u64>, document: &serde_json::Value, actor: &str,
-    ) -> Result<u64, PolicyError> {
+        &self, entries: &EntryStore, write: Rev8PolicyWrite, document: &serde_json::Value, actor: &str,
+    ) -> Result<SavedRev8Policy, PolicyError> {
         let input = rev8::parse(document)?;
+        // Report stale edits before probing resources; check again under the write lock.
+        if let Rev8PolicyWrite::Update {
+            id,
+            expected_revision: Some(expected),
+        } = write
+        {
+            let current = sqlx::query_scalar(POLICY_HEAD_REVISION)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+            check_policy_revision(id, Some(expected), current)?;
+        }
         if input.enables_directory_scope() {
             return Err(rev8::invalid(
                 "spec.enabled must be false for spec.target.directoryScope until live link checks are available",
@@ -140,6 +177,18 @@ impl PolicyStore {
         };
         let next_run = input.schedule_after(Utc::now())?;
         let mut tx = self.lock_configuration().await?;
+        let update = match write {
+            Rev8PolicyWrite::Create => None,
+            Rev8PolicyWrite::Update { id, expected_revision } => {
+                // Revision writers already hold the configuration lock. Leave the
+                // policy row available to workers until the update is ready.
+                let current = sqlx::query_scalar(POLICY_HEAD_REVISION)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                Some((id, check_policy_revision(id, expected_revision, current)?))
+            }
+        };
         let (policy, bindings) = Self::bind_policy(&mut tx, input).await?;
         policy.validate_capabilities(&config)?;
         if let Some(migration) = policy.pool_migration() {
@@ -161,10 +210,10 @@ impl PolicyStore {
         let next_run = next_run.filter(|_| policy.enabled);
         let heat_filesystem =
             (policy.uses_read_heat && policy.pool_migration().is_some()).then_some(policy.filesystem.as_str());
-        let id = if let Some(id) = id {
-            let result = sqlx::query(
+        let (id, revision) = if let Some((id, current)) = update {
+            sqlx::query(
                 "UPDATE policies SET name = ?, definition = ?, revision = revision + 1, enabled = ?, rev8_next_run = ?, rev8_heat_filesystem = ?
-                 WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL",
+                 WHERE id = ?",
             )
             .bind(&policy.name)
             .bind(Json(document))
@@ -175,12 +224,9 @@ impl PolicyStore {
             .execute(&mut *tx)
             .await
             .map_err(|error| policy_write_error(error, &policy.name))?;
-            if result.rows_affected() == 0 {
-                return Err(PolicyError::NotFound(id));
-            }
-            id
+            (id, current + 1)
         } else {
-            sqlx::query(
+            let id = sqlx::query(
                 "INSERT INTO policies (name, kind, definition, enabled, revision, rev8_next_run, rev8_heat_filesystem) VALUES (?, 'Policy', ?, ?, 1, ?, ?)",
             )
             .bind(&policy.name)
@@ -191,11 +237,12 @@ impl PolicyStore {
             .execute(&mut *tx)
             .await
             .map_err(|error| policy_write_error(error, &policy.name))?
-            .last_insert_id()
+            .last_insert_id();
+            (id, 1)
         };
         record_rev8_revision(&mut tx, id, bindings, actor).await?;
         tx.commit().await?;
-        Ok(id)
+        Ok(SavedRev8Policy { id, revision })
     }
 
     #[tracing::instrument(skip(self))]

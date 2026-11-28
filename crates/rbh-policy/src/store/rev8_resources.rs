@@ -211,6 +211,7 @@ impl PolicyStore {
             .actions
             .iter()
             .map(|invocation| invocation.kind)
+            .chain(compiled.pool_migration().map(|_| ActionKind::PoolMigrate))
             .collect::<std::collections::BTreeSet<_>>();
         let safety = applicable_safety(&resources, compiled.filesystem.as_str(), actions.iter().copied());
         check_approval_floor(

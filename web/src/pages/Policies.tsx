@@ -1,14 +1,20 @@
 import { SearchOutlined } from '@ant-design/icons';
 import { ProTable, type ProColumns } from '@ant-design/pro-components';
 import { Link, useSearchParams } from '@umijs/max';
-import { Button, Empty, Input, Select, Tag } from 'antd';
+import { Button, Empty, Flex, Input, Select, Tag } from 'antd';
 import { useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
+import { policyDetailsPath, policyEditPath } from '@/services/policies';
 import { filesystemDetailsPath, listTieringPolicies, type TieringPolicy } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
 
 const columns: ProColumns<TieringPolicy>[] = [
-  { title: '策略名称', dataIndex: 'name', width: 220 },
+  {
+    title: '策略名称',
+    dataIndex: 'name',
+    width: 220,
+    render: (_, row) => <Link to={policyDetailsPath(row.id)}>{row.name}</Link>,
+  },
   { title: '策略 ID', dataIndex: 'id', width: 105 },
   { title: '当前修订', dataIndex: 'revision', width: 110 },
   {
@@ -26,6 +32,11 @@ const columns: ProColumns<TieringPolicy>[] = [
     title: '启用状态',
     width: 120,
     render: (_, row) => <Tag color={row.enabled ? 'success' : 'default'}>{row.enabled ? '已启用' : '已停用'}</Tag>,
+  },
+  {
+    title: '操作',
+    width: 85,
+    render: (_, row) => row.editable ? <Link to={policyEditPath(row.id)}>编辑</Link> : '—',
   },
 ];
 
@@ -50,7 +61,10 @@ export default function Policies() {
       status={state.status}
       error={state.status === 'error' ? state.message : undefined}
       refresh={refresh}
-      action={<Link to="/policies/preview">预览迁移</Link>}
+      action={<Flex gap={12} align="center">
+        <Link to="/policies/preview">预览迁移</Link>
+        <Link to="/policies/new" className="ant-btn ant-btn-primary">新建策略</Link>
+      </Flex>}
     >
       <div className="console-table">
         <div className="console-controls">

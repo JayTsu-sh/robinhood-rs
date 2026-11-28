@@ -118,9 +118,15 @@ impl PoolMigration {
             ] {
                 let members = mount
                     .pool_members(pool)
-                    .map_err(|error| invalid(format!("lustre.pool_migrate {field} {pool}: {error}")))?;
+                    .map_err(|error| PolicyError::InvalidPolicyField {
+                        field,
+                        message: format!("lustre.pool_migrate {field} {pool}: {error}"),
+                    })?;
                 if members.is_empty() {
-                    return Err(invalid(format!("lustre.pool_migrate {field} {pool} has no OSTs")));
+                    return Err(PolicyError::InvalidPolicyField {
+                        field,
+                        message: format!("lustre.pool_migrate {field} {pool} has no OSTs"),
+                    });
                 }
                 if field == "targetPool"
                     && migration

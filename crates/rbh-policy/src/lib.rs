@@ -28,12 +28,16 @@ pub enum PolicyError {
     NotFound(u64),
     #[error("policy name already exists: {0}")]
     NameConflict(String),
+    #[error("policy {id} has advanced from revision {expected} to {current}")]
+    RevisionConflict { id: u64, expected: u64, current: u64 },
     #[error("resource not found: {0}")]
     ResourceNotFound(String),
     #[error("{0}")]
     ResourceInUse(String),
     #[error("{0}")]
     InvalidPolicy(String),
+    #[error("{message}")]
+    InvalidPolicyField { field: &'static str, message: String },
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
     #[error("Rev.8 worker lock row is missing")]
