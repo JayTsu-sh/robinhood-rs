@@ -88,6 +88,8 @@ test('shows a restored mount before collection and keeps the cluster after unmou
   }
   await expect(row).toContainText('已挂载');
   await expect(row).toContainText('等待采集');
+  const metrics = page.locator('.lustre-metrics').locator('dd');
+  await expect(metrics).toHaveText(['1', '0', '1', '0']);
   await row.getByRole('link', { name }).click();
   await expect(page.getByRole('heading', { name })).toBeVisible();
   await expect(page.getByRole('button', { name: '移除接入' })).toHaveCount(0);
@@ -99,6 +101,7 @@ test('shows a restored mount before collection and keeps the cluster after unmou
   await expect(page.getByText('手动挂载后启用')).toBeVisible();
   await page.getByRole('link', { name: '返回 Lustre 集群列表' }).click();
   await expect(row).toContainText('未挂载');
+  await expect(metrics).toHaveText(['0', '1', '1', '0']);
 });
 
 test('lists an externally discovered mount without registering it', async ({ page }) => {
@@ -197,7 +200,10 @@ test('updates the open resource on notification and follows an associated policy
   await send('management', '*');
   await mountsRead;
   await expect(pool('cold')).toContainText('未取得容量');
-  await send('snapshot', 'lab-a');
+  await Promise.all([
+    page.waitForResponse('**/api/filesystems/management'),
+    send('snapshot', 'lab-a'),
+  ]);
   await expect(pool('cold')).toContainText('容量已过期');
   await expect(pool('cold')).toContainText('OST 查询失败');
   await expect(pool('cold')).toContainText('1 KiB');

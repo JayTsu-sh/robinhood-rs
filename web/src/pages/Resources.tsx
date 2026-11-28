@@ -5,7 +5,7 @@ import InventoryPage from '@/components/InventoryPage';
 import ResourceManagement, { useResourceManagement } from '@/components/ResourceManagement';
 import {
   Availability, CapacityStatus, CollectionStatus, MountStatus, formatBytes,
-  formatObservationTime, formatUsage, useObservationClock,
+  formatUsage, useObservationClock,
 } from '@/components/ResourceStatus';
 import { withLiveMountStatus, type ResourceRegistration } from '@/services/resourceManagement';
 import { filesystemDetailsPath, listFilesystems, type FilesystemResource } from '@/services/tiering';
@@ -38,11 +38,9 @@ function resourceColumns(now: number): TableColumnsType<ClusterRow> {
       width: 125,
       render: (_, { resource, source }) => {
         const filesystem = source?.match(/:\/([^/]+)/)?.[1] ?? resource?.id;
-        const id = resource?.id;
         return (
           <>
             <span className="console-mono">{filesystem ?? '—'}</span>
-            {id && id !== filesystem && <div className="lustre-cell-note console-mono">{id}</div>}
             {!resource && source && <div className="lustre-cell-note lustre-mount-source console-mono">{source}</div>}
           </>
         );
@@ -82,7 +80,6 @@ function resourceColumns(now: number): TableColumnsType<ClusterRow> {
         return (
           <>
             <CollectionStatus status={collectionStatus} observedAt={observedAt} now={now} />
-            {observedAt !== null && <div className="lustre-cell-note">{formatObservationTime(observedAt)}</div>}
             {failedPools.length > 0 && (
               <Popover
                 title="池成员采集失败"
@@ -169,11 +166,10 @@ export default function Resources() {
   const rows = allRows.filter(
     ({ resource }) => availability === 'all' || (resource?.tieringAvailable === true) === (availability === 'available'),
   );
-  const normalClusters = allRows.filter(({ mountStatus, resource }) =>
-    mountStatus === 'mounted' && (resource?.tieringAvailable ?? true)).length;
+  const mountedClusters = allRows.filter(({ mountStatus }) => mountStatus === 'mounted').length;
   const metrics = [
-    { label: '正常集群', value: normalClusters, color: 'green' },
-    { label: '异常集群', value: allRows.length - normalClusters, color: 'amber' },
+    { label: '正常集群', value: mountedClusters, color: 'green' },
+    { label: '异常集群', value: allRows.length - mountedClusters, color: 'amber' },
     { label: '文件系统', value: allRows.length, color: 'blue' },
     {
       label: '存储池',
@@ -192,7 +188,7 @@ export default function Resources() {
     <div className="lustre-resources">
       <InventoryPage
         title="Lustre 集群"
-        description="查看 Lustre 文件系统、挂载状态和存储池。"
+        description="管理已接入的 Lustre 集群、文件系统和存储池。"
         status={status}
         error={state.status === 'error' ? state.message : undefined}
         refreshError={state.status === 'ready' ? state.refreshError : undefined}
@@ -248,7 +244,7 @@ export default function Resources() {
               </div>,
             }}
           />
-          <div className="lustre-table-footer">共 {rows.length} / {allRows.length} 个资源 · 以文件系统为单位</div>
+          <div className="lustre-table-footer">共 {rows.length} / {allRows.length} 个资源（以文件系统为单位）</div>
         </div>
       </InventoryPage>
     </div>
