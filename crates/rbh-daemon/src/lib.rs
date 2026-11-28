@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use scheduler_rs::prelude::*;
-use scheduler_rs::store::{DataStore, MemoryStore, MysqlStore};
+use scheduler_rs::store::MemoryStore;
 use tokio_util::sync::CancellationToken;
 
 /// Run the robinhood-rs daemon.
@@ -32,13 +32,13 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing::info!("robinhood-rs daemon starting");
 
-    let writers = if let Some(path) = std::env::var_os("RBH_REV8_WRITERS_FILE") {
+    let writers = if let Some(path) = std::env::var_os("RBH_POLICY_WRITERS_FILE") {
         let json = tokio::fs::read_to_string(path)
             .await
-            .context("read RBH_REV8_WRITERS_FILE")?;
-        rbh_api::Rev8Writers::from_digest_json(&json).map_err(anyhow::Error::msg)?
+            .context("read RBH_POLICY_WRITERS_FILE")?;
+        rbh_api::PolicyWriters::from_digest_json(&json).map_err(anyhow::Error::msg)?
     } else {
-        rbh_api::Rev8Writers::default()
+        rbh_api::PolicyWriters::default()
     };
 
     // 2. Database connection.
@@ -47,10 +47,10 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .context("failed to connect to MariaDB")?;
 
-    // 3. Run migrations (entry-store owns all schema).
+    // 3. Verify the database schema before registering filesystems.
     let entry_store = rbh_entry_store::store::EntryStore::connect(&db_url)
         .await
-        .context("failed to initialize entry store")?;
+        .context("failed to open entry store")?;
     let runtime_registry = runtime::RuntimeRegistry::from_env()?;
     for filesystem in runtime_registry.iter() {
         entry_store.register_filesystem(&filesystem.config).await?;
@@ -76,43 +76,21 @@ pub async fn run() -> anyhow::Result<()> {
                 .with_context(|| format!("read_heat configuration for {}", filesystem.config.id))?;
         }
     }
-    if let Some(path) = std::env::var_os("RBH_REV8_HSM_PRINCIPAL_FILE") {
-        use rbh_policy::rev8::execution::{LustreHsm, Principal, Runtime};
+    if let Some(path) = std::env::var_os("RBH_HSM_PRINCIPAL_FILE") {
+        use rbh_policy::policy::execution::{LustreHsm, Principal, Runtime};
 
         let json = tokio::fs::read_to_string(path)
             .await
-            .context("read RBH_REV8_HSM_PRINCIPAL_FILE")?;
-        let principal: Principal = serde_json::from_str(&json).context("invalid Rev.8 HSM workload identity")?;
+            .context("read RBH_HSM_PRINCIPAL_FILE")?;
+        let principal: Principal = serde_json::from_str(&json).context("invalid HSM workload identity")?;
         anyhow::ensure!(
             !principal.service_account.trim().is_empty(),
-            "Rev.8 HSM serviceAccount is empty"
+            "HSM serviceAccount is empty"
         );
-        policy_store = policy_store.with_rev8_runtime(Runtime {
+        policy_store = policy_store.with_execution_runtime(Runtime {
             principal,
             hsm: Arc::new(LustreHsm),
         });
-    }
-    policy_store
-        .check_schema()
-        .await
-        .context("policy schema check failed")?;
-    let lustre: Vec<_> = runtime_registry
-        .iter()
-        .filter(|runtime| runtime.config.backend == rbh_entry_store::BackendKind::Lustre)
-        .collect();
-    if let [runtime] = lustre.as_slice() {
-        let rebound_cursors = entry_store
-            .bind_legacy_lustre_cursors(&runtime.config.id)
-            .await
-            .context("failed to bind legacy changelog cursors to the sole configured Lustre filesystem")?;
-        if rebound_cursors > 0 {
-            tracing::info!(filesystem = %runtime.config.id, cursors = rebound_cursors, "legacy changelog cursors bound to sole Lustre filesystem");
-        }
-    } else if !lustre.is_empty() {
-        tracing::warn!(
-            lustre_filesystems = lustre.len(),
-            "legacy unscoped changelog cursors are not rebound when multiple Lustre filesystems are configured"
-        );
     }
     let classifier_store = rbh_policy::ClassifierStore::new(pool.clone());
 
@@ -120,7 +98,6 @@ pub async fn run() -> anyhow::Result<()> {
     let classifier_cache: std::sync::Arc<tokio::sync::RwLock<Vec<rbh_policy::ClassifierRow>>> = std::sync::Arc::new(
         tokio::sync::RwLock::new(classifier_store.list().await.unwrap_or_default()),
     );
-    tracing::info!("database migrations complete");
 
     // 4. Spawn one isolated scan/change-source supervisor per Lustre runtime.
     //
@@ -362,15 +339,7 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    // Retain old schedule history and run the wakeup in each daemon.
-    let persisted_schedules = MysqlStore::new(pool.clone())
-        .await
-        .context("failed to initialize scheduler store")?;
-    retire_persisted_schedules(&persisted_schedules).await?;
-
-    // Rev.8 policies, due times and execution state live in the catalog.
-    // An in-memory trigger avoids sharing scheduler rows with daemons
-    // that have no trigger registered for those rows.
+    // Policy due times and execution state live in the catalog. Wakeups are local to each daemon.
     let scheduler = Scheduler::builder()
         .data_store(Arc::new(MemoryStore::new()))
         .executor(Arc::new(scheduler_rs::executor::TokioExecutor::new()))
@@ -380,9 +349,9 @@ pub async fn run() -> anyhow::Result<()> {
         .context("failed to build scheduler")?;
 
     // Register task types.
-    scheduler.register::<rbh_policy::Rev8TickTask>().await;
+    scheduler.register::<rbh_policy::PolicyTickTask>().await;
 
-    // Initialize the Rev.8 worker runtime.
+    // Initialize the policy worker runtime.
     let (worker_failure, mut worker_failures) = tokio::sync::mpsc::channel(1);
     rbh_policy::init_runtime(Arc::new(rbh_policy::PolicyRuntime {
         policy_store: policy_store.clone(),
@@ -390,9 +359,9 @@ pub async fn run() -> anyhow::Result<()> {
         worker_failure,
     }));
 
-    register_rev8_wakeup(&scheduler)
+    register_policy_wakeup(&scheduler)
         .await
-        .context("register Rev.8 scheduler wakeup")?;
+        .context("register policy scheduler wakeup")?;
 
     // Active HSM state poller. Walks the catalog in small batches,
     // calls llapi_hsm_state_get, patches sm_status if the stored state
@@ -525,21 +494,21 @@ pub async fn run() -> anyhow::Result<()> {
         signal = signals::supervise(obs_guard, daemon_cancel.clone(), None, None) => {
             console_resources.stop();
             scheduler.shutdown();
-            signal.and(scheduler_run.await.context("Rev.8 scheduler shutdown failed"))
+            signal.and(scheduler_run.await.context("policy scheduler shutdown failed"))
         }
         Some(error) = worker_failures.recv() => {
             daemon_cancel.cancel();
             console_resources.stop();
             scheduler.shutdown();
             if let Err(shutdown_error) = scheduler_run.await {
-                tracing::warn!(%shutdown_error, "Rev.8 scheduler shutdown failed");
+                tracing::warn!(%shutdown_error, "policy scheduler shutdown failed");
             }
-            Err(error).context("Rev.8 scheduler stopped")
+            Err(error).context("policy scheduler stopped")
         }
         result = &mut scheduler_run => {
             result
                 .and_then(|()| Err(SchedulerError::ExecutionError("unexpected scheduler exit".into())))
-                .context("Rev.8 scheduler stopped")
+                .context("policy scheduler stopped")
         }
     };
     daemon_cancel.cancel();
@@ -771,23 +740,7 @@ async fn run_juicefs_baseline(
     Ok(())
 }
 
-/// Pause obsolete tasks before polling the queue, retaining their execution history.
-async fn retire_persisted_schedules(store: &MysqlStore) -> Result<(), SchedulerError> {
-    for mut schedule in store.list_schedules().await? {
-        if matches!(
-            schedule.type_name.as_str(),
-            "rbh.policy_run" | rbh_policy::Rev8TickTask::TYPE_NAME
-        ) && schedule.state == ScheduleState::Active
-        {
-            schedule.state = ScheduleState::Paused;
-            schedule.updated_at = chrono::Utc::now();
-            store.update_schedule(&schedule).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn register_rev8_wakeup(scheduler: &Scheduler) -> Result<(), SchedulerError> {
+async fn register_policy_wakeup(scheduler: &Scheduler) -> Result<(), SchedulerError> {
     use scheduler_rs::trigger::IntervalTrigger;
 
     let config = ScheduleConfig {
@@ -797,11 +750,11 @@ async fn register_rev8_wakeup(scheduler: &Scheduler) -> Result<(), SchedulerErro
     };
     scheduler
         .add_raw(
-            rbh_policy::Rev8TickTask::TYPE_NAME.to_owned(),
+            rbh_policy::PolicyTickTask::TYPE_NAME.to_owned(),
             serde_json::Value::Null,
-            Box::new(IntervalTrigger::every(rbh_policy::Rev8TickTask::INTERVAL)),
+            Box::new(IntervalTrigger::every(rbh_policy::PolicyTickTask::INTERVAL)),
             config,
-            Some("rbh.rev8.tick".into()),
+            Some("rbh.policy.tick".into()),
         )
         .await?;
     Ok(())

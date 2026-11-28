@@ -1,21 +1,13 @@
 //! MariaDB-backed entry catalog for robinhood-rs.
 //!
-//! Owns the `rbh_entries` database. Tables:
-//! * `entries` — FID-keyed catalog of Lustre files/dirs (Phase 2)
-//! * `names` — hardlink support (Phase 2)
-//! * `removed_entries` — deleted files for HSM cleanup (Phase 2)
-//! * `changelog_cursor` — per-MDT cursor for `CursorStore` (Phase 2)
-//! * `filesystems` / `scoped_entries` — additive filesystem-scoped identity
-//!   used while legacy FID-keyed callers are migrated
-//!
-//! Policy tables (`policies`, `policy_trigger_state`, etc.) are added in Phase 6+.
-//!
-//! See `.claude/memory/persistence_boundary.md`: this crate owns `rbh_entries`
-//! exclusively; it never writes to `rbh_scheduler` (owned by scheduler-rs).
+//! The project-wide MariaDB schema is installed from `schema.sql`.
+//! This crate validates it on connection and owns the filesystem-scoped
+//! catalog, changelog cursors, and the Lustre compatibility catalog.
 
 pub mod error;
 pub mod fid_codec;
 pub mod model;
+mod schema;
 pub mod store;
 
 pub use error::StoreError;

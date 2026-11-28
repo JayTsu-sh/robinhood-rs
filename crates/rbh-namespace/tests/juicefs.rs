@@ -8,7 +8,6 @@ use rbh_entry_store::{
     BackendCapabilities, BackendKind, EntryKey, EntryKind, FileSystemConfig, FileSystemId, ObjectId, ScopedEntryRow,
 };
 use rbh_namespace::{NamespaceAdapter, NamespaceError, NamespaceTarget};
-use sqlx::mysql::MySqlPoolOptions;
 
 const DB: &str = "mysql://root@127.0.0.1/rbh_namespace_test";
 
@@ -50,20 +49,9 @@ async fn juicefs_adapter_defines_hardlink_rename_delete_and_ownership_behavior()
     if !enabled() {
         return;
     }
-    let admin = MySqlPoolOptions::new()
-        .connect("mysql://root@127.0.0.1/mysql")
-        .await
-        .unwrap();
-    sqlx::query("DROP DATABASE IF EXISTS rbh_namespace_test")
-        .execute(&admin)
-        .await
-        .unwrap();
-    sqlx::query("CREATE DATABASE rbh_namespace_test")
-        .execute(&admin)
-        .await
-        .unwrap();
-    let store = EntryStore::connect(DB).await.unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let database = std::env::var("RBH_TEST_DATABASE_URL").unwrap_or_else(|_| DB.to_owned());
+    let store = EntryStore::connect(&database).await.expect("initialized test database");
+    let temp = tempfile::Builder::new().prefix("rbh-namespace-").tempdir().unwrap();
     let mount = temp.path().join("jfs");
     fs::create_dir(&mount).unwrap();
     let first_path = mount.join("first");
@@ -71,8 +59,9 @@ async fn juicefs_adapter_defines_hardlink_rename_delete_and_ownership_behavior()
     fs::write(&first_path, b"namespace").unwrap();
     fs::hard_link(&first_path, &hard_path).unwrap();
 
-    let filesystem = FileSystemId::new("juice-a").unwrap();
-    let other = FileSystemId::new("juice-b").unwrap();
+    let fixture = temp.path().file_name().unwrap().to_str().unwrap();
+    let filesystem = FileSystemId::new(format!("{fixture}-a")).unwrap();
+    let other = FileSystemId::new(format!("{fixture}-b")).unwrap();
     for id in [&filesystem, &other] {
         store
             .register_filesystem(&FileSystemConfig {

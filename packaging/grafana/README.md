@@ -30,7 +30,7 @@ select the Prometheus datasource → *Import*.
 | Catalog entries | `rbh_catalog_entries` |
 | Changelog rate | `sum by (source, event_type) (rate(rbh_changelog_events_total[1m]))` |
 
-The `$mdt` filter uses the `source` label. Query Rev.8 policy runs and file actions through the REST history endpoints.
+The `$mdt` filter uses the `source` label. Query policy runs and file actions through the REST history endpoints.
 
 ## Alerting suggestions
 

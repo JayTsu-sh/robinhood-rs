@@ -32,7 +32,7 @@ export function poolScopePreviewDocument({
   filesystem, sourcePool, targetPool, root, excludedSubtrees = [],
 }: PreviewScope) {
   // This preview covers the full selected source pool and directory scope.
-  // The Rev.8 engine applies execution limits only to dispatch.
+  // The policy engine applies execution limits only to dispatch.
   const maxLogicalBytes = '9223372036854775807B';
   return {
     apiVersion: 'hsm.storage.io/v1alpha3',

@@ -71,10 +71,10 @@ export default function PolicyExecutionActions(
       if (response?.status === 401 && writerTransportAllowed()) {
         setRequiresToken(true);
         setToken('');
-        if (requiresToken) setError('Rev.8 writer 凭据未获后端接受');
+        if (requiresToken) setError('策略写入凭据未获后端接受');
       } else {
         let message = response?.status === 401
-          ? '请通过本机回环地址或 HTTPS 连接后使用 Rev.8 writer。'
+          ? '请通过本机回环地址或 HTTPS 连接后提交策略写入请求。'
           : requestError(cause);
         if (response?.status === 409) {
           setConflict(response.data?.currentRevisionExact);
@@ -113,7 +113,7 @@ export default function PolicyExecutionActions(
           <Typography.Text strong>{name} · 修订 {revision}</Typography.Text>
           <Typography.Text>{explanation}</Typography.Text>
           {requiresToken && <label>
-            Rev.8 writer token
+            策略写入令牌
             <Input.Password autoComplete="off" disabled={saving} value={token}
               onChange={(event) => setToken(event.target.value)} onPressEnter={submit} />
           </label>}

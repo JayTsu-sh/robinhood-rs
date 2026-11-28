@@ -4,29 +4,28 @@ use lustre_api::LuFid;
 use rbh_entry_store::{EntryStore, fid_codec};
 use serde_json::{Value, json};
 
-use crate::handlers::scoped_api_tests::{rev8_archive_policy, rev8_test_server, state_without_database_connection};
+use crate::handlers::scoped_api_tests::{archive_policy, policy_test_server, state_without_database_connection};
 
 async fn history_fixture(prefix: &str) -> (EntryStore, TestServer, u64, String) {
     let entries = EntryStore::connect(&std::env::var("RBH_TEST_DATABASE_URL").unwrap())
         .await
         .unwrap();
     let name = format!("history-{prefix}-{}", uuid::Uuid::new_v4().simple());
-    let mut document = rev8_archive_policy("history-fixture", &name);
+    let mut document = archive_policy("history-fixture", &name);
     document["spec"]["execution"]
         .as_object_mut()
         .unwrap()
         .remove("activation");
-    let policy =
-        sqlx::query("INSERT INTO policies (name, kind, definition, revision, enabled) VALUES (?, 'rev8', ?, 2, FALSE)")
-            .bind(format!("{name}-current"))
-            .bind(&document)
-            .execute(entries.pool())
-            .await
-            .unwrap()
-            .last_insert_id();
+    let policy = sqlx::query("INSERT INTO policies (name, definition, revision, enabled) VALUES (?, ?, 2, FALSE)")
+        .bind(format!("{name}-current"))
+        .bind(&document)
+        .execute(entries.pool())
+        .await
+        .unwrap()
+        .last_insert_id();
     let mut current = document.clone();
     current["metadata"]["name"] = json!(format!("{name}-current"));
-    sqlx::query("INSERT INTO rev8_policy_revisions (policy_id, revision, definition) VALUES (?, 1, ?), (?, 2, ?)")
+    sqlx::query("INSERT INTO policy_revisions (policy_id, revision, definition) VALUES (?, 1, ?), (?, 2, ?)")
         .bind(policy)
         .bind(&document)
         .bind(policy)
@@ -37,12 +36,12 @@ async fn history_fixture(prefix: &str) -> (EntryStore, TestServer, u64, String) 
     let mut state = state_without_database_connection();
     state.policy_store = rbh_policy::PolicyStore::new(entries.pool().clone());
     state.entry_store = entries.clone();
-    (entries, rev8_test_server(state), policy, name)
+    (entries, policy_test_server(state), policy, name)
 }
 
 async fn insert_run(entries: &EntryStore, policy: u64, revision: u64, state: &str, actor: Option<&str>) -> u64 {
     sqlx::query(
-        "INSERT INTO rev8_runs (policy_id, revision, state, requested_by, estimated_bytes) VALUES (?, ?, ?, ?, 9007199254740993)",
+        "INSERT INTO policy_runs (policy_id, revision, state, requested_by, estimated_bytes) VALUES (?, ?, ?, ?, 9007199254740993)",
     )
     .bind(policy)
     .bind(revision)
@@ -94,8 +93,8 @@ async fn run_history_filters_before_paging_and_reads_pinned_revisions() {
 
     let large_revision = 9_007_199_254_740_993_u64;
     sqlx::query(
-        "INSERT INTO rev8_policy_revisions (policy_id, revision, definition)
-        SELECT policy_id, ?, definition FROM rev8_policy_revisions WHERE policy_id = ? AND revision = 2",
+        "INSERT INTO policy_revisions (policy_id, revision, definition)
+        SELECT policy_id, ?, definition FROM policy_revisions WHERE policy_id = ? AND revision = 2",
     )
     .bind(large_revision)
     .bind(policy)
@@ -165,7 +164,7 @@ async fn policy_inventory_prefers_active_runs_and_falls_back_to_latest() {
     assert_eq!(row["latestRun"]["revision"], "1");
 
     for (id, expected) in [(active, queued), (queued, latest)] {
-        sqlx::query("UPDATE rev8_runs SET state = 'finished' WHERE id = ?")
+        sqlx::query("UPDATE policy_runs SET state = 'finished' WHERE id = ?")
             .bind(id)
             .execute(entries.pool())
             .await
@@ -196,7 +195,7 @@ async fn operation_history_filters_beyond_one_hundred_rows_and_refreshes_layout_
             _ => ("completed", None),
         };
         sqlx::query(
-            "INSERT INTO rev8_operations (run_id, filesystem, fid, action, state, reason, attempted, size, migration_plan, completion_evidence, finished_at)
+            "INSERT INTO policy_operations (run_id, filesystem, fid, action, state, reason, attempted, size, migration_plan, completion_evidence, finished_at)
              VALUES (?, ?, ?, 'lustre.pool_migrate', ?, ?, TRUE, 9007199254740993, ?, ?, IF(? = 'completed', UTC_TIMESTAMP(6), NULL))",
         )
         .bind(run)
@@ -327,7 +326,7 @@ async fn operation_history_filters_beyond_one_hundred_rows_and_refreshes_layout_
     assert_eq!(report["operations"].as_array().unwrap().len(), 1);
     assert_eq!(report["operations"][0]["state"], "failed");
     sqlx::query(
-        "UPDATE rev8_operations SET state = 'completed', reason = NULL, completion_evidence = ?,
+        "UPDATE policy_operations SET state = 'completed', reason = NULL, completion_evidence = ?,
         checked_at = '2026-11-28 06:15:00.000000' WHERE run_id = ? AND state = 'unknown'",
     )
     .bind(&evidence)
@@ -378,7 +377,7 @@ async fn exception_report_covers_more_than_one_page_and_combines_the_same_reason
             _ => ("failed", Some("fid_missing")),
         };
         sqlx::query(
-            "INSERT INTO rev8_operations (run_id, filesystem, fid, action, state, reason, size)
+            "INSERT INTO policy_operations (run_id, filesystem, fid, action, state, reason, size)
              VALUES (?, ?, ?, 'lustre.pool_migrate', ?, ?, 1)",
         )
         .bind(run)

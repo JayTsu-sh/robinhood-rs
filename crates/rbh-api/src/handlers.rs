@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow};
 use rbh_entry_store::store::{AggregateKey, AggregateSort, QueryParam};
 use rbh_policy::{
-    PolicyError, rev8,
-    store::{Rev8PolicyRow, Rev8PolicyWrite, SavedRev8Policy},
+    PolicyError, policy,
+    store::{PolicyRevision, PolicyWrite, SavedPolicy},
 };
 use rbh_predicate::{Predicate, SortKey, SqlParam, to_sql};
 
@@ -46,9 +46,9 @@ pub fn api_routes() -> Router<AppState> {
                 .delete(delete_policy),
         )
         .route("/policies/{id}/run", post(run_policy_now))
-        .route("/policies/{id}/runs", get(list_rev8_runs))
-        .route("/policies/{id}/breaker/reset", post(reset_rev8_breaker))
-        .route("/policies/{id}/runs/{run}/operations", get(list_rev8_operations))
+        .route("/policies/{id}/runs", get(list_policy_runs))
+        .route("/policies/{id}/breaker/reset", post(reset_policy_breaker))
+        .route("/policies/{id}/runs/{run}/operations", get(list_run_operations))
         .route("/policies/preview", post(preview_policy_document))
         .route("/policies/{id}/preview", post(preview_policy))
         .route("/policies/{id}/revisions/{revision}", get(get_policy_revision))
@@ -115,14 +115,14 @@ async fn metrics_endpoint(State(state): State<AppState>) -> axum::response::Resp
 
 #[tracing::instrument(skip_all)]
 async fn create_policy(
-    State(state): State<AppState>, Extension(writers): Extension<crate::Rev8Writers>, headers: HeaderMap,
+    State(state): State<AppState>, Extension(writers): Extension<crate::PolicyWriters>, headers: HeaderMap,
     Json(document): Json<serde_json::Value>,
-) -> Result<(StatusCode, Json<SavedRev8Policy>), ApiError> {
-    rev8::validate_policy_version(&document)?;
+) -> Result<(StatusCode, Json<SavedPolicy>), ApiError> {
+    policy::validate_policy_version(&document)?;
     let actor = writers.authorize(&headers)?;
     let saved = state
         .policy_store
-        .save_rev8(&state.entry_store, Rev8PolicyWrite::Create, &document, actor)
+        .save_policy(&state.entry_store, PolicyWrite::Create, &document, actor)
         .await?;
     Ok((StatusCode::CREATED, Json(saved)))
 }
@@ -139,16 +139,16 @@ struct PolicyReadQuery {
 #[tracing::instrument(skip(state))]
 async fn list_policies(
     State(state): State<AppState>, axum::extract::Query(query): axum::extract::Query<PolicyReadQuery>,
-) -> Result<Json<Vec<Rev8PolicyRow>>, ApiError> {
+) -> Result<Json<Vec<PolicyRevision>>, ApiError> {
     let rows = if query.include_latest_run {
         state
             .policy_store
-            .list_rev8_with_latest_run(query.configured_only)
+            .list_policies_with_latest_run(query.configured_only)
             .await?
     } else if query.configured_only {
-        state.policy_store.list_configured_rev8().await?
+        state.policy_store.list_configured_policies().await?
     } else {
-        state.policy_store.list_rev8().await?
+        state.policy_store.list_policies().await?
     };
     Ok(Json(rows))
 }
@@ -157,28 +157,28 @@ async fn list_policies(
 async fn get_policy(
     State(state): State<AppState>, Path(id): Path<u64>,
     axum::extract::Query(query): axum::extract::Query<PolicyReadQuery>,
-) -> Result<Json<Rev8PolicyRow>, ApiError> {
+) -> Result<Json<PolicyRevision>, ApiError> {
     let row = if query.include_latest_run {
-        state.policy_store.get_rev8_with_latest_run(id).await?
+        state.policy_store.get_policy_with_latest_run(id).await?
     } else {
-        state.policy_store.get_rev8(id).await?
+        state.policy_store.get_policy(id).await?
     };
     Ok(Json(row.ok_or(PolicyError::NotFound(id))?))
 }
 
 #[tracing::instrument(skip_all, fields(id))]
 async fn update_policy(
-    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::PolicyWriters>,
     headers: HeaderMap, Json(document): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
-    rev8::validate_policy_version(&document)?;
+    policy::validate_policy_version(&document)?;
     let actor = writers.authorize(&headers)?;
     let expected_revision = expected_policy_revision(&headers)?;
     let saved = state
         .policy_store
-        .save_rev8(
+        .save_policy(
             &state.entry_store,
-            Rev8PolicyWrite::Update { id, expected_revision },
+            PolicyWrite::Update { id, expected_revision },
             &document,
             actor,
         )
@@ -218,14 +218,14 @@ struct PolicyActivation {
 
 #[tracing::instrument(skip_all, fields(id))]
 async fn set_policy_enabled(
-    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::PolicyWriters>,
     headers: HeaderMap, Json(activation): Json<PolicyActivation>,
-) -> Result<Json<SavedRev8Policy>, ApiError> {
+) -> Result<Json<SavedPolicy>, ApiError> {
     let actor = writers.authorize(&headers)?;
     let expected = expected_policy_revision(&headers)?;
     let row = state
         .policy_store
-        .get_rev8(id)
+        .get_policy(id)
         .await?
         .ok_or(PolicyError::NotFound(id))?;
     let mut definition = row.definition.0;
@@ -233,9 +233,9 @@ async fn set_policy_enabled(
     Ok(Json(
         state
             .policy_store
-            .save_rev8(
+            .save_policy(
                 &state.entry_store,
-                Rev8PolicyWrite::Update {
+                PolicyWrite::Update {
                     id,
                     expected_revision: expected.or(Some(row.revision)),
                 },
@@ -255,11 +255,11 @@ struct PreviewQuery {
 #[tracing::instrument(skip_all)]
 async fn preview_policy_document(
     State(state): State<AppState>, Json(document): Json<serde_json::Value>,
-) -> Result<Json<rev8::PreviewResult<()>>, ApiError> {
+) -> Result<Json<policy::PreviewResult<()>>, ApiError> {
     Ok(Json(
         state
             .policy_store
-            .preview_rev8_document(&state.entry_store, &document)
+            .preview_policy_document(&state.entry_store, &document)
             .await?,
     ))
 }
@@ -267,11 +267,11 @@ async fn preview_policy_document(
 #[tracing::instrument(skip(state))]
 async fn preview_policy(
     State(state): State<AppState>, Path(id): Path<u64>, axum::extract::Query(query): axum::extract::Query<PreviewQuery>,
-) -> Result<Json<rev8::PreviewResult>, ApiError> {
+) -> Result<Json<policy::PreviewResult>, ApiError> {
     Ok(Json(
         state
             .policy_store
-            .preview_rev8_with_heat(&state.entry_store, id, query.heat_fid)
+            .preview_policy_with_heat(&state.entry_store, id, query.heat_fid)
             .await?,
     ))
 }
@@ -279,15 +279,15 @@ async fn preview_policy(
 #[tracing::instrument(skip(state))]
 async fn get_policy_revision(
     State(state): State<AppState>, Path((id, revision)): Path<(u64, u64)>,
-) -> Result<Json<Rev8PolicyRow>, ApiError> {
-    Ok(Json(state.policy_store.get_rev8_revision(id, revision).await?))
+) -> Result<Json<PolicyRevision>, ApiError> {
+    Ok(Json(state.policy_store.get_policy_revision(id, revision).await?))
 }
 
 #[tracing::instrument(skip(state))]
 async fn get_policy_definition(
     State(state): State<AppState>, Path((id, revision)): Path<(u64, u64)>,
 ) -> Result<Response, ApiError> {
-    let row = state.policy_store.get_rev8_revision(id, revision).await?;
+    let row = state.policy_store.get_policy_revision(id, revision).await?;
     let body = serde_json::to_string_pretty(&row.definition.0).map_err(PolicyError::from)?;
     Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response())
 }
@@ -306,48 +306,48 @@ struct RunPage {
     after_id: u64,
 }
 
-async fn reset_rev8_breaker(
-    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+async fn reset_policy_breaker(
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::PolicyWriters>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let actor = writers.authorize(&headers)?;
-    state.policy_store.reset_rev8_breaker(id, actor).await?;
+    state.policy_store.reset_policy_breaker(id, actor).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_rev8_runs(
+async fn list_policy_runs(
     State(state): State<AppState>, Path(id): Path<u64>, axum::extract::Query(page): axum::extract::Query<RunPage>,
-) -> Result<Json<Vec<rbh_policy::store::Rev8Run>>, ApiError> {
-    Ok(Json(state.policy_store.list_rev8_runs(id, page.after_id).await?))
+) -> Result<Json<Vec<rbh_policy::store::PolicyRun>>, ApiError> {
+    Ok(Json(state.policy_store.list_policy_runs(id, page.after_id).await?))
 }
 
-async fn list_rev8_operations(
+async fn list_run_operations(
     State(state): State<AppState>, Path((id, run)): Path<(u64, u64)>,
     axum::extract::Query(page): axum::extract::Query<RunPage>,
-) -> Result<Json<Vec<rbh_policy::store::Rev8Operation>>, ApiError> {
+) -> Result<Json<Vec<rbh_policy::store::PolicyOperation>>, ApiError> {
     Ok(Json(
-        state.policy_store.list_rev8_operations(id, run, page.after_id).await?,
+        state.policy_store.list_run_operations(id, run, page.after_id).await?,
     ))
 }
 
 /// Queue a run bound to the current persisted policy revision.
 #[tracing::instrument(skip_all, fields(id))]
 async fn run_policy_now(
-    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::PolicyWriters>,
     headers: HeaderMap, body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let actor = writers.authorize(&headers)?;
     if !body.is_empty() {
         let request: RunRequest = serde_json::from_slice(&body)
-            .map_err(|error| ApiError::BadRequest(format!("invalid Rev.8 run request: {error}")))?;
+            .map_err(|error| ApiError::BadRequest(format!("invalid policy run request: {error}")))?;
         if request.dry_run {
-            return Ok(Json(state.policy_store.preview_rev8(&state.entry_store, id).await?).into_response());
+            return Ok(Json(state.policy_store.preview_policy(&state.entry_store, id).await?).into_response());
         }
     }
     let expected_revision = expected_policy_revision(&headers)?;
     let run = state
         .policy_store
-        .request_rev8_run(id, actor, expected_revision)
+        .request_policy_run(id, actor, expected_revision)
         .await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -358,11 +358,11 @@ async fn run_policy_now(
 
 #[tracing::instrument(skip_all, fields(id))]
 async fn delete_policy(
-    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::PolicyWriters>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     writers.authorize(&headers)?;
-    state.policy_store.delete_rev8(id).await?;
+    state.policy_store.delete_policy(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1304,7 +1304,7 @@ impl IntoResponse for ApiError {
                 return (
                     StatusCode::UNAUTHORIZED,
                     [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
-                    Json(serde_json::json!({"error": "Rev.8 configuration requires an authenticated writer"})),
+                    Json(serde_json::json!({"error": "Policy configuration requires an authenticated writer"})),
                 )
                     .into_response();
             }
@@ -1353,13 +1353,14 @@ pub(crate) mod scoped_api_tests {
         matches!(std::env::var("RBH_INTEGRATION"), Ok(value) if !value.is_empty() && value != "0")
     }
 
-    pub(crate) fn rev8_test_server(state: AppState) -> TestServer {
+    pub(crate) fn policy_test_server(state: AppState) -> TestServer {
         use sha2::{Digest, Sha256};
 
-        const TOKEN: &str = "rev8-rest-test-writer";
+        const TOKEN: &str = "policy-rest-test-writer";
         let digest = hex::encode(Sha256::digest(TOKEN));
         let writers =
-            crate::Rev8Writers::from_digest_json(&serde_json::json!({"config-operator": digest}).to_string()).unwrap();
+            crate::PolicyWriters::from_digest_json(&serde_json::json!({"config-operator": digest}).to_string())
+                .unwrap();
         let mut server = TestServer::new(crate::router_with_writers(state, writers)).unwrap();
         server.add_header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"));
         server
@@ -1371,7 +1372,7 @@ pub(crate) mod scoped_api_tests {
         })
     }
 
-    pub(crate) fn rev8_archive_policy(filesystem: &str, name: &str) -> serde_json::Value {
+    pub(crate) fn archive_policy(filesystem: &str, name: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "hsm.storage.io/v1alpha3",
             "kind": "Policy",
@@ -1425,8 +1426,8 @@ pub(crate) mod scoped_api_tests {
         let mut state = state_without_database_connection();
         state.policy_store = rbh_policy::PolicyStore::new(entries.pool().clone());
         state.entry_store = entries;
-        let server = rev8_test_server(state);
-        let mut document = rev8_archive_policy(filesystem.as_str(), filesystem.as_str());
+        let server = policy_test_server(state);
+        let mut document = archive_policy(filesystem.as_str(), filesystem.as_str());
         document["spec"]["enabled"] = false.into();
         document["spec"]["execution"]["budget"]["run"]["maxObjectLogicalBytes"] = json!(9_007_199_254_740_993_u64);
         let response = server.post("/api/policies").json(&document).await;
@@ -1477,9 +1478,9 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn rev8_policy_reports_unsupported_version_before_accessing_storage() {
-        let server = rev8_test_server(state_without_database_connection());
-        let mut document = rev8_archive_policy("lustre", "archive-preview");
+    async fn policy_reports_unsupported_version_before_accessing_storage() {
+        let server = policy_test_server(state_without_database_connection());
+        let mut document = archive_policy("lustre", "archive-preview");
         document["apiVersion"] = "hsm.storage.io/v1alpha2".into();
         let response = server.post("/api/policies").json(&document).await;
         response.assert_status_bad_request();
@@ -1488,8 +1489,8 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn legacy_policy_submissions_require_a_rev8_document() {
-        let server = rev8_test_server(state_without_database_connection());
+    async fn legacy_policy_submissions_require_a_policy_document() {
+        let server = policy_test_server(state_without_database_connection());
         let legacy = serde_json::json!({
             "name": "old-archive", "filesystem": "lustre", "kind": "hsm_archive",
             "enabled": true, "trigger": "1h", "action": {"hsm": {"archive_id": 1}}
@@ -1503,8 +1504,8 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn rev8_manual_run_rejects_a_legacy_target_even_without_a_json_content_type() {
-        let server = rev8_test_server(state_without_database_connection());
+    async fn policy_manual_run_rejects_a_legacy_target_even_without_a_json_content_type() {
+        let server = policy_test_server(state_without_database_connection());
         let response = server
             .post("/api/policies/123/run")
             .text(r#"{"target":{"kind":"ost","osts":[7]}}"#)
@@ -1519,7 +1520,7 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn rev8_resource_write_requires_an_authenticated_identity() {
+    async fn policy_resource_write_requires_an_authenticated_identity() {
         let server = TestServer::new(crate::router(state_without_database_connection())).unwrap();
         let document = serde_json::json!({
             "apiVersion": "hsm.storage.io/v1alpha3", "kind": "Selector",
@@ -1534,8 +1535,8 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn rev8_action_contract_is_registered_and_read_only() {
-        let server = rev8_test_server(state_without_database_connection());
+    async fn policy_action_contract_is_registered_and_read_only() {
+        let server = policy_test_server(state_without_database_connection());
         let response = server.get("/api/action-contracts").await;
         response.assert_status_ok();
         let contracts = response.json::<Vec<serde_json::Value>>();
@@ -1583,13 +1584,13 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn rev8_policy_reports_invalid_configuration_at_its_field() {
-        let server = rev8_test_server(state_without_database_connection());
+    async fn policy_reports_invalid_configuration_at_its_field() {
+        let server = policy_test_server(state_without_database_connection());
         for (field, value, error_field) in [
             ("/spec/execution/activation/mode", "unknown".into(), "activation.mode"),
             ("/spec/trigger/interval", "0h".into(), "trigger.interval"),
         ] {
-            let mut document = rev8_archive_policy("lustre", "archive-preview");
+            let mut document = archive_policy("lustre", "archive-preview");
             *document.pointer_mut(field).unwrap() = value;
             let response = server.post("/api/policies").json(&document).await;
             response.assert_status_bad_request();
@@ -1598,7 +1599,7 @@ pub(crate) mod scoped_api_tests {
             assert!(message.contains(error_field), "{field}: {message}");
         }
 
-        let mut document = rev8_archive_policy("lustre", "archive-preview");
+        let mut document = archive_policy("lustre", "archive-preview");
         document["spec"]["execution"]["concurrency"] = 1.into();
         let response = server.post("/api/policies").json(&document).await;
         response.assert_status_bad_request();
@@ -1607,7 +1608,7 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn rev8_policy_previews_scoped_candidates_and_preserves_the_latest_revision() {
+    async fn policy_preview_uses_scoped_candidates_and_preserves_the_latest_revision() {
         if !integration_enabled() {
             return;
         }
@@ -1677,10 +1678,10 @@ pub(crate) mod scoped_api_tests {
             state.policy_store = rbh_policy::PolicyStore::new(entry_store.pool().clone());
             state.classifier_store = rbh_policy::ClassifierStore::new(entry_store.pool().clone());
             state.entry_store = entry_store;
-            rev8_test_server(state)
+            policy_test_server(state)
         };
         let server = build_server(store);
-        let mut document = rev8_archive_policy(first.as_str(), &format!("archive-preview-{suffix}"));
+        let mut document = archive_policy(first.as_str(), &format!("archive-preview-{suffix}"));
         for (field, value, error_field) in [
             ("/spec/execution/profileRef", "unknown".into(), "profileRef"),
             ("/spec/rules/entries/0/match/field", "object.fizz".into(), "match.field"),
@@ -2214,7 +2215,7 @@ pub(crate) mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn rev8_rejects_hsm_on_juicefs() {
+    async fn policy_rejects_hsm_on_juicefs() {
         if !integration_enabled() {
             return;
         }
@@ -2235,14 +2236,14 @@ pub(crate) mod scoped_api_tests {
             .await
             .unwrap();
         let pool = store.pool().clone();
-        let server = rev8_test_server(AppState {
+        let server = policy_test_server(AppState {
             policy_store: rbh_policy::PolicyStore::new(pool.clone()),
             classifier_store: rbh_policy::ClassifierStore::new(pool),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: store,
             scans: Arc::new(Mutex::new(HashMap::new())),
         });
-        let document = rev8_archive_policy(filesystem.as_str(), "invalid-hsm");
+        let document = archive_policy(filesystem.as_str(), "invalid-hsm");
         let response = server.post("/api/policies").json(&document).await;
         response.assert_status_bad_request();
         let body: serde_json::Value = response.json();

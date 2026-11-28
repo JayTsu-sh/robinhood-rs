@@ -5,8 +5,23 @@ pub enum StoreError {
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
-    #[error("migration error: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
+    #[error("database schema is missing or incomplete. Initialize an empty database with rbh-entry-store/schema.sql")]
+    SchemaMissing,
+
+    #[error(
+        "database schema version {actual} is unsupported (expected {expected}). Initialize an empty database with rbh-entry-store/schema.sql"
+    )]
+    SchemaVersion { actual: u32, expected: u32 },
+
+    #[error(
+        "database schema is incomplete: missing InnoDB table {0}. Initialize an empty database with rbh-entry-store/schema.sql"
+    )]
+    SchemaTableMissing(&'static str),
+
+    #[error(
+        "database schema is incomplete: missing policy lock row in {0}. Initialize an empty database with rbh-entry-store/schema.sql"
+    )]
+    SchemaLockMissing(&'static str),
 
     #[error("entry not found: fid={0}")]
     NotFound(lustre_api::LuFid),

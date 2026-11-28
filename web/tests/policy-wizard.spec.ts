@@ -71,8 +71,8 @@ test('the compiled wizard previews and saves a real disabled revision, with exac
   const previous = () => page.getByRole('button', { name: '上一步' }).click();
   async function saveWithWriter() {
     await page.getByRole('button', { name: '保存策略' }).click();
-    const writer = page.getByRole('dialog', { name: 'Rev.8 writer 凭据' });
-    await writer.getByLabel('Rev.8 writer token').fill(token!);
+    const writer = page.getByRole('dialog', { name: '策略写入凭据' });
+    await writer.getByLabel('策略写入令牌').fill(token!);
     await writer.getByRole('button', { name: '提交保存' }).click();
   }
   const result = page.getByRole('region', { name: '预览结果' });
@@ -188,7 +188,7 @@ test('the compiled wizard previews and saves a real disabled revision, with exac
   await page.getByRole('tab', { name: '策略配置' }).click();
   await expect(page.locator('pre')).toContainText('9007199254740993');
   const downloadEvent = page.waitForEvent('download');
-  await page.getByRole('button', { name: '导出 Rev.8 JSON' }).click();
+  await page.getByRole('button', { name: '导出策略 JSON' }).click();
   const download = await downloadEvent;
   expect(download.suggestedFilename()).toBe(`${name}-readonly-r1.json`);
   const stream = await download.createReadStream();

@@ -2,7 +2,7 @@
 # End-to-end smoke tests for robinhood-rs.
 #
 # What it does, in order:
-#   1. Creates a dedicated test DB (RBH_E2E_DB, default rbh_e2e_<pid>).
+#   1. Initializes a dedicated test DB (RBH_E2E_DB, default rbh_e2e_<pid>).
 #   2. Spawns the daemon against that DB on a non-default port (8088).
 #   3. Seeds scoped catalog entries and one removed entry via mysql.
 #   4. Exercises: /api/health, /api/entries/count, rbh find (multiple forms),
@@ -27,6 +27,7 @@ PORT=${RBH_E2E_PORT:-8088}
 DB=${RBH_E2E_DB:-rbh_e2e_${BASHPID}}
 API="http://127.0.0.1:$PORT"
 TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
+SCHEMA_FILE=${RBH_SCHEMA_FILE:-$ROOT/crates/rbh-entry-store/schema.sql}
 BIN_DAEMON="$TARGET_DIR/release/robinhood"
 BIN_CLI="$TARGET_DIR/release/rbh"
 FILESYSTEM=lustre
@@ -60,10 +61,10 @@ cleanup() {
         wait "$PID" 2>/dev/null || true
     fi
     if [[ "$WORKER_LOCK_RENAMED" == 1 ]]; then
-        test_sql "$DB" -e 'RENAME TABLE rev8_worker_lock_e2e_fault TO rev8_worker_lock;' || true
+        test_sql "$DB" -e 'RENAME TABLE policy_worker_lock_e2e_fault TO policy_worker_lock;' || true
     fi
     if [[ "$WORKER_LOCK_ROW_REMOVED" == 1 ]]; then
-        test_sql "$DB" -e 'INSERT IGNORE INTO rev8_worker_lock (id) VALUES (1);' || true
+        test_sql "$DB" -e 'INSERT IGNORE INTO policy_worker_lock (id) VALUES (1);' || true
     fi
     if [[ "$DB_CREATED" == 1 && "${RBH_E2E_KEEP_DB:-0}" != "1" ]]; then
         test_sql -e "DROP DATABASE $DB;" || true
@@ -107,8 +108,8 @@ test_sql -e "CREATE DATABASE $DB;" \
     || die "cannot create DB $DB (use a fresh name on a disposable MariaDB)"
 DB_CREATED=1
 
-# 2. launch daemon (migrations run on boot)
-start_daemon() {
+# 2. Verify startup requires explicit database initialization.
+launch_daemon() {
     LOG="$(mktemp "${TMPDIR:-/tmp}/rbh-e2e.XXXXXX.log")"
     echo "[setup] launching daemon on :$PORT (log: $LOG)"
     RBH_DATABASE_URL="mysql://root@127.0.0.1/$DB" \
@@ -119,10 +120,13 @@ start_daemon() {
     RBH_LOG="info" \
     RBH_CONSOLE_COLLECT_SECS=2 \
     RBH_LISTEN_ADDR="127.0.0.1:$PORT" \
-        env -u RBH_REV8_WRITERS_FILE -u RBH_REV8_HSM_PRINCIPAL_FILE \
+        env -u RBH_POLICY_WRITERS_FILE -u RBH_HSM_PRINCIPAL_FILE \
         "$BIN_DAEMON" >"$LOG" 2>&1 &
     PID=$!
+}
 
+start_daemon() {
+    launch_daemon
     for _ in $(seq 1 30); do
         kill -0 "$PID" 2>/dev/null || die "daemon exited before becoming healthy (see $LOG)"
         if grep -q 'HTTP server listening' "$LOG" &&
@@ -144,6 +148,15 @@ wait_for_daemon_exit() {
         die "daemon did not exit within 5s of $1 (see $LOG)"
     fi
 }
+
+launch_daemon
+wait_for_daemon_exit "startup with an empty database"
+startup_status=0
+wait "$PID" || startup_status=$?
+PID=""
+[[ "$startup_status" == 1 ]] || die "daemon did not reject an empty database (see $LOG)"
+grep -q 'Initialize an empty database .*schema.sql' "$LOG" || die "missing schema setup hint (see $LOG)"
+test_sql "$DB" < "$SCHEMA_FILE" || die "cannot initialize DB $DB from $SCHEMA_FILE"
 
 start_daemon
 
@@ -279,7 +292,7 @@ legacy_error="$(curl -sS -X POST "$API/api/policies" -H 'Content-Type: applicati
     -d '{"name":"e2e_threshold","kind":"alert","filesystem":"lustre","trigger":"count > 3"}' \
     -w '\n%{http_code}')"
 assert_http "${legacy_error##*$'\n'}" "400" "legacy policy rejected"
-assert_contains "$legacy_error" "hsm.storage.io/v1alpha3" "policy format error identifies Rev.8"
+assert_contains "$legacy_error" "hsm.storage.io/v1alpha3" "policy format error identifies the supported version"
 metrics="$(curl -fsS "$API/api/metrics")"
 assert_contains "$metrics" 'rbh_catalog_entries{backend="lustre",filesystem="lustre"} 8' "/metrics contains scoped catalog count"
 
@@ -294,31 +307,33 @@ PID=""
 grep -q "robinhood-rs daemon stopped" "$LOG" \
     || die "daemon log missing 'daemon stopped' line (see $LOG)"
 
-# 6. Simulate loss of a durable dependency of the Rev.8 run queue.
+# 6. Simulate loss of a durable dependency of the run queue.
 assert_queue_failure() {
     wait_for_daemon_exit "$1"
     local status=0
     wait "$PID" || status=$?
     PID=""
     [[ "$status" == 1 ]] || die "$1 returned exit status $status (see $LOG)"
-    grep -q "Rev.8 scheduler stopped" "$LOG" || die "daemon log missing scheduler failure (see $LOG)"
+    grep -q "policy scheduler stopped" "$LOG" || die "daemon log missing scheduler failure (see $LOG)"
 }
 
 start_daemon
+out="$(curl -fsS "$API/api/entries/count?filesystem=$FILESYSTEM")"
+assert_contains "$out" '"count":8' "catalog retained across restart"
 echo "[fault] hiding the run queue lock table"
-test_sql "$DB" -e 'RENAME TABLE rev8_worker_lock TO rev8_worker_lock_e2e_fault;'
+test_sql "$DB" -e 'RENAME TABLE policy_worker_lock TO policy_worker_lock_e2e_fault;'
 WORKER_LOCK_RENAMED=1
 assert_queue_failure "run queue store failure"
-test_sql "$DB" -e 'RENAME TABLE rev8_worker_lock_e2e_fault TO rev8_worker_lock;'
+test_sql "$DB" -e 'RENAME TABLE policy_worker_lock_e2e_fault TO policy_worker_lock;'
 WORKER_LOCK_RENAMED=0
 
 start_daemon
 echo "[fault] removing the run queue lock row"
-test_sql "$DB" -e 'DELETE FROM rev8_worker_lock WHERE id = 1;'
+test_sql "$DB" -e 'DELETE FROM policy_worker_lock WHERE id = 1;'
 WORKER_LOCK_ROW_REMOVED=1
 assert_queue_failure "missing run queue lock row"
-grep -q "Rev.8 worker lock row is missing" "$LOG" || die "daemon log missing worker lock error (see $LOG)"
-test_sql "$DB" -e 'INSERT INTO rev8_worker_lock (id) VALUES (1);'
+grep -q "policy worker lock row is missing" "$LOG" || die "daemon log missing worker lock error (see $LOG)"
+test_sql "$DB" -e 'INSERT INTO policy_worker_lock (id) VALUES (1);'
 WORKER_LOCK_ROW_REMOVED=0
 
 echo "[done] all assertions passed"
