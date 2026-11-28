@@ -1,15 +1,17 @@
 mod migration;
+mod native_admission;
 mod native_recovery;
 mod preflight;
-pub(super) use migration::PoolRecovery;
+pub(super) use migration::{PoolPreflight, PoolRecovery};
+pub(super) use native_admission::NativePreflight;
 pub(super) use native_recovery::NativeRecovery;
-pub(super) use preflight::PoolPreflights;
+pub(super) use preflight::Preflights;
 
 use std::{
     collections::BTreeMap,
     ops::ControlFlow,
-    sync::OnceLock,
-    time::{Duration, Instant},
+    sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use chrono::{DateTime, Utc};
@@ -24,10 +26,7 @@ use crate::{
     PolicyError,
     rev8::{
         self, ActionKind, BudgetLimits, CompiledPolicy, DB_EPOCH_MICROS, Invocation,
-        execution::{
-            Admission, Decision, FidObservation, Generation, LustreHsm, NativeHsm, Profile, Submission,
-            SubmissionDeferral, SubmissionGate,
-        },
+        execution::{Admission, Generation, Profile},
         heat::{self, HeatProfile},
         invalid, push_expression,
         resources::safety_matches,
@@ -165,7 +164,7 @@ impl AdmissionBlock {
 struct Dispatch<'a> {
     run: &'a Rev8Run,
     policy: &'a CompiledPolicy,
-    admission: &'a Admission,
+    admission: Arc<Admission>,
     config: &'a FileSystemConfig,
     heat: Option<&'a HeatProfile>,
     preflight_until: OnceLock<Instant>,
@@ -443,7 +442,7 @@ impl PolicyStore {
         let dispatch = Dispatch {
             run: &run,
             policy: &policy,
-            admission: &admission,
+            admission: Arc::new(admission),
             config: &config,
             heat,
             preflight_until: OnceLock::new(),
@@ -750,7 +749,7 @@ impl PolicyStore {
     }
 
     async fn admit_candidate(
-        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, mut invocation: Invocation,
+        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: Invocation,
         worker: &mut Transaction<'_, MySql>,
     ) -> Result<ControlFlow<&'static str>, PolicyError> {
         let fs = dispatch.policy.filesystem.as_str();
@@ -771,101 +770,7 @@ impl PolicyStore {
                 .admit_pool_migration(dispatch, candidate, &invocation, worker)
                 .await;
         }
-        let fid = decode_fid(&candidate.fid)?;
-        let mount = &dispatch.config.mount_path;
-        let snapshot = match self.backend().observe(mount, fid).await {
-            Ok(FidObservation::Present(snapshot)) => snapshot,
-            Ok(FidObservation::Missing { .. }) => {
-                return self
-                    .record_deferred(dispatch, candidate, &invocation, "fid_missing")
-                    .await
-                    .map(ControlFlow::Continue);
-            }
-            Err(error) => {
-                return self
-                    .record_deferred(dispatch, candidate, &invocation, &error)
-                    .await
-                    .map(ControlFlow::Continue);
-            }
-        };
-        let seen = &snapshot.generation;
-        if seen.size != candidate.size || seen.mtime != candidate.mtime || seen.ctime != candidate.ctime {
-            return self
-                .record_deferred(dispatch, candidate, &invocation, "catalog_generation_changed")
-                .await
-                .map(ControlFlow::Continue);
-        }
-        if matches!(invocation.kind, ActionKind::Release | ActionKind::Restore) {
-            invocation.archive_id = snapshot.state.archive_id;
-        }
-        if let Decision::Defer(reason) = dispatch.admission.authorize(fs, &invocation) {
-            return self
-                .record_deferred(dispatch, candidate, &invocation, &reason)
-                .await
-                .map(ControlFlow::Continue);
-        }
-        if let Err(reason) = invocation.precondition(&snapshot.state) {
-            return self
-                .record_deferred(dispatch, candidate, &invocation, reason)
-                .await
-                .map(ControlFlow::Continue);
-        }
-        let operation = self
-            .reserve_operation(dispatch, candidate, &invocation, seen, None)
-            .await?;
-
-        // Hold the policy head through revalidation and the request. A disable,
-        // replacement or delete cannot commit in the middle of issuing it.
-        let mut tx = self.pool.begin().await?;
-        let active = current_revision(&mut tx, dispatch.run).await?;
-        if !lock_permit(&mut tx, operation).await? {
-            return Ok(ControlFlow::Continue(()));
-        }
-        let (state, attempted, reason, terminal_class) = if !active || !dispatch.admission.window_open(Utc::now()) {
-            ("deferred", false, Some("policy_or_window_inactive".into()), None)
-        } else {
-            let live = self.backend().observe(mount, fid).await;
-            match live {
-                Ok(FidObservation::Present(current))
-                    if current.generation == snapshot.generation && current.state == snapshot.state =>
-                {
-                    let gate = native_submission_gate(dispatch, invocation.kind);
-                    if let ControlFlow::Break(reason) = gate.check() {
-                        ("deferred", false, Some(reason.reason().into()), None)
-                    } else {
-                        // Verify that the worker transaction still owns its lock.
-                        // The committed operation reserves the FID and budget even
-                        // if the connection is lost after this check.
-                        if !verify_worker_permit(worker).await? {
-                            (
-                                "deferred",
-                                false,
-                                Some("permit_store_requires_synchronous_commit".into()),
-                                None,
-                            )
-                        } else {
-                            match self.backend().submit(mount, fid, invocation, seen, gate).await {
-                                Submission::Accepted => ("submitted", true, None, None),
-                                Submission::Deferred(reason) => ("deferred", false, Some(reason.reason().into()), None),
-                                Submission::Rejected { error, class } => {
-                                    ("failed", true, Some(error), class.map(|class| class.name()))
-                                }
-                                Submission::Unknown(error) => ("unknown", true, Some(error), None),
-                            }
-                        }
-                    }
-                }
-                _ => ("deferred", false, Some("target_changed_before_submit".into()), None),
-            }
-        };
-        sqlx::query(
-            "UPDATE rev8_operations SET state = ?, attempted = ?, reason = ?, terminal_error_class = ?,
-             accepted_at = CASE WHEN ? = 'submitted' THEN UTC_TIMESTAMP(6) ELSE NULL END,
-             finished_at = CASE WHEN ? = 'failed' THEN UTC_TIMESTAMP(6) ELSE NULL END WHERE id = ? AND state = 'submitting'",
-        ).bind(state).bind(attempted).bind(reason.as_deref().map(short_reason)).bind(terminal_class)
-            .bind(state).bind(state).bind(operation).execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(ControlFlow::Continue(()))
+        self.admit_native(dispatch, candidate, invocation, worker).await
     }
 
     async fn reserve_operation(
@@ -917,10 +822,6 @@ impl PolicyStore {
         self.finish_native_recoveries().await?;
         self.start_pending_pool_recoveries(entries).await?;
         self.start_pending_native_recoveries(entries).await
-    }
-
-    fn backend(&self) -> &dyn NativeHsm {
-        self.runtime.as_ref().map_or(&LustreHsm, |runtime| runtime.hsm.as_ref())
     }
 }
 
@@ -986,37 +887,6 @@ fn elapsed_ms(run: &Rev8Run) -> u64 {
     (Utc::now() - run.started_at.expect("run started"))
         .num_milliseconds()
         .max(0) as u64
-}
-
-fn native_submission_gate(dispatch: &Dispatch<'_>, action: ActionKind) -> SubmissionGate {
-    // Anchor the persisted run age before blocking. A wall-clock step during
-    // preparation must not extend the remaining duration budgets.
-    let checked_at = Instant::now();
-    let already_elapsed = elapsed_ms(dispatch.run);
-    let remaining = |limit: u64| Duration::from_millis(limit.saturating_sub(already_elapsed));
-    let window_open = dispatch.admission.window_check();
-    let policy_limit = dispatch.policy.budget.duration_ms.map(remaining);
-    let safety_limit = dispatch
-        .admission
-        .safety
-        .iter()
-        .filter(|scope| safety_matches(scope, dispatch.policy.filesystem.as_str(), action))
-        .filter_map(|scope| BudgetLimits::from_safety(scope).duration_ms)
-        .min()
-        .map(remaining);
-    SubmissionGate(Box::new(move || {
-        if !window_open() {
-            return ControlFlow::Break(SubmissionDeferral::WindowClosed);
-        }
-        let elapsed = checked_at.elapsed();
-        if policy_limit.is_some_and(|limit| elapsed >= limit) {
-            return ControlFlow::Break(SubmissionDeferral::PolicyRunDuration);
-        }
-        if safety_limit.is_some_and(|limit| elapsed >= limit) {
-            return ControlFlow::Break(SubmissionDeferral::SystemSafetyRunDuration);
-        }
-        ControlFlow::Continue(())
-    }))
 }
 
 fn usage_for_scope(stats: &[Usage], filesystem: &str, scope: Option<&Value>) -> Usage {

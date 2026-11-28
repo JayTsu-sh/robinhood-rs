@@ -1,20 +1,32 @@
-use std::{borrow::Cow, collections::BTreeMap, future::Future, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, future::Future, path::PathBuf, sync::Arc, time::Instant};
 
-use lustre_api::{LuFid, StripeInfo};
+use lustre_api::LuFid;
 use rbh_entry_store::FileSystemId;
 use sqlx::MySqlPool;
 use tokio::{sync::Mutex, task::JoinHandle};
 
-use super::{BATCH_SIZE, Generation, PolicyError};
+use super::{BATCH_SIZE, PolicyError};
 
-#[derive(Default, Clone)]
-pub(in crate::store) struct PoolPreflights(Arc<Mutex<BTreeMap<FileSystemId, PendingRead>>>);
+pub(in crate::store) struct Preflights<T>(Arc<Mutex<BTreeMap<FileSystemId, PendingRead<T>>>>);
+
+impl<T> Default for Preflights<T> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<T> Clone for Preflights<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct PreflightKey {
     pub run: u64,
     pub revision: u64,
     pub fid: LuFid,
+    pub branch: i64,
     pub mount: PathBuf,
     pub catalog_version: (u64, i64, i64),
 }
@@ -25,16 +37,14 @@ pub(super) struct PreflightRequest {
     pub run_deadline: Instant,
 }
 
-pub(super) type PreflightObservation = Result<(Generation, StripeInfo), Cow<'static, str>>;
-
-struct PendingRead {
+struct PendingRead<T> {
     key: PreflightKey,
     deadline: Instant,
-    task: JoinHandle<PreflightObservation>,
+    task: JoinHandle<T>,
 }
 
-pub(super) enum PreflightResult {
-    Observed(PreflightObservation, Instant),
+pub(super) enum PreflightResult<T> {
+    Observed(T, Instant),
     Waiting(PreflightWait),
 }
 
@@ -46,7 +56,7 @@ pub(super) enum PreflightWait {
 }
 
 impl PreflightWait {
-    pub(super) fn reason(&self) -> &'static str {
+    pub(super) fn migration_reason(&self) -> &'static str {
         match self {
             Self::Busy => "migration_preflight_busy",
             Self::Pending => "migration_preflight_pending",
@@ -54,15 +64,24 @@ impl PreflightWait {
             Self::WorkerStopped => "migration_preflight_worker_stopped",
         }
     }
+
+    pub(super) fn native_reason(&self) -> &'static str {
+        match self {
+            Self::Busy => "native_hsm_preflight_busy",
+            Self::Pending => "native_hsm_preflight_pending",
+            Self::TimedOut => "native_hsm_preflight_timeout",
+            Self::WorkerStopped => "native_hsm_preflight_worker_stopped",
+        }
+    }
 }
 
-impl PoolPreflights {
+impl<T: Send + 'static> Preflights<T> {
     #[tracing::instrument(skip_all, fields(%filesystem, run_id = request.key.run, fid = %request.key.fid))]
     pub(super) async fn read<F>(
         &self, pool: &MySqlPool, filesystem: &FileSystemId, request: PreflightRequest, observe: F,
-    ) -> Result<PreflightResult, PolicyError>
+    ) -> Result<PreflightResult<T>, PolicyError>
     where
-        F: Future<Output = PreflightObservation> + Send + 'static,
+        F: Future<Output = T> + Send + 'static,
     {
         use PreflightResult::*;
         use PreflightWait::*;
@@ -135,7 +154,7 @@ impl PoolPreflights {
                 Ok(match result {
                     Ok(observation) => Observed(observation, deadline),
                     Err(error) => {
-                        tracing::warn!(%error, "pool migration preflight worker stopped");
+                        tracing::warn!(%error, "Lustre preflight worker stopped");
                         Waiting(WorkerStopped)
                     }
                 })

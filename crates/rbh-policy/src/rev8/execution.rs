@@ -2,7 +2,17 @@
 
 mod governance;
 
-use std::{io, ops::ControlFlow, os::unix::fs::MetadataExt, path::Path, sync::Arc, thread};
+use std::{
+    io,
+    ops::ControlFlow,
+    os::unix::fs::MetadataExt,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
 
 use async_trait::async_trait;
 use lustre_api::{HsmAction, HsmRequestBuilder, HsmState, HsmUserStateInfo, LuFid, LustreApi};
@@ -83,6 +93,7 @@ pub enum SubmissionDeferral {
     SystemSafetyRunDuration,
     MountChanged,
     MountIdentityUnavailable,
+    DispatchCancelled,
 }
 
 impl SubmissionDeferral {
@@ -93,16 +104,55 @@ impl SubmissionDeferral {
             Self::SystemSafetyRunDuration => "system_safety_run_duration",
             Self::MountChanged => "hsm_mount_changed",
             Self::MountIdentityUnavailable => "hsm_mount_identity_unavailable",
+            Self::DispatchCancelled => "native_hsm_dispatch_cancelled",
         }
     }
 }
 
-/// Recheck the current time against the admitted run immediately before submission.
-pub struct SubmissionGate(pub(crate) Box<dyn Fn() -> ControlFlow<SubmissionDeferral> + Send>);
+/// Checks admission and claims the request at the ioctl boundary.
+pub struct SubmissionGate {
+    status: Box<dyn Fn() -> ControlFlow<SubmissionDeferral> + Send>,
+    open: Arc<AtomicBool>,
+}
+
+pub(crate) struct SubmissionOwner(Arc<AtomicBool>);
+
+impl Drop for SubmissionOwner {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 impl SubmissionGate {
+    pub(crate) fn owned(
+        status: impl Fn() -> ControlFlow<SubmissionDeferral> + Send + 'static,
+    ) -> (Self, SubmissionOwner) {
+        let open = Arc::new(AtomicBool::new(true));
+        let owner = SubmissionOwner(Arc::clone(&open));
+        (
+            Self {
+                status: Box::new(status),
+                open,
+            },
+            owner,
+        )
+    }
+
+    pub(crate) fn status(&self) -> ControlFlow<SubmissionDeferral> {
+        if !self.open.load(Ordering::Acquire) {
+            return ControlFlow::Break(SubmissionDeferral::DispatchCancelled);
+        }
+        (self.status)()
+    }
+
+    /// Claim a single request. A successful claim is the handoff to the
+    /// ioctl. Losing the owner before the claim prevents that handoff.
     pub fn check(&self) -> ControlFlow<SubmissionDeferral> {
-        (self.0)()
+        if self.open.swap(false, Ordering::AcqRel) {
+            (self.status)()
+        } else {
+            ControlFlow::Break(SubmissionDeferral::DispatchCancelled)
+        }
     }
 }
 
@@ -278,7 +328,7 @@ impl NativeHsm for LustreHsm {
                         ..
                     },
                 ) => {
-                    if let ControlFlow::Break(reason) = gate.check() {
+                    if let ControlFlow::Break(reason) = gate.status() {
                         return Submission::Deferred(reason);
                     }
                     let class = if errno == libc::EIO {
@@ -357,5 +407,21 @@ impl Invocation {
             ActionKind::Restore => !flags.contains(S::RELEASED) && self.archive_id == state.archive_id,
             ActionKind::PoolMigrate => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_dispatch_owner_revokes_an_unclaimed_request() {
+        let (gate, owner) = SubmissionGate::owned(|| ControlFlow::Continue(()));
+        assert_eq!(gate.status(), ControlFlow::Continue(()));
+        drop(owner);
+        assert_eq!(
+            std::thread::spawn(move || gate.check()).join().unwrap(),
+            ControlFlow::Break(SubmissionDeferral::DispatchCancelled)
+        );
     }
 }

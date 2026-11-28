@@ -42,7 +42,7 @@ struct HsmFixture {
     interrupt_request: AtomicBool,
     reject_request: AtomicBool,
     sent: Notify,
-    hold_observation: Mutex<Option<LuFid>>,
+    hold_observation: Mutex<Option<(LuFid, u8)>>,
     observation_started: Notify,
     resume_observation: Notify,
     hold_submission: AtomicBool,
@@ -64,7 +64,18 @@ impl NativeHsm for HsmFixture {
     async fn observe(&self, _: &Path, fid: LuFid) -> Result<FidObservation, String> {
         let held = {
             let mut hold = self.hold_observation.lock().unwrap();
-            *hold == Some(fid) && hold.take().is_some()
+            match hold.as_mut() {
+                Some((target, remaining)) if *target == fid => {
+                    if *remaining == 0 {
+                        hold.take();
+                        true
+                    } else {
+                        *remaining -= 1;
+                        false
+                    }
+                }
+                _ => false,
+            }
         };
         if held {
             self.observation_started.notify_one();
@@ -423,7 +434,7 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     plain_preview["spec"]["trigger"] = json!({"type": "manual"});
     let plain_policy = env.create(&plain_preview).await;
     let plain_run = env.queue(plain_policy).await;
-    *env.hsm.hold_observation.lock().unwrap() = Some(first);
+    *env.hsm.hold_observation.lock().unwrap() = Some((first, 0));
     tokio::time::timeout(Duration::from_secs(3), async {
         env.tick().await;
         env.hsm.observation_started.notified().await;
@@ -680,8 +691,8 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
             .contains(HsmState::NOARCHIVE)
     );
 
-    // Rebind while the first batch is observing a file, before any submit.
-    // The old batch records a deferral and the new revision gets one attempt.
+    // Rebind while the final live lookup is blocked. Another scope can
+    // preview and the old revision cannot reserve or submit the FID.
     env.hsm.reject_request.store(false, Ordering::SeqCst);
     let racing = env.file(3, 512, HsmState::empty(), 0).await;
     let mut racing_policy = policy.clone();
@@ -691,7 +702,7 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     racing_policy["spec"]["mode"] = "one_shot".into();
     racing_policy["spec"]["rules"]["entries"][0]["match"] = json!({"field": "object.size", "op": "eq", "value": 512});
     let racing_id = env.create(&racing_policy).await;
-    *env.hsm.hold_observation.lock().unwrap() = Some(racing);
+    *env.hsm.hold_observation.lock().unwrap() = Some((racing, 1));
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let running = {
         let entries = env.entries.clone();
@@ -704,11 +715,34 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     )
     .await
     .unwrap();
+    let old_runs = server
+        .get(&format!("/api/policies/{racing_id}/runs"))
+        .await
+        .json::<Vec<Value>>();
+    let old_run = old_runs[0]["id"].as_u64().unwrap();
+    assert!(env.operations(racing_id, old_run).await.is_empty());
+    let other_run = env.queue(plain_policy).await;
+    env.reconcile_until(&env.stores, async || {
+        let runs = server
+            .get(&format!("/api/policies/{plain_policy}/runs"))
+            .await
+            .json::<Vec<Value>>();
+        runs.iter()
+            .any(|run| run["id"] == other_run && run["state"] == "previewed")
+    })
+    .await;
     safety["spec"]["limits"]["maxUnknownOutstanding"] = 5.into();
-    server.put(&safety_url).json(&safety).await.assert_status_ok();
+    tokio::time::timeout(Duration::from_secs(3), server.put(&safety_url).json(&safety))
+        .await
+        .expect("policy update waited for the Lustre read")
+        .assert_status_ok();
     env.hsm.resume_observation.notify_one();
     running.await.unwrap().unwrap();
-    env.tick().await;
+    env.reconcile_until(&env.stores, async || {
+        env.submitted().last() == Some(&(racing, ActionKind::Archive, 17))
+    })
+    .await;
+    assert!(env.operations(racing_id, old_run).await.is_empty());
     let racing_runs = server
         .get(&format!("/api/policies/{racing_id}/runs"))
         .await

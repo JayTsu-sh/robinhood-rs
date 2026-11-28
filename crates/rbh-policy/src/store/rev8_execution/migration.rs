@@ -9,7 +9,7 @@ use std::{
 
 use chrono::Utc;
 use lustre_api::{
-    LuFid, LustreApi,
+    LuFid, LustreApi, StripeInfo,
     migration::{
         FileVersion, MigrationError, MigrationLimits, MigrationOwnership, MigrationPlacement, MigrationPlan,
         VerifiedPlacement,
@@ -22,7 +22,7 @@ use sqlx::{MySql, QueryBuilder, Transaction, types::Json};
 use super::{
     BATCH_SIZE, Candidate, Dispatch, Generation, Invocation, OPERATION_FIELDS, PolicyError, PolicyStore, Rev8Operation,
     current_revision, decode_fid, elapsed_ms, exclude_recovery_ids, lock_permit,
-    preflight::{PreflightKey, PreflightObservation, PreflightRequest, PreflightResult, PreflightWait},
+    preflight::{PreflightKey, PreflightRequest, PreflightResult, PreflightWait},
     short_reason, verify_worker_permit,
 };
 use crate::{
@@ -34,6 +34,8 @@ use crate::{
         resources::safety_matches,
     },
 };
+
+pub(in crate::store) type PoolPreflight = Result<(Generation, StripeInfo), Cow<'static, str>>;
 
 pub(in crate::store) struct PoolRecovery {
     operation: Rev8Operation,
@@ -82,6 +84,7 @@ impl PolicyStore {
             run: dispatch.run.id,
             revision: dispatch.run.revision,
             fid,
+            branch: candidate.branch,
             mount: dispatch.config.mount_path.clone(),
             catalog_version: (candidate.size, candidate.mtime, candidate.ctime),
         };
@@ -109,13 +112,13 @@ impl PolicyStore {
                     .map(ControlFlow::Continue);
             }
             PreflightResult::Waiting(wait @ PreflightWait::Pending) => {
-                return Ok(ControlFlow::Break(wait.reason()));
+                return Ok(ControlFlow::Break(wait.migration_reason()));
             }
             PreflightResult::Waiting(wait @ PreflightWait::Busy) if dispatch.policy.one_shot => {
-                return Ok(ControlFlow::Break(wait.reason()));
+                return Ok(ControlFlow::Break(wait.migration_reason()));
             }
             PreflightResult::Waiting(wait) => {
-                self.record_deferred(dispatch, candidate, invocation, wait.reason())
+                self.record_deferred(dispatch, candidate, invocation, wait.migration_reason())
                     .await?;
                 return Ok(ControlFlow::Continue(()));
             }
@@ -395,7 +398,7 @@ impl PolicyStore {
 
 async fn observe_pool_source(
     backend: Arc<dyn NativeHsm>, key: PreflightKey, invocation: Invocation, deadline: Instant,
-) -> PreflightObservation {
+) -> PoolPreflight {
     let PreflightKey {
         fid,
         mount,
@@ -403,7 +406,7 @@ async fn observe_pool_source(
         ..
     } = key;
     if Instant::now() >= deadline {
-        return Err(PreflightWait::TimedOut.reason().into());
+        return Err(PreflightWait::TimedOut.migration_reason().into());
     }
     let observation = backend.observe_for_migration(&mount, fid).await.map_err(Cow::Owned)?;
     let FidObservation::Present(observation) = observation else {
@@ -415,7 +418,7 @@ async fn observe_pool_source(
     }
     invocation.precondition(&observation.state)?;
     if Instant::now() >= deadline {
-        return Err(PreflightWait::TimedOut.reason().into());
+        return Err(PreflightWait::TimedOut.migration_reason().into());
     }
     let layout = read_only_lustre(move || LustreApi.migration_source_layout(&mount, &fid))
         .await

@@ -33,7 +33,8 @@ pub struct PolicyStore {
     configured_filesystems: Option<Arc<BTreeSet<FileSystemId>>>,
     pool_recoveries: Arc<tokio::sync::Mutex<BTreeMap<u64, rev8_execution::PoolRecovery>>>,
     native_recoveries: Arc<tokio::sync::Mutex<BTreeMap<u64, rev8_execution::NativeRecovery>>>,
-    pool_preflights: rev8_execution::PoolPreflights,
+    pool_preflights: rev8_execution::Preflights<rev8_execution::PoolPreflight>,
+    native_preflights: rev8_execution::Preflights<rev8_execution::NativePreflight>,
 }
 
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
@@ -55,7 +56,8 @@ impl PolicyStore {
             configured_filesystems: None,
             pool_recoveries: Arc::default(),
             native_recoveries: Arc::default(),
-            pool_preflights: rev8_execution::PoolPreflights::default(),
+            pool_preflights: rev8_execution::Preflights::default(),
+            native_preflights: rev8_execution::Preflights::default(),
         }
     }
 
