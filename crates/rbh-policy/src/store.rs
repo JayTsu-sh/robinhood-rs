@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -23,11 +23,13 @@ mod policy_resources;
 mod read_heat;
 pub use policy_execution::history::{
     HistoryOperation, HistoryPage, LatestRun, OperationFilter, OperationResults, OperationSearch, OperationState,
-    OperationSummary, RunHistory, RunReportSnapshot, RunSearch, RunState,
+    OperationSummary, RunActivationMode, RunHistory, RunReportSnapshot, RunSearch, RunState,
 };
-pub use policy_execution::{PolicyOperation, PolicyRun};
+pub use policy_execution::{PolicyOperation, PolicyRun, RunControl};
 pub use policy_resources::ResourceRevision;
 pub use read_heat::HeatSampler;
+
+type PoolJobHandle = tokio::task::JoinHandle<Result<(), PolicyError>>;
 
 /// MariaDB-backed action policy store.
 #[derive(Clone)]
@@ -35,8 +37,10 @@ pub struct PolicyStore {
     pool: MySqlPool,
     runtime: Option<policy::execution::Runtime>,
     read_heat: Arc<BTreeMap<FileSystemId, HeatProfile>>,
-    configured_filesystems: Option<Arc<BTreeSet<FileSystemId>>>,
+    configured_filesystems: Option<Arc<RwLock<BTreeSet<FileSystemId>>>>,
+    console_mount_sources: Arc<RwLock<BTreeMap<FileSystemId, String>>>,
     pool_recoveries: Arc<tokio::sync::Mutex<BTreeMap<u64, policy_execution::PoolRecovery>>>,
+    pool_jobs: Arc<tokio::sync::Mutex<BTreeMap<u64, PoolJobHandle>>>,
     native_recoveries: Arc<tokio::sync::Mutex<BTreeMap<u64, policy_execution::NativeRecovery>>>,
     native_submissions: Arc<tokio::sync::Mutex<BTreeMap<u64, policy_execution::NativeSubmissionJob>>>,
     pool_preflights: policy_execution::Preflights<policy_execution::PoolPreflight>,
@@ -56,6 +60,9 @@ pub struct PolicyRevision {
     #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_run: Option<LatestRun>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,7 +113,9 @@ impl PolicyStore {
             runtime: None,
             read_heat: Arc::default(),
             configured_filesystems: None,
+            console_mount_sources: Arc::default(),
             pool_recoveries: Arc::default(),
+            pool_jobs: Arc::default(),
             native_recoveries: Arc::default(),
             native_submissions: Arc::default(),
             pool_preflights: policy_execution::Preflights::default(),
@@ -121,16 +130,58 @@ impl PolicyStore {
 
     /// Restrict new policy work to the running daemon's deployment registry.
     pub fn with_configured_filesystems(mut self, filesystems: impl IntoIterator<Item = FileSystemId>) -> Self {
-        self.configured_filesystems = Some(Arc::new(filesystems.into_iter().collect()));
+        self.configured_filesystems = Some(Arc::new(RwLock::new(filesystems.into_iter().collect())));
         self
     }
 
+    pub fn set_filesystem_configured(&self, filesystem: &FileSystemId, enabled: bool) {
+        if let Some(configured) = &self.configured_filesystems {
+            let mut configured = configured.write().expect("configured filesystem lock");
+            if enabled {
+                configured.insert(filesystem.clone());
+            } else {
+                configured.remove(filesystem);
+            }
+        }
+    }
+
+    pub fn set_console_mount_source(&self, filesystem: &FileSystemId, source: String) {
+        self.console_mount_sources
+            .write()
+            .expect("console mount sources lock")
+            .insert(filesystem.clone(), source);
+    }
+
+    fn console_mount_source(&self, filesystem: &FileSystemId) -> Option<String> {
+        self.console_mount_sources
+            .read()
+            .expect("console mount sources lock")
+            .get(filesystem)
+            .cloned()
+    }
+
+    async fn console_mount_matches(&self, config: &FileSystemConfig) -> bool {
+        let Some(source) = self.console_mount_source(&config.id) else {
+            return true;
+        };
+        let path = config.mount_path.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            policy::execution::lustre_call(move || {
+                lustre_api::pools::PoolMount::open(&path).is_ok_and(|mount| mount.source() == source)
+            }),
+        )
+        .await
+        .is_ok_and(|result| result.unwrap_or(false))
+    }
+
     fn ensure_configured(&self, filesystem: &FileSystemId) -> Result<(), PolicyError> {
-        if self
-            .configured_filesystems
-            .as_ref()
-            .is_some_and(|configured| !configured.contains(filesystem))
-        {
+        if self.configured_filesystems.as_ref().is_some_and(|configured| {
+            !configured
+                .read()
+                .expect("configured filesystem lock")
+                .contains(filesystem)
+        }) {
             return Err(policy::invalid(format!(
                 "filesystem {filesystem} is not configured in this deployment"
             )));
@@ -202,7 +253,7 @@ impl PolicyStore {
         } else {
             None
         };
-        let next_run = input.schedule_after(Utc::now())?;
+        let next_run = input.first_run(Utc::now())?;
         let mut tx = self.lock_configuration().await?;
         let update = match write {
             PolicyWrite::Create => None,
@@ -216,6 +267,13 @@ impl PolicyStore {
                 Some((id, check_policy_revision(id, expected_revision, current)?))
             }
         };
+        // Removal and unmount take this lock and can complete during the probes above.
+        self.ensure_configured(input.filesystem())?;
+        if !self.console_mount_matches(&config).await {
+            return Err(policy::invalid(
+                "registered Lustre mount source has changed or is unavailable",
+            ));
+        }
         let (policy, bindings) = Self::bind_policy(&mut tx, input).await?;
         policy.validate_capabilities(&config)?;
         if let Some(migration) = policy.pool_migration() {
@@ -341,6 +399,7 @@ impl PolicyStore {
 
     fn retain_configured_policies(&self, rows: &mut Vec<PolicyRevision>) {
         if let Some(configured) = &self.configured_filesystems {
+            let configured = configured.read().expect("configured filesystem lock");
             rows.retain(|row| {
                 row.definition["spec"]["target"]["filesystem"]
                     .as_str()
@@ -400,7 +459,15 @@ impl PolicyStore {
         let policy = self
             .compile_revision(policy::parse(&row.definition)?, &bindings)
             .await?;
-        self.preview_compiled(entries, &policy, row.revision, bindings, fid)
+        policy
+            .preview_with_heat(
+                entries,
+                row.revision,
+                bindings,
+                self.read_heat.get(&policy.filesystem),
+                fid,
+                true,
+            )
             .await
     }
 
@@ -418,12 +485,26 @@ impl PolicyStore {
         let migration = policy
             .pool_migration()
             .ok_or_else(|| policy::invalid("draft tiering preview requires lustre.pool_migrate"))?;
+        let config = policy::validate_filesystem(entries, &policy.filesystem).await?;
+        if !self.console_mount_matches(&config).await {
+            return Err(policy::invalid(
+                "registered Lustre mount source has changed or is unavailable",
+            ));
+        }
         if !policy.has_directory_scope() {
-            let config = policy::validate_filesystem(entries, &policy.filesystem).await?;
             policy.validate_capabilities(&config)?;
             migration.validate_pools(&config.mount_path).await?;
         }
-        self.preview_compiled(entries, &policy, (), bindings, None).await
+        policy
+            .preview_with_heat(
+                entries,
+                (),
+                bindings,
+                self.read_heat.get(&policy.filesystem),
+                None,
+                true,
+            )
+            .await
     }
 
     async fn preview_compiled<Revision>(
@@ -431,7 +512,14 @@ impl PolicyStore {
         fid: Option<lustre_api::LuFid>,
     ) -> Result<PreviewResult<Revision>, PolicyError> {
         policy
-            .preview_with_heat(entries, revision, bindings, self.read_heat.get(&policy.filesystem), fid)
+            .preview_with_heat(
+                entries,
+                revision,
+                bindings,
+                self.read_heat.get(&policy.filesystem),
+                fid,
+                false,
+            )
             .await
     }
 }

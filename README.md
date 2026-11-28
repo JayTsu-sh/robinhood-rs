@@ -1,20 +1,252 @@
 # robinhood-rs
 
-A Rust rewrite of the [Robinhood Policy Engine](https://github.com/cea-hpc/robinhood)
-for Lustre filesystems. Policies are stored in a database and managed
-via REST; an operator-facing `rbh` CLI wraps the REST surface.
+robinhood-rs is a Rust rewrite of the [Robinhood Policy Engine](https://github.com/cea-hpc/robinhood).
+It maintains a filesystem catalog from scans and changelogs. Use the `rbh` CLI
+or REST API to query the catalog, and use the web console to configure, preview,
+and monitor online tiering between OST pools on the same Lustre filesystem.
+Native Lustre HSM actions are available through the policy API. The cross-storage
+HSM card in the console is marked **暂未开放**.
 
-The daemon uses policies for native Lustre HSM and optional online
-tiering. It maintains its catalog through scans and filesystem change
-sources.
+## Try the project locally
 
----
+From the repository root, start the development stack with Docker Compose and
+BuildKit. The image includes the compiled console, and MariaDB imports the
+schema when its volume is first created.
+
+```sh
+docker compose -f dev/compose/docker-compose.yml up -d --build
+curl -fsS --retry 10 --retry-connrefused http://127.0.0.1:8080/api/health
+docker compose -f dev/compose/docker-compose.yml exec rbh-daemon rbh --filesystem lustre status
+```
+
+Open [the console](http://127.0.0.1:8080/console/). This stack is for trying the
+UI, catalog, and API with development data. To seed sample data and preview a
+policy, follow the [Compose guide](dev/compose/README.md).
+
+## Deploy a container that mounts Lustre
+
+Use rootful Docker Engine and Compose on a Linux x86-64 Lustre client node.
+Install and load the host's Lustre and LNet kernel modules, configure LNet,
+verify that `/dev/lnet` exists, and check MGS connectivity from the host with
+`lctl ping <MGS-NID>`. The image supplies
+the Lustre client tools and shared libraries. The daemon creates the mounts
+under `/mnt/rbh-lustre` inside the container when you add a cluster.
+[Lustre client setup](https://wiki.lustre.org/Mounting_a_Lustre_File_System_on_Client_Nodes)
+
+1. Initialize a database as described in [Initialize MariaDB](#2-initialize-mariadb).
+   Use a MariaDB URL reachable from the host network.
+2. Create `writers.json` with the [writer setup](#3-configure-and-start-the-daemon).
+   Install only the digest file in a dedicated container configuration directory.
+   Keep the operator's token file on the host. For actual migration, place
+   `principal.json` in the configuration directory and set
+   `RBH_HSM_PRINCIPAL_FILE=/run/rbh-config/principal.json`.
+3. Supply the database URL and a stable observer ID, then start the daemon.
+   Use the same observer ID and database when recreating the container so
+   the daemon can restore saved mounts. The container starts with an empty
+   filesystem registry unless you set `RBH_FILESYSTEMS_JSON`.
+
+```sh
+export RBH_DATABASE_URL='mysql://rbh_service:PASSWORD@127.0.0.1:3306/rbh_entries'
+export RBH_CONTAINER_CONFIG_DIR=/etc/robinhood/container
+export RBH_CONSOLE_OBSERVER_ID='tiering-node-1'
+sudo install -d -m 0700 "$RBH_CONTAINER_CONFIG_DIR"
+sudo install -m 0600 "$writer_dir/writers.json" "$RBH_CONTAINER_CONFIG_DIR/writers.json"
+docker compose -f packaging/docker/compose.yml up -d --build
+curl -fsS --retry 10 --retry-connrefused http://127.0.0.1:8080/api/health
+```
+
+4. Open `http://127.0.0.1:8080/console/`. Under **Lustre 集群** choose
+   **添加集群** and **创建新挂载**. Enter the Lustre filesystem name and MGS NIDs,
+   test the connection, and leave **添加后立即挂载** selected. Select
+   **daemon 重启后恢复挂载** to restore it on the next start. Use the cluster
+   details to unmount it after associated scans and operations finish.
+
+The Compose service uses the host network and `/dev/lnet` and grants
+`SYS_ADMIN` for mounts, `NET_ADMIN` for LNet connectivity checks, and
+`DAC_READ_SEARCH` for the FID-to-path verification used by directory-scoped
+policies on mounts with `nouser_fid2path`. Its AppArmor setting defaults to
+`unconfined` to permit the mount. On hosts with a
+profile that permits Lustre mounts and the required device access, set
+`RBH_CONTAINER_APPARMOR_PROFILE` to the installed profile name. The default
+HTTP listener is on loopback. The optional `RBH_CONTAINER_IMAGE` selects the
+image tag, which defaults to `robinhood-rs:lustre`.
+[Managed mount Compose file](packaging/docker/compose.yml)
+
+## Deploy on a Lustre client
+
+### 1. Build the daemon, CLI, and console
+
+Run these commands on a Linux build host with Rust and Cargo, a C toolchain,
+Clang/libclang for bindgen, Lustre client headers and `liblustreapi`, and Node.js
+22 with npm. The runtime host needs the matching Lustre client tools and shared
+libraries. Use a Lustre mount visible to the daemon and readable by its service
+account.
+
+```sh
+cargo build --locked --release -p robinhood-rs -p rbh-cli
+npm --prefix web ci
+npm --prefix web run build
+```
+
+With Cargo's default target directory, the binaries are
+`target/release/robinhood` and `target/release/rbh`. The console build is in
+`web/dist/`.
+
+### 2. Initialize MariaDB
+
+As a database administrator, import the current schema into a new, empty
+database. Use a dedicated database account for the daemon with
+`SELECT`, `INSERT`, `UPDATE`, and `DELETE` on that database. For an existing
+development database with a different schema version, create a separate empty
+database and point the daemon at it.
+
+```sh
+mariadb --execute 'CREATE DATABASE rbh_entries'
+mariadb rbh_entries < crates/rbh-entry-store/schema.sql
+```
+
+### 3. Configure and start the daemon
+
+For console writes, configure a writer before starting the daemon. The
+`RBH_POLICY_WRITERS_FILE` JSON file maps writer names to SHA-256 digests.
+Generate a local test credential in the shell that will start the foreground
+daemon. Use the contents of `token` as the operator's bearer token.
+
+```sh
+umask 077
+writer_dir=$(mktemp -d)
+openssl rand -hex 32 | tr -d '\n' > "$writer_dir/token"
+digest=$(sha256sum "$writer_dir/token" | cut -d ' ' -f 1)
+printf '{"operator":"%s"}\n' "$digest" > "$writer_dir/writers.json"
+export RBH_POLICY_WRITERS_FILE="$writer_dir/writers.json"
+```
+
+For a service deployment, install the binaries, console, and systemd unit
+using the [packaging instructions](packaging/README.md#first-time-install).
+Put the database URL, listener, filesystem registry, and absolute writer-file
+path in the service environment file. Give the service account read access to
+the writer file. The packaged service serves the console from
+`/usr/share/robinhood/console` by default. To try the same deployment in the
+foreground from the repository checkout, run the following after replacing the
+database credentials and mount path.
+
+```sh
+export RBH_DATABASE_URL='mysql://rbh_service:PASSWORD@127.0.0.1:3306/rbh_entries'
+export RBH_LISTEN_ADDR='127.0.0.1:8080'
+export RBH_CONSOLE_DIR="$PWD/web/dist"
+export RBH_FILESYSTEMS_JSON='[{"id":"lustre","backend":"lustre","mount_path":"/mnt/lustre","capabilities":{"changelog":false,"namespace":true,"purge":true,"hsm":true,"stripe":true,"ost":true}}]'
+./target/release/robinhood
+```
+
+An empty catalog triggers a baseline scan. To keep it current from Lustre
+events, register a changelog reader per MDT on the MDS. Set the filesystem's
+`capabilities.changelog` to `true` and add its `lustre_changelog` entries
+with the actual `mdt` and `reader_id` values. Include `LYOUT` in the changelog
+mask for layout refresh. [Filesystem configuration](#configuration)
+
+Use loopback for local access. For remote operators, serve `/console/` and
+`/api/` on the same HTTPS origin through a reverse proxy.
+[Console deployment](packaging/README.md#build-and-serve-the-web-console)
+
+From a second shell, check health and inspect the catalog. The CLI's
+`--filesystem` flag takes the configured ID, such as `lustre`. For a remote
+daemon, set `RBH_API_URL` to its API origin.
+
+```sh
+curl -fsS http://127.0.0.1:8080/api/health
+curl -fsS http://127.0.0.1:8080/api/filesystems
+./target/release/rbh --filesystem lustre status
+./target/release/rbh --filesystem lustre find --size +1M --sort size --desc
+./target/release/rbh --filesystem lustre report fs-info
+```
+
+To index a test subtree on demand, run
+`./target/release/rbh --filesystem lustre scan --root /mnt/lustre/example`.
+Use a directory that exists under the registered mount.
+
+For daemon-managed mounts, set `RBH_LUSTRE_MANAGED_ROOT` and give the service
+mount privileges. The console can then create mounts, unmount them, and restore
+them after a restart when configured to do so.
+[Managed mounts](packaging/README.md#daemon-managed-lustre-mounts)
+
+## Run a tiering policy from the console
+
+1. Open `/console/` and go to **Lustre 集群**. The mount configured at startup
+   appears there. To attach another mount visible to the daemon, use **添加集群**
+   and select the existing mount. Check that the source and target OST pools
+   are both eligible, and allow the baseline scan to populate the catalog.
+2. In **分层策略**, create a same-filesystem tiering policy. Select the filesystem
+   and pool pair, choose a scan scope and file rules, and set the trigger and
+   per-run limits. For a first run, use a small test directory and a manual
+   trigger. Directory scope selects candidate files. The directory's default
+   Pool layout stays as it is.
+3. Keep **仅评估（Dry-run）** and select **计算预览**. Check the candidate counts and
+   sample files before saving. New policies are saved disabled. Supply the
+   writer token when prompted.
+4. To move data, configure the daemon workload identity and governance below.
+   Edit the policy, select **实际执行**, save, and use **启用策略**. Choose
+   **立即运行** for the manual trigger. If the policy requires operator approval,
+   approve the pending run in its details.
+5. Open the run details to check progress, per-file dispositions and live
+   target-pool evidence, or to download a report. Use the run controls to
+   pause, resume, or cancel further dispatch.
+
+For actual migration, set `RBH_HSM_PRINCIPAL_FILE` to a daemon-readable JSON
+file such as `{"serviceAccount":"tiering-daemon"}` and restart the daemon after
+changing its environment. Bind an authorization policy that allows the
+service account, an approval policy that permits the action, and a matching
+system safety policy. Select the named authorization and approval resources
+in the wizard. The built-in preview governance is for Dry-run.
+[Policy resource API](#policy-resources)
+
+For a test filesystem registered as `lustre`, the following commands use
+`curl` and `jq` to create the three resources for `tiering-daemon`. Set
+`RBH_POLICY_TOKEN_FILE` to the writer token file first. Use `tiering-local`
+for the authorization and approval
+selections in the wizard. The system safety policy applies by filesystem scope.
+
+```bash
+create_tiering_resource() {
+  jq -c --arg kind "$2" '{apiVersion:"hsm.storage.io/v1alpha3",kind:$kind,metadata:{name:"tiering-local"},spec:.}' |
+    curl -fsS "http://127.0.0.1:8080/api/$1" \
+      -H "Authorization: Bearer $(cat "$RBH_POLICY_TOKEN_FILE")" \
+      -H 'Content-Type: application/json' --data-binary @-
+}
+
+create_tiering_resource authorization-policies AuthorizationPolicy <<'JSON'
+{"defaultDecision":"deny","statements":[{"id":"tiering","decision":"allow","actions":["lustre.pool_migrate"],"subjects":{"serviceAccounts":["tiering-daemon"]},"scope":{"filesystems":["lustre"],"objectTypes":["file"]}}]}
+JSON
+create_tiering_resource approval-policies ApprovalPolicy <<'JSON'
+{"defaultDecision":"deny","requirements":[{"id":"tiering","actions":["lustre.pool_migrate"],"mode":"not_required"}],"floorDefaults":{"minApprovers":1,"approverRoles":["approver"]}}
+JSON
+create_tiering_resource system-safety-policies SystemSafetyPolicy <<'JSON'
+{"scope":{"filesystems":["lustre"]},"allowedActions":["lustre.pool_migrate"]}
+JSON
+```
+
+Provide the executor with write access to the mount and live FID-to-path
+lookup for directory-scoped policies.
+For parallel migration, set the policy's same-filesystem concurrency and
+choose an execution profile with enough global slots.
+[Systemd and executor permissions](packaging/README.md#enable-pool-migration-under-systemd)
+· [Pool migration API](#lustre-pool-migration)
+
+You can review or start a saved policy from the CLI as well. Replace `1`
+with the policy ID and set `RBH_POLICY_TOKEN_FILE` to the writer's token file
+for a manual run.
+
+```sh
+./target/release/rbh policy-list
+./target/release/rbh policy-show 1
+./target/release/rbh policy-run 1 --dry-run
+RBH_POLICY_TOKEN_FILE=/path/to/token ./target/release/rbh policy-run 1
+```
 
 ## Architecture
 
 ```
               ┌────────────────────────┐
-              │  rbh-daemon (binary)   │
+              │  robinhood (daemon)    │
               │ ─────────────────────  │
               │ signals.rs   SIGHUP    │
               │ changelog.rs ingest    │
@@ -45,43 +277,6 @@ sources.
                      │ /api/* (axum) │◀── rbh-cli (find / report / ...)
                      │ /api/metrics  │◀── Prometheus
                      └───────────────┘
-```
-
-## Build
-
-```bash
-# Native (requires lustre-client for liblustreapi):
-cargo build --release
-
-# Local stack for catalog and API checks
-cd dev/compose && docker compose up -d --build
-```
-
-See the [development Compose guide](dev/compose/README.md) for prerequisites,
-catalog seeding, and API smoke checks.
-
-## Quick start
-
-```bash
-# 1. Initialize a new MariaDB database.
-mariadb --execute 'CREATE DATABASE rbh_entries'
-mariadb rbh_entries < crates/rbh-entry-store/schema.sql
-
-# Configure the daemon and optional Lustre changelog readers.
-export RBH_DATABASE_URL=mysql://root@127.0.0.1/rbh_entries
-export RBH_LUSTRE_MOUNT=/lustre
-export RBH_MDTS=testfs-MDT0000           # unset = no changelog listener
-export RBH_CHANGELOG_USER=cl1            # register via `lctl changelog_register` on the MDS
-
-./target/release/robinhood &
-
-# 2. The daemon runs the initial fs-scan on first boot if the catalog
-# is empty, then keeps it current from the Lustre changelog.
-#
-# 3. Use the CLI to inspect / query / act.
-./target/release/rbh find --user 0 --size +1M --sort size --desc
-./target/release/rbh report fs-info
-./target/release/rbh scan --root /lustre --since-mtime $(date -d '-24h' +%s)
 ```
 
 ## Commands
@@ -290,7 +485,8 @@ from enabled policies and from other selectors block resource deletion.
 ### Lustre pool migration
 
 Register the Lustre mount with HSM, stripe and OST capabilities. A pool
-migration policy has a periodic trigger and one pool pair on that filesystem.
+migration policy selects one pool pair on that filesystem. It supports periodic,
+manual, and source-pool capacity triggers.
 The action contract is available at `GET /api/action-contracts/lustre.pool_migrate`.
 When using the packaged systemd unit, allow writes to the executor mount.
 [Configure the service drop-in](packaging/README.md#enable-pool-migration-under-systemd).
@@ -336,7 +532,6 @@ and `stripeSize` override the source stripe geometry. Set `minResidence`
 to a positive duration such as `24h` to require time in the source
 pool. The catalog starts the clock on its first verified observation of
 the pool or a change of pool, and retains it across rescans and restarts.
-For existing observed layouts, the upgrade starts the clock at upgrade time.
 The first release handles online regular files with an initialized
 single-component RAID0 layout.
 
@@ -442,20 +637,45 @@ during admission has its reason in `GET /api/policies/{id}/runs/{runId}/operatio
 
 ## Configuration
 
-All runtime knobs are environment variables (hot-reloadable subset via
-SIGHUP):
+Set daemon variables in the launching shell or the systemd environment file
+(`/etc/sysconfig/rbh-daemon` or `/etc/default/rbh-daemon`). Restart the daemon
+after editing the service environment file. `SIGHUP` reloads the log filter
+from the running process environment.
 
-| Variable | Effect |
-|----------|--------|
-| `RBH_DATABASE_URL` | MariaDB connection string |
-| `RBH_LUSTRE_MOUNT` | Legacy single-Lustre mount; translated to a filesystem runtime |
-| `RBH_FILESYSTEM_ID` | Stable id for the legacy single-Lustre runtime; default `lustre` |
-| `RBH_FILESYSTEMS_JSON` | Explicit filesystem registry as a JSON array; supports any mix of Lustre and JuiceFS runtimes |
-| `RBH_MDTS`         | Legacy single-Lustre MDT list (empty = no changelog) |
-| `RBH_CHANGELOG_USER` | Legacy single-Lustre reader id (`cl1` etc.); CSV for per-MDT |
-| `RBH_LISTEN_ADDR`  | REST bind, default `0.0.0.0:8080` |
-| `RBH_LOG`          | `tracing-subscriber` env-filter; **hot-reload via SIGHUP** |
-| `RBH_OTLP_ENDPOINT` | (Reserved; not yet wired) |
+### Daemon environment variables
+
+| Variable | When to set it and default |
+| --- | --- |
+| `RBH_DATABASE_URL` | Set to the deployment's MariaDB connection URL. The local fallback is `mysql://root@127.0.0.1/rbh_entries`. |
+| `RBH_LISTEN_ADDR` | HTTP bind address for both REST and the console. Defaults to `0.0.0.0:8080`. Use `127.0.0.1:8080` behind a local reverse proxy. |
+| `RBH_FILESYSTEMS_JSON` | JSON array of Lustre and JuiceFS runtimes. When omitted, the daemon derives a single Lustre runtime from the legacy variables below. |
+| `RBH_LUSTRE_MOUNT` | Mount path for the legacy runtime. Defaults to `/lustre`. |
+| `RBH_FILESYSTEM_ID` | Stable identifier for the legacy runtime. Defaults to `lustre`. |
+| `RBH_MDTS` | Comma-separated MDT names for the legacy runtime. `RBH_MDT_NAME` is the single-MDT fallback. |
+| `RBH_CHANGELOG_USER` | Legacy changelog reader ID, such as `cl1`, or one ID per MDT in the same order. Changelog ingestion requires both an MDT and a reader ID. |
+| `RBH_CONSOLE_DIR` | Absolute path to the built console assets. Defaults to `/usr/share/robinhood/console`. Set it to the absolute `web/dist` path for a checkout build. |
+| `RBH_CONSOLE_COLLECT_SECS` | Lustre resource collection interval in seconds. Defaults to `60` and accepts positive integers. |
+| `RBH_CONSOLE_OBSERVER_ID` | Resource snapshot and console registration scope. Defaults to the hostname. Set a stable, unique value when multiple daemons with the same hostname share MariaDB. |
+| `RBH_LUSTRE_MANAGED_ROOT` | Set for daemon-created Lustre mounts. Use an existing canonical directory owned by the daemon account. The daemon also needs host mount privileges. |
+| `RBH_POLICY_WRITERS_FILE` | Set for console or API writes. The daemon reads a JSON map of writer names to SHA-256 bearer-token digests. |
+| `RBH_HSM_PRINCIPAL_FILE` | Set for actual policy execution. The daemon reads a JSON workload identity with a `serviceAccount` authorized for the requested action. |
+| `RBH_HSM_POLL_SECS` | Native HSM state polling interval in seconds for HSM-capable runtimes. Defaults to `0`, which disables the poller. |
+| `RBH_HSM_POLL_BATCH` | Native HSM state polling batch size. Defaults to `200`. |
+| `RBH_HSM_POLL_PAUSE_MS` | Delay between native HSM polling batches in milliseconds. Defaults to `500`. |
+| `RBH_LOG` | Log filter. Falls back to `RUST_LOG`, then `info`. |
+
+### CLI environment variables
+
+| Variable | When to set it and default |
+| --- | --- |
+| `RBH_API_URL` | Daemon API origin for `rbh`. Defaults to `http://127.0.0.1:8080`. |
+| `RBH_FILESYSTEM` | Filesystem ID for catalog commands. Use `--filesystem ID` to select it per command. |
+| `RBH_POLICY_TOKEN_FILE` | File containing the writer's bearer token for `rbh policy-run`. `--token-file PATH` also works. |
+
+Pool migration concurrency is configured by `maxConcurrency` on the policy
+action and `concurrency.global` on its execution profile. For read-heat agent
+variables, see [Lustre read heat](#lustre-read-heat). For test fixtures, see the
+[integration test guide](tests/README.md).
 
 For explicit runtimes, `RBH_FILESYSTEMS_JSON` contains filesystem configuration
 plus its change-source configuration. Capabilities are declared per filesystem, so a
@@ -463,6 +683,8 @@ Lustre runtime with `"hsm": false` never starts the HSM poller even when
 `RBH_HSM_POLL_SECS` is non-zero. Each Lustre runtime declares its own
 `lustre_changelog` array of `{ "mdt", "reader_id" }` objects; JuiceFS runtimes
 declare `changelog_agent`. A failed source is restarted independently.
+For JuiceFS agent installation, network configuration, and daemon wiring, see
+the [JuiceFS changelog agent guide](agents/juicefs-changelog-agent/README.md).
 
 Include `LYOUT` in each Lustre reader's changelog mask to refresh catalog
 layouts after a change. Entry responses expose the pool in `pool_name` and

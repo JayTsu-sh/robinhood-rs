@@ -2,17 +2,30 @@ import { Link, useParams, useSearchParams } from '@umijs/max';
 import { Alert, Button, Card, Descriptions, Flex, Tabs, Tag } from 'antd';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
-import { LatestRunLink } from '@/components/ExecutionStatus';
+import { executionTime, LatestRunLink, logicalBytes } from '@/components/ExecutionStatus';
+import InventoryStatistics from '@/components/InventoryStatistics';
 import { PolicyBindings, PolicyConfiguration } from '@/components/PolicyConfiguration';
 import PolicyExecutionActions from '@/components/PolicyExecutionActions';
 import PolicyJson from '@/components/PolicyJson';
 import RunHistoryTable from '@/components/RunHistoryTable';
 import { policyPoolPair, readEditablePolicy } from '@/domain/tieringPolicy';
-import { executionFilters, runHistoryPath } from '@/services/executions';
+import { executionFilters, getRunStatistics, runHistoryPath } from '@/services/executions';
 import { readPolicyDraft } from '@/services/policyDrafts';
 import { getPolicy, getPolicyDefinition, policyDetailsPath, policyEditPath, type PolicyRevision } from '@/services/policies';
 import { filesystemDetailsPath } from '@/services/tiering';
 import { requestError, useInventory } from '@/services/useInventory';
+
+function PolicyRunStatistics({ id }: { id: string }) {
+  const load = useCallback((signal: AbortSignal) => getRunStatistics(signal, id), [id]);
+  const { state } = useInventory(load);
+  const stats = state.status === 'ready' ? state.data : undefined;
+  return <InventoryStatistics items={[
+    ['历史执行', stats?.total ?? '—'],
+    ['历史完成对象', stats?.completedObjects ?? '—'],
+    ['历史失败对象', stats?.failedObjects ?? '—'],
+    ['已完成逻辑量', logicalBytes(stats?.completedLogicalBytes ?? null)],
+  ]} />;
+}
 
 function Details({ row, historical, refresh }: { row: PolicyRevision; historical: boolean; refresh: () => void }) {
   const { definition, idExact: id, revisionExact: revision } = row;
@@ -73,6 +86,8 @@ function Details({ row, historical, refresh }: { row: PolicyRevision; historical
         {
           key: 'overview', label: '策略概览',
           children: (
+            <Flex vertical>
+            {!historical && <PolicyRunStatistics id={id} />}
             <Card>
               <Descriptions column={{ xs: 1, md: 2 }} items={[
                 { key: 'name', label: '策略名称', children: metadata.name },
@@ -83,7 +98,11 @@ function Details({ row, historical, refresh }: { row: PolicyRevision; historical
                 { key: 'pools', label: '源池 → 目标池', children: pair && `${pair.sourcePool} → ${pair.targetPool}` },
                 { key: 'root', label: '起始目录', children: spec.target.directoryScope?.root ?? '未限定目录' },
                 { key: 'excluded', label: '排除子目录', children: spec.target.directoryScope?.excludedSubtrees?.join('、') || '无' },
-                { key: 'interval', label: '周期', children: spec.trigger.interval ?? '—' },
+                { key: 'interval', label: '启动方式', children: spec.trigger.type === 'manual'
+                  ? '仅手动触发' : spec.trigger.interval ?? '—' },
+                ...(!historical ? [{
+                  key: 'next', label: '下次调度', children: executionTime(row.nextRun),
+                }] : []),
                 ...(!historical ? [{
                   key: 'run', label: '当前或最近运行',
                   children: <Flex vertical gap={8} align="start">
@@ -93,6 +112,7 @@ function Details({ row, historical, refresh }: { row: PolicyRevision; historical
                 }] : []),
               ]} />
             </Card>
+            </Flex>
           ),
         },
         {

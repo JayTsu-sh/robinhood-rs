@@ -66,6 +66,10 @@ fn directory_and_link_changes_during_copy_preserve_the_source_layout() {
             target_pool: "cold".into(),
             stripe_count: u16::try_from(original.count).unwrap(),
             stripe_size: u32::try_from(original.size).unwrap(),
+            max_bytes_per_second: None,
+            min_target_free_percent: None,
+            filesystem_concurrency: None,
+            expected_mount_source: None,
         };
         let expected = FileVersion::from(&fs::metadata(&file).unwrap());
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -74,7 +78,7 @@ fn directory_and_link_changes_during_copy_preserve_the_source_layout() {
             .unwrap();
         let mut checks = 0;
         let mut remaining_link = link.clone();
-        let ownership = MigrationOwnership::acquire(&filesystem).unwrap();
+        let ownership = MigrationOwnership::acquire(&filesystem, fid).unwrap();
         let result = LustreApi.migrate_reserved_pool(
             &mount,
             &fid,
@@ -114,8 +118,8 @@ fn directory_and_link_changes_during_copy_preserve_the_source_layout() {
         );
         assert_eq!(checks, 2);
         assert!(matches!(
-            MigrationOwnership::acquire(&filesystem),
-            Err(MigrationError::Deferred("filesystem_migration_busy"))
+            MigrationOwnership::acquire(&filesystem, fid),
+            Err(MigrationError::Deferred("file_migration_busy"))
         ));
         assert_eq!(LustreApi.path_to_fid(&remaining_link).unwrap(), fid);
         assert_eq!(LustreApi.path_to_fid(&file).unwrap(), fid);

@@ -103,6 +103,11 @@ impl PoolMount {
         &self.mount.source
     }
 
+    pub fn active_mdt_names(&self) -> Result<Vec<String>> {
+        let anchored = PathBuf::from(format!("/proc/self/fd/{}", self.descriptor.as_raw_fd()));
+        crate::LustreApi.active_mdt_names(&anchored)
+    }
+
     /// Prefer the kernel's non-reusable mount ID. On older kernels also verify
     /// the live Lustre client and source before using any previous observations.
     pub fn identity(&self) -> Option<MountIdentity> {

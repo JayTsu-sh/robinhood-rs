@@ -107,7 +107,7 @@ test('execution history opens a pinned run and refreshes operations after dispat
   await expect(details).toContainText('8、9');
 });
 
-test('the built console reads a recorded run and file evidence from the daemon', async ({ page, request }) => {
+test('the built console reads a recorded run and file evidence from the daemon', { tag: '@daemon' }, async ({ page, request }) => {
   test.skip(process.env.RBH_CONSOLE_RUN_HISTORY_TEST !== '1', 'requires the isolated MariaDB run history fixture');
   const response = await request.get('/api/runs?policyName=history-files-&limit=1');
   expect(response.ok()).toBe(true);

@@ -5,11 +5,17 @@ import { runDetailsPath, type LatestRun, type RunHistory } from '@/services/exec
 const runStates = {
   queued: { label: '排队中', color: 'default' },
   running: { label: '派发中', color: 'processing' },
+  paused: { label: '已暂停', color: 'warning' },
+  awaiting_approval: { label: '待人工审批', color: 'warning' },
   previewed: { label: '已评估', color: 'blue' },
   finished: { label: '派发已结束', color: 'blue' },
   deferred: { label: '已暂缓', color: 'warning' },
   cancelled: { label: '已取消', color: 'default' },
 };
+
+export function isActiveRun(state: string | undefined) {
+  return state !== undefined && ['queued', 'running', 'paused', 'awaiting_approval'].includes(state);
+}
 
 const operationStates = {
   submitting: { label: '提交中', color: 'processing' },
@@ -37,10 +43,19 @@ const datetime = new Intl.DateTimeFormat('zh-CN', {
   hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
 });
 
-export function executionTime(time: string | number | null) {
-  if (time === null) return '—';
+export function executionTime(time: string | number | null | undefined) {
+  if (time == null) return '—';
   const date = new Date(time);
   return Number.isNaN(date.getTime()) ? '—' : datetime.format(date);
+}
+
+export function executionElapsed(start: string | null, end: string | null | undefined) {
+  if (!start || !end) return '—';
+  const seconds = Math.floor((Date.parse(end) - Date.parse(start)) / 1000);
+  if (!Number.isFinite(seconds) || seconds < 0) return '—';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds % 3600 / 60);
+  return `${hours ? `${hours} 小时 ` : ''}${minutes ? `${minutes} 分 ` : ''}${seconds % 60} 秒`;
 }
 
 export function logicalBytes(value: string | null) {

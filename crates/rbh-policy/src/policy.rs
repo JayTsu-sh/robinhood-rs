@@ -10,15 +10,19 @@ use std::{
 mod directory_scope;
 pub mod execution;
 pub mod heat;
+mod namespace_filters;
 pub mod resources;
 mod scoped_preview;
 mod tiering;
 pub(crate) use directory_scope::{AdmittedLinks, DirectoryScope};
 pub use directory_scope::{DeferralReason, ExclusionReason, ScopeSummary};
 use resources::{ResourceBinding, ResourceKind};
+pub use scoped_preview::PreviewFile;
 pub use tiering::PoolMigration;
+pub(crate) use tiering::pool_capacity;
 
-use chrono::{DateTime, Datelike, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, NaiveTime, TimeDelta, TimeZone, Utc};
+use chrono_tz::Tz;
 use rbh_entry_store::store::{EntryStore, QueryParam};
 use rbh_entry_store::{EntryKind, FileSystemId};
 use rbh_predicate::{CmpOp, Field, Predicate, SqlParam, Value};
@@ -45,11 +49,17 @@ pub struct CompiledPolicy {
     pub(crate) actions: Vec<Invocation>,
     pub(crate) decision: String,
     pub(crate) decision_params: Vec<QueryParam>,
+    rule_labels: BTreeMap<i64, String>,
     pub(crate) enabled: bool,
     pub(crate) enforced: bool,
     pub(crate) one_shot: bool,
     pub(crate) window: Option<JsonValue>,
     pub(crate) budget: BudgetLimits,
+    pub(crate) pool_watermarks: Option<(u8, u8)>,
+    pub(crate) candidate_order: CandidateOrder,
+    pub(crate) require_operator_approval: bool,
+    pub(crate) failure_pause: Option<FailurePause>,
+    pub(crate) uses_namespace_filters: bool,
 }
 
 #[derive(Serialize)]
@@ -65,6 +75,8 @@ pub struct PreviewResult<Revision = u64> {
     pub read_heat: Option<heat::PreviewHeat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory_scope: Option<ScopeSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sample_files: Vec<PreviewFile>,
 }
 
 /// Reject legacy and unsupported document versions at the REST boundary.
@@ -85,8 +97,26 @@ pub(crate) fn parse(document: &JsonValue) -> Result<Policy, PolicyError> {
             "metadata.name must be a lowercase resource name of 1–253 characters",
         ));
     }
-    policy.schedule_after(Utc::now())?;
+    policy.first_run(Utc::now())?;
+    if let Trigger::PoolUsage {
+        high_percent,
+        low_percent,
+        ..
+    } = policy.spec.trigger
+        && (high_percent > 100 || low_percent >= high_percent)
+    {
+        return Err(invalid("pool usage requires 0 <= lowPercent < highPercent <= 100"));
+    }
     policy.spec.execution.budget.run.validate()?;
+    if policy
+        .spec
+        .execution
+        .failure_pause
+        .as_ref()
+        .is_some_and(|limits| !(1..=100).contains(&limits.percent))
+    {
+        return Err(invalid("spec.execution.failurePause.percent must be 1–100"));
+    }
     if policy.enforced_and_enabled() && policy.spec.execution.budget.run.max_duration.is_none() {
         return Err(invalid(
             "spec.execution.budget.run.maxDuration is required for enforced activation",
@@ -100,8 +130,9 @@ pub(crate) fn parse(document: &JsonValue) -> Result<Policy, PolicyError> {
 
 impl Policy {
     pub(crate) fn schedule_after(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, PolicyError> {
-        let Trigger::Periodic { interval } = &self.spec.trigger else {
-            return Ok(None);
+        let interval = match &self.spec.trigger {
+            Trigger::Manual => return Ok(None),
+            Trigger::Periodic { interval, .. } | Trigger::PoolUsage { interval, .. } => interval,
         };
         let delay = duration_millis(interval)
             .and_then(|value| i64::try_from(value).ok())
@@ -111,6 +142,41 @@ impl Policy {
             .filter(|date| date.year() <= 9999)
             .map(Some)
             .ok_or_else(|| invalid("spec.trigger.interval exceeds the scheduler range"))
+    }
+
+    pub(crate) fn first_run(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, PolicyError> {
+        let next = self.schedule_after(now)?;
+        let Trigger::Periodic {
+            first_at: Some(start), ..
+        } = &self.spec.trigger
+        else {
+            return Ok(next);
+        };
+        let timezone: Tz = start
+            .timezone
+            .parse()
+            .map_err(|_| invalid("spec.trigger.firstAt.timezone must be an IANA time zone"))?;
+        let time = NaiveTime::parse_from_str(&start.time, "%H:%M")
+            .ok()
+            .filter(|_| start.time.len() == 5)
+            .ok_or_else(|| invalid("spec.trigger.firstAt.time must be HH:MM"))?;
+        let mut date = now.with_timezone(&timezone).date_naive();
+        // Skip a nonexistent wall time and consider both occurrences of an ambiguous one.
+        for _ in 0..3 {
+            let local = timezone.from_local_datetime(&date.and_time(time));
+            let candidate = [local.earliest(), local.latest()]
+                .into_iter()
+                .flatten()
+                .map(|time| time.with_timezone(&Utc))
+                .find(|time| *time > now && time.year() <= 9999);
+            if candidate.is_some() {
+                return Ok(candidate);
+            }
+            date = date
+                .succ_opt()
+                .ok_or_else(|| invalid("first run is outside the scheduler range"))?;
+        }
+        Err(invalid("no valid upcoming time for spec.trigger.firstAt"))
     }
 
     pub(crate) fn next_run(&self, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, PolicyError> {
@@ -178,6 +244,7 @@ impl Policy {
             decision,
             params: decision_params,
             actions,
+            labels: rule_labels,
             uses_read_heat,
             execute_requires_heat,
         } = spec.rules.compile(&mut conditions)?;
@@ -197,10 +264,19 @@ impl Policy {
             .iter()
             .find_map(|invocation| invocation.migration.clone())
             .or(retained_pool);
+        if conditions.uses_namespace_filters && (directory_scope.is_none() || pool_migration.is_none()) {
+            return Err(invalid("path and filename predicates require a scoped pool migration"));
+        }
+        let pool_watermarks = match spec.trigger {
+            Trigger::PoolUsage {
+                high_percent,
+                low_percent,
+                ..
+            } if pool_migration.is_some() => Some((high_percent, low_percent)),
+            Trigger::PoolUsage { .. } => return Err(invalid("pool usage requires a pool migration action")),
+            _ => None,
+        };
         if let Some(migration) = &pool_migration {
-            if !matches!(spec.trigger, Trigger::Periodic { .. }) {
-                return Err(invalid("lustre.pool_migrate requires a periodic trigger"));
-            }
             if actions
                 .iter()
                 .any(|invocation| invocation.migration.as_ref() != Some(migration))
@@ -237,6 +313,7 @@ impl Policy {
             actions,
             decision,
             decision_params: query_params(decision_params),
+            rule_labels,
             uses_read_heat,
             directory_scope: directory_scope.map(Arc::new),
             pool_migration,
@@ -246,6 +323,11 @@ impl Policy {
             one_shot: matches!(spec.mode, Some(RunMode::OneShot)),
             window: spec.execution.admission_window,
             budget: spec.execution.budget.run.limits(),
+            pool_watermarks,
+            candidate_order: spec.execution.candidate_order.unwrap_or_default(),
+            require_operator_approval: spec.execution.require_operator_approval.unwrap_or(false),
+            failure_pause: spec.execution.failure_pause,
+            uses_namespace_filters: conditions.uses_namespace_filters,
             params,
         })
     }
@@ -354,18 +436,19 @@ impl CompiledPolicy {
     pub async fn preview(
         &self, entries: &EntryStore, revision: u64, resource_bindings: Vec<ResourceBinding>,
     ) -> Result<PreviewResult, PolicyError> {
-        self.preview_with_heat(entries, revision, resource_bindings, None, None)
+        self.preview_with_heat(entries, revision, resource_bindings, None, None, false)
             .await
     }
 
     pub(crate) async fn preview_with_heat<Revision>(
         &self, entries: &EntryStore, revision: Revision, resource_bindings: Vec<ResourceBinding>,
-        profile: Option<&heat::HeatProfile>, heat_fid: Option<lustre_api::LuFid>,
+        profile: Option<&heat::HeatProfile>, heat_fid: Option<lustre_api::LuFid>, sample_files: bool,
     ) -> Result<PreviewResult<Revision>, PolicyError> {
         let config = validate_filesystem(entries, &self.filesystem).await?;
         self.validate_capabilities(&config)?;
         if let Some(scope) = &self.directory_scope {
-            let observation = scoped_preview::evaluate(entries, self, &config, scope, profile, heat_fid).await?;
+            let observation =
+                scoped_preview::evaluate(entries, self, &config, scope, profile, heat_fid, sample_files).await?;
             return Ok(PreviewResult {
                 revision,
                 candidate_count: observation.candidate_count,
@@ -374,6 +457,7 @@ impl CompiledPolicy {
                 resource_bindings,
                 read_heat: observation.read_heat,
                 directory_scope: Some(observation.scope),
+                sample_files: observation.sample,
             });
         }
         if self.uses_read_heat {
@@ -394,6 +478,7 @@ impl CompiledPolicy {
             resource_bindings,
             read_heat: None,
             directory_scope: None,
+            sample_files: Vec::new(),
         })
     }
 }
@@ -474,7 +559,25 @@ enum Consistency {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Trigger {
     Manual,
-    Periodic { interval: String },
+    Periodic {
+        interval: String,
+        #[serde(rename = "firstAt")]
+        first_at: Option<FirstRunTime>,
+    },
+    PoolUsage {
+        interval: String,
+        #[serde(rename = "highPercent")]
+        high_percent: u8,
+        #[serde(rename = "lowPercent")]
+        low_percent: u8,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirstRunTime {
+    time: String,
+    timezone: String,
 }
 
 #[derive(Deserialize)]
@@ -490,6 +593,39 @@ struct Execution {
     activation: Option<Activation>,
     admission_window: Option<JsonValue>,
     budget: Budget,
+    candidate_order: Option<CandidateOrder>,
+    require_operator_approval: Option<bool>,
+    failure_pause: Option<FailurePause>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FailurePause {
+    pub(crate) percent: u8,
+    pub(crate) min_failures: NonZeroU64,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CandidateOrder {
+    #[default]
+    Fid,
+    OldestAccess,
+    NewestAccess,
+    OldestModification,
+    LargestFirst,
+}
+
+impl CandidateOrder {
+    pub(crate) fn sort_column(self) -> Option<(&'static str, bool)> {
+        match self {
+            Self::Fid => None,
+            Self::OldestAccess => Some(("entries.atime", true)),
+            Self::NewestAccess => Some(("entries.atime", false)),
+            Self::OldestModification => Some(("entries.mtime", true)),
+            Self::LargestFirst => Some(("entries.size", false)),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -579,6 +715,7 @@ struct CompiledRules {
     uses_read_heat: bool,
     execute_requires_heat: bool,
     actions: Vec<Invocation>,
+    labels: BTreeMap<i64, String>,
 }
 
 impl Rules {
@@ -624,6 +761,7 @@ impl Rules {
         let mut skip_requires_heat_to_pass = false;
         let mut clauses = vec!["CASE".to_owned()];
         let mut actions = Vec::new();
+        let mut labels = BTreeMap::new();
         let mut params = Vec::new();
         for (index, rule) in rules {
             let path = format!("spec.rules.entries[{index}]");
@@ -651,13 +789,16 @@ impl Rules {
                         matches!(rule.decision, Decision::RequireApproval),
                         &path,
                     )?);
-                    actions.len()
+                    actions.len() as i64
                 }
                 Decision::Skip if rule.action.is_some() => {
                     return Err(invalid(format!("{path}.action cannot be set on a skip rule")));
                 }
-                Decision::Skip => 0,
+                Decision::Skip => -(index as i64 + 1),
             };
+            if let Some(name) = rule.name {
+                labels.insert(branch, name);
+            }
             let condition = conditions.compile(&rule.condition, &format!("{path}.match"))?;
             if branch > 0 {
                 execute_requires_heat &= skip_requires_heat_to_pass || !condition.can_match_without_heat;
@@ -688,6 +829,7 @@ impl Rules {
             uses_read_heat,
             execute_requires_heat,
             actions,
+            labels,
         })
     }
 }
@@ -719,8 +861,7 @@ struct RuleDefaults {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Rule {
-    #[serde(rename = "name")]
-    _name: Option<String>,
+    name: Option<String>,
     #[serde(default)]
     priority: i64,
     #[serde(rename = "match")]
@@ -871,7 +1012,26 @@ impl FieldCondition {
                     value: Value::Num(bytes),
                 })
             }
-            field @ ("object.last_modified" | "object.last_access") if matches!(self.op, Comparison::OlderThan) => {
+            field @ ("object.uid" | "object.gid" | "object.project_id") => {
+                let id = self
+                    .value
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .ok_or_else(|| invalid(format!("{path}.value must be an unsigned 32-bit integer")))?;
+                let field = match field {
+                    "object.uid" => Field::Uid,
+                    "object.gid" => Field::Gid,
+                    _ => Field::Projid,
+                };
+                Ok(Predicate::Cmp {
+                    field,
+                    cmp: self.op.ordinal(path)?,
+                    value: Value::Num(i64::from(id)),
+                })
+            }
+            field @ ("object.last_modified" | "object.last_access" | "object.last_changed")
+                if matches!(self.op, Comparison::OlderThan) =>
+            {
                 let age_ms = as_string()
                     .ok()
                     .and_then(duration_millis)
@@ -887,7 +1047,15 @@ impl FieldCondition {
                     let cutoff = i64::try_from(age_ms.div_ceil(1000))
                         .ok()
                         .and_then(|age| now.timestamp().checked_sub(age));
-                    (Field::Mtime, CmpOp::Le, cutoff)
+                    (
+                        if field == "object.last_modified" {
+                            Field::Mtime
+                        } else {
+                            Field::Ctime
+                        },
+                        CmpOp::Le,
+                        cutoff,
+                    )
                 };
                 let cutoff = cutoff.ok_or_else(|| invalid(format!("{path}.value exceeds the timestamp range")))?;
                 Ok(Predicate::Cmp {
@@ -896,8 +1064,31 @@ impl FieldCondition {
                     value: Value::Num(cutoff),
                 })
             }
-            field @ ("object.last_modified" | "object.last_access") => {
-                Err(invalid(format!("{path}.op must be older_than for {field}")))
+            field @ ("object.last_modified" | "object.last_access" | "object.last_changed") => {
+                let age_seconds = duration_millis(as_string()?)
+                    .and_then(|age| i64::try_from(age.div_ceil(1000)).ok())
+                    .ok_or_else(|| invalid(format!("{path}.value must be a positive duration")))?;
+                let cutoff = now
+                    .timestamp()
+                    .checked_sub(age_seconds)
+                    .ok_or_else(|| invalid(format!("{path}.value exceeds the timestamp range")))?;
+                let field = match field {
+                    "object.last_modified" => Field::Mtime,
+                    "object.last_access" => Field::Atime,
+                    _ => Field::Ctime,
+                };
+                let cmp = match self.op.ordinal(path)? {
+                    CmpOp::Lt => CmpOp::Gt,
+                    CmpOp::Le => CmpOp::Ge,
+                    CmpOp::Gt => CmpOp::Lt,
+                    CmpOp::Ge => CmpOp::Le,
+                    equal => equal,
+                };
+                Ok(Predicate::Cmp {
+                    field,
+                    cmp,
+                    value: Value::Num(cutoff),
+                })
             }
             "lustre.pool" => {
                 let cmp = self.op.equality(path)?;
@@ -943,6 +1134,7 @@ enum Comparison {
     Gt,
     Gte,
     OlderThan,
+    Glob,
 }
 
 impl Comparison {
@@ -955,6 +1147,7 @@ impl Comparison {
             Self::Gt => CmpOp::Gt,
             Self::Gte => CmpOp::Ge,
             Self::OlderThan => return Err(invalid(format!("{path}.op older_than requires object.last_modified"))),
+            Self::Glob => return Err(invalid(format!("{path}.op glob requires object.path or object.name"))),
         })
     }
 
@@ -987,12 +1180,12 @@ impl Condition {
         let (sql, params, may_be_unknown) = match &predicate {
             Predicate::Cmp {
                 field: Field::Atime,
-                cmp: CmpOp::Lt,
+                cmp,
                 value: Value::Num(cutoff),
             } => (
                 // A whole-second catalog timestamp cannot distinguish reads
                 // on either side of the cutoff within that second.
-                "CASE WHEN atime = ? THEN NULL ELSE atime < ? END".into(),
+                format!("CASE WHEN atime = ? THEN NULL ELSE atime {} ? END", cmp.sql()),
                 vec![SqlParam::Num(*cutoff), SqlParam::Num(*cutoff)],
                 true,
             ),
@@ -1067,6 +1260,7 @@ struct ConditionCompiler<'a> {
     referenced: BTreeSet<String>,
     remaining: usize,
     uses_last_access: bool,
+    uses_namespace_filters: bool,
     now: DateTime<Utc>,
 }
 
@@ -1078,6 +1272,7 @@ impl<'a> ConditionCompiler<'a> {
             referenced: BTreeSet::new(),
             remaining: 4096,
             uses_last_access: false,
+            uses_namespace_filters: false,
             now: Utc::now(),
         }
     }
@@ -1115,6 +1310,18 @@ impl<'a> ConditionCompiler<'a> {
                     invalid(format!("{path}.{field}: {message}"))
                 }
             })?;
+            if matches!(condition.field.as_str(), "object.path" | "object.name") {
+                self.uses_namespace_filters = true;
+                return namespace_filters::condition(
+                    &condition.field,
+                    condition.op,
+                    condition
+                        .value
+                        .as_str()
+                        .ok_or_else(|| invalid(format!("{path}.value must be a string")))?,
+                    path,
+                );
+            }
             if let Some(column) = heat::score_column(&condition.field) {
                 let value = condition
                     .value

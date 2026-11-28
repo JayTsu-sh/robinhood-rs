@@ -14,12 +14,31 @@ export const week = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 export const sizeUnits = { B: 'B', KiB: 'KiB', MiB: 'MiB', GiB: 'GiB', TiB: 'TiB', PiB: 'PiB' };
 export const intervalUnits = { m: '分钟', h: '小时', d: '天' };
 export const durationUnits = { ms: '毫秒', s: '秒', ...intervalUnits };
+const clockTime = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 export const conditionFields = {
   'object.size': '文件大小',
   'object.last_access': '最后访问时间',
   'object.last_modified': '最后修改时间',
+  'object.last_changed': '最后状态变更时间',
+  'object.uid': 'UID',
+  'object.gid': 'GID',
+  'object.project_id': '项目 ID',
+  'object.path': '完整路径',
+  'object.name': '文件名',
 };
 export const comparisons = { eq: '=', ne: '≠', lt: '<', lte: '≤', gt: '>', gte: '≥' };
+export const namespaceComparisons = { eq: '=', ne: '≠', glob: '通配匹配' };
+export const ageComparisons = { older_than: '超过', ...comparisons };
+export const candidateOrders = {
+  fid: '按 FID', oldest_access: '最久未访问优先', newest_access: '最近访问优先',
+  oldest_modification: '最久未修改优先', largest_first: '大文件优先',
+};
+export function isIdentityField(field: Field) {
+  return field === 'object.uid' || field === 'object.gid' || field === 'object.project_id';
+}
+export function isNamespaceField(field: Field) {
+  return field === 'object.path' || field === 'object.name';
+}
 const sizeFactors = Object.fromEntries(Object.keys(sizeUnits).map((unit, i) => [unit, BigInt(1024 ** i)]));
 const durationFactors = { ms: BigInt(1), s: BigInt(1000), m: BigInt(60000), h: BigInt(3600000), d: BigInt(86400000) };
 const maxU64 = BigInt('18446744073709551615');
@@ -42,11 +61,17 @@ export interface WizardValues {
   targetPool: string;
   scoped: boolean;
   root: string;
+  recursive?: boolean;
   excludedSubtrees: string[];
   include: ConditionGroup;
   exclude: ConditionGroup;
   rules: Rule[];
+  trigger?: 'periodic' | 'manual' | 'pool_usage';
   interval: Quantity;
+  firstTime?: string;
+  firstTimezone?: string;
+  highWatermark?: string;
+  lowWatermark?: string;
   windowEnabled: boolean;
   timezone: string;
   start: string;
@@ -56,6 +81,14 @@ export interface WizardValues {
   maxLogicalBytes: Quantity;
   maxDuration: Quantity;
   maxFileBytes: Quantity;
+  candidateOrder?: keyof typeof candidateOrders;
+  maxRate?: string;
+  minTargetFree?: string;
+  retries?: string;
+  maxConcurrency?: string;
+  pauseErrorRate?: string;
+  pauseMinFailures?: string;
+  requireOperatorApproval?: boolean;
   profile: string;
   authorization: string;
   approval: string;
@@ -66,12 +99,13 @@ export interface PolicySettings {
   mode: ActivationMode;
 }
 
-export interface DirectoryScope { root: string; excludedSubtrees: string[] }
+export interface DirectoryScope { root: string; excludedSubtrees: string[]; recursive?: boolean }
 type Condition = true | { all: ClauseExpression[] } | { any: ClauseExpression[] };
-interface ClauseExpression { field: Field; op: string; value: string | 0 }
+interface ClauseExpression { field: Field; op: string; value: string | number }
 export interface PolicyAction {
   type?: string;
-  params?: { sourcePool?: string; targetPool?: string; maxFileBytes?: string | number };
+  params?: { sourcePool?: string; targetPool?: string; maxFileBytes?: string | number;
+    maxMibPerSecond?: number; minTargetFreePercent?: number; retries?: number; maxConcurrency?: number };
 }
 interface RuleEntry {
   name?: string;
@@ -88,10 +122,14 @@ export interface PolicyDefinition {
   spec: {
     enabled?: boolean;
     target: { filesystem: string; directoryScope?: DirectoryScope; where?: unknown };
-    trigger: { type: string; interval?: string };
+    trigger: { type: string; interval?: string; firstAt?: { time: string; timezone: string };
+      highPercent?: number; lowPercent?: number };
     rules: { defaults?: { action?: PolicyAction }; entries: RuleEntry[]; exclude?: unknown[] };
     execution: {
       profileRef: string;
+      candidateOrder?: keyof typeof candidateOrders;
+      requireOperatorApproval?: boolean;
+      failurePause?: { percent: number; minFailures: number };
       activation?: { mode: ActivationMode };
       admissionWindow?: { timezone: string; weekly: { days: string[]; start: string; end: string }[] };
       budget: { run: {
@@ -117,7 +155,8 @@ export function newWizardValues(): WizardValues {
   return {
     name: '', description: '', filesystem: '', sourcePool: '', targetPool: '',
     scoped: true, root: '/', excludedSubtrees: [], include: emptyGroup(), exclude: emptyGroup(),
-    rules: [newRule(1)], interval: { amount: '1', unit: 'h' }, windowEnabled: false,
+    rules: [newRule(1)], trigger: 'periodic', interval: { amount: '1', unit: 'h' }, windowEnabled: false,
+    firstTime: '', firstTimezone: 'Asia/Shanghai', highWatermark: '85', lowWatermark: '75',
     timezone: 'Asia/Shanghai', start: '22:00', end: '06:00',
     maxOperations: '100', maxSubmitAttempts: '100',
     maxLogicalBytes: { amount: '100', unit: 'GiB' },
@@ -133,7 +172,8 @@ export function quantityText({ amount, unit }: Quantity) {
 
 function conditionExpression({ join, clauses }: ConditionGroup): Condition {
   const expressions = clauses.map(({ field, op, amount, unit }): ClauseExpression => ({
-    field, op, value: field === 'object.size' && amount === '0' ? 0 : quantityText({ amount, unit }),
+    field, op, value: isNamespaceField(field) ? amount : isIdentityField(field) ? Number(amount) :
+      field === 'object.size' && amount === '0' ? 0 : quantityText({ amount, unit }),
   }));
   if (!expressions.length) return true;
   return join === 'all' ? { all: expressions } : { any: expressions };
@@ -151,12 +191,26 @@ export function policyDocument(values: WizardValues, settings: PolicySettings) {
         filesystem,
         objectType: 'file',
         where: conditionExpression(values.include),
-        ...(values.scoped && { directoryScope: { root, excludedSubtrees } }),
+        ...(values.scoped && { directoryScope: {
+          root, excludedSubtrees, ...(values.recursive !== undefined && { recursive: values.recursive }),
+        } }),
       },
-      trigger: { type: 'periodic', interval: quantityText(values.interval) },
+      trigger: values.trigger === 'manual' ? { type: 'manual' } : values.trigger === 'pool_usage' ? {
+        type: 'pool_usage', interval: quantityText(values.interval),
+        highPercent: Number(values.highWatermark), lowPercent: Number(values.lowWatermark),
+      } : {
+        type: 'periodic', interval: quantityText(values.interval),
+        ...(values.firstTime && { firstAt: { time: values.firstTime, timezone: values.firstTimezone?.trim() } }),
+      },
       objective: { type: 'exhaust' },
       rules: {
-        defaults: { action: { type: poolMigration, params: { sourcePool, targetPool, maxFileBytes: quantityText(values.maxFileBytes) } } },
+        defaults: { action: { type: poolMigration, params: {
+          sourcePool, targetPool, maxFileBytes: quantityText(values.maxFileBytes),
+          ...(values.maxRate && { maxMibPerSecond: Number(values.maxRate) }),
+          ...(values.minTargetFree && { minTargetFreePercent: Number(values.minTargetFree) }),
+          ...(values.retries && { retries: Number(values.retries) }),
+          ...(values.maxConcurrency && { maxConcurrency: Number(values.maxConcurrency) }),
+        } } },
         exclude: values.exclude.clauses.length ? [conditionExpression(values.exclude)] : [],
         entries: values.rules.map(({ name: label, decision, condition }, index) => ({
           name: label.trim(), priority: values.rules.length - index, match: conditionExpression(condition), decision,
@@ -164,6 +218,11 @@ export function policyDocument(values: WizardValues, settings: PolicySettings) {
       },
       execution: {
         profileRef: values.profile,
+        ...(values.candidateOrder && { candidateOrder: values.candidateOrder }),
+        ...(values.requireOperatorApproval !== undefined && { requireOperatorApproval: values.requireOperatorApproval }),
+        ...(values.pauseErrorRate && { failurePause: {
+          percent: Number(values.pauseErrorRate), minFailures: Number(values.pauseMinFailures),
+        } }),
         activation: { mode: settings.mode },
         ...(values.windowEnabled && {
           admissionWindow: { timezone: values.timezone.trim(), weekly: [{ days: week, start: values.start, end: values.end }] },
@@ -194,8 +253,19 @@ function readGroup(expression: unknown): ConditionGroup {
   const join = group.all ? 'all' : 'any';
   const clauses = group[join]?.map(({ field, op, value }) => {
     if (!Object.hasOwn(conditionFields, field)) throw new Error('Unsupported policy condition');
-    const supported = field === 'object.size' ? Object.hasOwn(comparisons, op) : op === 'older_than';
+    const identity = isIdentityField(field);
+    if (isNamespaceField(field)) {
+      if (!Object.hasOwn(namespaceComparisons, op) || typeof value !== 'string') throw new Error('Unsupported path filter');
+      return { field, op, amount: value, unit: '' };
+    }
+    const supported = Object.hasOwn(field === 'object.size' || identity ? comparisons : ageComparisons, op);
     if (!supported) throw new Error('Unsupported comparison');
+    if (identity) {
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+        throw new Error('Unsupported identity');
+      }
+      return { field, op, amount: String(value), unit: '' };
+    }
     return { field, op, ...readQuantity(value, field === 'object.size' ? sizeUnits : durationUnits) };
   });
   if (!clauses?.length) throw new Error('Unsupported policy condition group');
@@ -219,27 +289,42 @@ export function readEditablePolicy(document: PolicyDefinition) {
     const scope = spec.target.directoryScope;
     const budget = spec.execution.budget.run;
     const window = spec.execution.admissionWindow;
-    if (!params?.sourcePool || !params.targetPool || !params.maxFileBytes || !budget.maxDuration || !spec.trigger.interval) return null;
+    if (!params?.sourcePool || !params.targetPool || !params.maxFileBytes || !budget.maxDuration) return null;
+    const { type: trigger, firstAt, interval, highPercent, lowPercent } = spec.trigger;
+    if (trigger !== 'manual' && ((trigger !== 'periodic' && trigger !== 'pool_usage') || !interval)) return null;
     if (!Number.isSafeInteger(budget.maxOperations) || !Number.isSafeInteger(budget.maxSubmitAttempts)) return null;
     const settings: PolicySettings = { enabled: spec.enabled !== false, mode: spec.execution.activation?.mode ?? 'preview' };
     const decoded: WizardValues = {
       ...values,
       name: metadata.name, description: metadata.description ?? '', filesystem: spec.target.filesystem,
       sourcePool: params.sourcePool, targetPool: params.targetPool, scoped: !!scope,
-      root: scope?.root ?? '/', excludedSubtrees: scope?.excludedSubtrees ?? [],
+      root: scope?.root ?? '/', excludedSubtrees: scope?.excludedSubtrees ?? [], recursive: scope?.recursive,
       include: readGroup(spec.target.where), exclude: readGroup(spec.rules.exclude?.[0] ?? true),
       rules: spec.rules.entries.map(({ name, decision, match }) => {
         if (!name || (decision !== 'skip' && decision !== 'execute')) throw new Error('Unsupported rule');
         return { name, decision, condition: readGroup(match) };
       }),
-      interval: readQuantity(spec.trigger.interval, intervalUnits),
+      trigger,
+      interval: interval ? readQuantity(interval, intervalUnits) : values.interval,
+      firstTime: firstAt?.time ?? values.firstTime,
+      firstTimezone: firstAt?.timezone ?? values.firstTimezone,
+      highWatermark: highPercent !== undefined ? String(highPercent) : values.highWatermark,
+      lowWatermark: lowPercent !== undefined ? String(lowPercent) : values.lowWatermark,
       windowEnabled: !!window, timezone: window?.timezone ?? values.timezone,
       start: window?.weekly[0]?.start ?? values.start, end: window?.weekly[0]?.end ?? values.end,
       maxOperations: String(budget.maxOperations), maxSubmitAttempts: String(budget.maxSubmitAttempts),
       maxLogicalBytes: readQuantity(budget.maxObjectLogicalBytes, sizeUnits),
       maxDuration: readQuantity(budget.maxDuration, durationUnits),
       maxFileBytes: readQuantity(params.maxFileBytes, sizeUnits),
+      maxRate: params.maxMibPerSecond === undefined ? undefined : String(params.maxMibPerSecond),
+      minTargetFree: params.minTargetFreePercent === undefined ? undefined : String(params.minTargetFreePercent),
+      retries: params.retries === undefined ? undefined : String(params.retries),
+      maxConcurrency: params.maxConcurrency === undefined ? undefined : String(params.maxConcurrency),
       profile: spec.execution.profileRef,
+      candidateOrder: spec.execution.candidateOrder,
+      requireOperatorApproval: spec.execution.requireOperatorApproval,
+      pauseErrorRate: spec.execution.failurePause && String(spec.execution.failurePause.percent),
+      pauseMinFailures: spec.execution.failurePause && String(spec.execution.failurePause.minFailures),
       authorization: spec.governance.authorizationRef, approval: spec.governance.approvalPolicyRef,
     };
     // Only configurations that can be submitted without losing fields are editable.
@@ -312,7 +397,17 @@ export function validateStep(step: WizardStep, v: WizardValues, resources: Resou
   const checkGroup = (field: FieldPath, group: ConditionGroup) => {
     group.clauses.forEach((clause, i) => {
       const path = [...field, 'clauses', i];
-      if (clause.field === 'object.size') {
+      if (isNamespaceField(clause.field)) {
+        if (!v.scoped) report([...path, 'field'], '路径和文件名条件需要限定目录范围');
+        if (!clause.amount || clause.amount.includes('\0') || new TextEncoder().encode(clause.amount).length > 4095) {
+          report([...path, 'amount'], '请输入有效路径或通配模式');
+        } else if (clause.field === 'object.path' && clause.op !== 'glob' && !clause.amount.startsWith('/')) {
+          report([...path, 'amount'], '完整路径须以 / 开头');
+        }
+      } else if (isIdentityField(clause.field)) {
+        const value = integer(clause.amount, true);
+        if (value === undefined || value > 0xffffffffn) report([...path, 'amount'], '请输入 0–4294967295 的整数');
+      } else if (clause.field === 'object.size') {
         checkQuantity(path, clause, sizeFactors, maxI64, true);
       } else {
         checkQuantity(path, clause, durationFactors, BigInt(90_000_000) * durationFactors.d);
@@ -363,14 +458,24 @@ export function validateStep(step: WizardStep, v: WizardValues, resources: Resou
       break;
     }
     case 'trigger':
-      checkQuantity(['interval'], v.interval,
-        { m: durationFactors.m, h: durationFactors.h, d: durationFactors.d },
-        BigInt(Date.UTC(10000, 0, 1) - Date.now() - 1));
+      if (v.trigger !== 'manual') {
+        checkQuantity(['interval'], v.interval,
+          { m: durationFactors.m, h: durationFactors.h, d: durationFactors.d },
+          BigInt(Date.UTC(10000, 0, 1) - Date.now() - 1));
+        if (v.trigger === 'pool_usage') {
+          const high = integer(v.highWatermark ?? '');
+          const low = integer(v.lowWatermark ?? '', true);
+          if (high === undefined || high > 100n) report(['highWatermark'], '请输入 1–100 的整数');
+          if (low === undefined || high === undefined || low >= high) report(['lowWatermark'], '低水位须小于高水位');
+        } else if (v.firstTime) {
+          if (!clockTime.test(v.firstTime)) report(['firstTime'], '请输入有效的首次启动时刻');
+          if (!validTimezone(v.firstTimezone ?? '')) report(['firstTimezone'], '请输入有效的 IANA 时区');
+        }
+      }
       if (v.windowEnabled) {
         if (!validTimezone(v.timezone)) report(['timezone'], '请输入有效的 IANA 时区');
-        const time = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
-        if (!time.test(v.start)) report(['start'], '请输入开始时刻');
-        if (!time.test(v.end) || v.end === v.start) report(['end'], '结束时刻须有效且不同于开始时刻');
+        if (!clockTime.test(v.start)) report(['start'], '请输入开始时刻');
+        if (!clockTime.test(v.end) || v.end === v.start) report(['end'], '结束时刻须有效且不同于开始时刻');
       }
       break;
     case 'execution':
@@ -381,6 +486,19 @@ export function validateStep(step: WizardStep, v: WizardValues, resources: Resou
       checkQuantity(['maxLogicalBytes'], v.maxLogicalBytes, sizeFactors, maxU64);
       checkQuantity(['maxDuration'], v.maxDuration, durationFactors, maxU64);
       checkQuantity(['maxFileBytes'], v.maxFileBytes, sizeFactors, maxI64);
+      if (v.maxRate && (integer(v.maxRate) ?? 0n) === 0n) report(['maxRate'], '请输入正整数');
+      if (v.maxRate && (integer(v.maxRate) ?? 0n) > 0xffffffffn) report(['maxRate'], '带宽超出支持范围');
+      if (v.minTargetFree && (integer(v.minTargetFree, true) ?? 101n) > 100n) {
+        report(['minTargetFree'], '请输入 0–100 的整数');
+      }
+      if (v.retries && (integer(v.retries, true) ?? 256n) > 255n) report(['retries'], '请输入 0–255 的整数');
+      if (v.maxConcurrency && (integer(v.maxConcurrency) ?? 65n) > 64n) report(['maxConcurrency'], '请输入 1–64 的整数');
+      if (v.pauseErrorRate || v.pauseMinFailures) {
+        if ((integer(v.pauseErrorRate ?? '') ?? 101n) > 100n) report(['pauseErrorRate'], '请输入 1–100 的整数');
+        if ((integer(v.pauseMinFailures ?? '') ?? (maxU64 + 1n)) > BigInt(Number.MAX_SAFE_INTEGER)) {
+          report(['pauseMinFailures'], '请输入支持范围内的正整数');
+        }
+      }
       for (const key of ['profile', 'authorization', 'approval'] as const) {
         if (!resources[key].some(({ name }) => name === v[key])) report([key], '请选择当前可用的资源');
       }

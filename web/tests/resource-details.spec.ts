@@ -1,5 +1,42 @@
 import { expect, test } from '@playwright/test';
 
+test('adds a discovered Lustre mount through the resource form', async ({ page }) => {
+  let registered = false;
+  const path = '/mnt/new-fs';
+  const record = {
+    id: 'new-fs', name: '测试集群', path, source: '192.0.2.1@tcp:/labfs', owner: 'external',
+    options: [], autoMount: false, desiredMounted: false, tiers: {},
+  };
+  await page.route('**/api/filesystems/management', (route) => {
+    if (route.request().method() === 'POST') {
+      expect(route.request().postDataJSON()).toEqual({
+        id: record.id, name: record.name, mount: { type: 'existing', path },
+      });
+      registered = true;
+      return route.fulfill({ status: 201, json: record });
+    }
+    return route.fulfill({ json: {
+      canCreateMount: false, resources: registered ? [record] : [],
+      availableMounts: registered ? [] : [{ path, source: record.source }],
+    } });
+  });
+  await page.route('**/api/filesystems', (route) => route.fulfill({ json: registered ? [{
+    id: record.id, mountPath: path, mountStatus: 'mounted', collectionStatus: 'pending',
+    observedAt: null, tieringAvailable: false, capacity: { status: 'missing', sample: null },
+    mount: { source: record.source, readOnly: false }, pools: null,
+  }] : [] }));
+  await page.route('**/api/filesystems/refresh', (route) => route.fulfill({ status: 204 }));
+  await page.goto('/console/#/resources');
+  await page.getByRole('button', { name: '添加集群' }).click();
+  const form = page.getByRole('dialog', { name: '添加集群' });
+  await form.getByLabel('文件系统 ID').fill(record.id);
+  await form.getByLabel('集群名称').fill(record.name);
+  await form.getByRole('combobox', { name: '本机 Lustre 挂载' }).click();
+  await page.getByRole('option', { name: `${path} · ${record.source}` }).click();
+  await form.getByRole('button', { name: '添加', exact: true }).click();
+  await expect(page.getByRole('link', { name: record.name })).toBeVisible();
+});
+
 test('opens a resource directly, refreshes that resource and follows an associated policy', async ({ page }) => {
   const now = Math.floor(Date.now() / 1000);
   const capacity = {

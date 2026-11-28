@@ -133,7 +133,7 @@ struct FidPathRequest {
     path: [u8; RBH_PATH_MAX],
 }
 
-fn fid_link_path(directory: &File, fid: &LuFid, index: u32) -> crate::Result<PathBuf> {
+pub(super) fn fid_link_path(directory: &File, fid: &LuFid, index: u32) -> crate::Result<PathBuf> {
     let mut request = FidPathRequest {
         fid: fid.into_raw(),
         record: 0,

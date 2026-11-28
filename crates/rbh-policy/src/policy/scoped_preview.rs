@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
 use chrono::{DateTime, Utc};
 use lustre_api::LuFid;
 use rbh_entry_store::{EntryKind, EntryStore, FileSystemConfig, FileSystemId, fid_codec};
+use serde::Serialize;
 use sqlx::{MySqlConnection, QueryBuilder};
 
 use super::{
@@ -13,11 +14,13 @@ use super::{
         DirectoryScope, LinkEvidence, LinkLocation, MAX_PATH_BYTES, ScopeDecision, ScopeSummary, valid_component,
     },
     heat::{self, HeatProfile, PreviewHeat},
+    push_expression,
 };
 use crate::PolicyError;
 
 type Fid = [u8; 16];
 const CATALOG_BATCH: usize = 512;
+const PREVIEW_SAMPLE: usize = 40;
 const DIRECTORY_CACHE: usize = 65_536;
 
 #[derive(Default)]
@@ -27,6 +30,16 @@ pub(super) struct ScopedTotals {
     pub(super) scope: ScopeSummary,
     heat_deferrals: BTreeMap<String, u64>,
     pub(super) read_heat: Option<PreviewHeat>,
+    pub(super) sample: Vec<PreviewFile>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewFile {
+    fid: LuFid,
+    paths: Vec<String>,
+    rule: Option<String>,
+    outcome: &'static str,
 }
 
 #[derive(sqlx::FromRow)]
@@ -183,6 +196,8 @@ struct CandidateLink {
     nlink: u32,
     lustre_link_count_known: bool,
     heat_reason: Option<String>,
+    branch: Option<i64>,
+    eligible: Option<bool>,
 }
 
 impl ScopedTotals {
@@ -209,7 +224,7 @@ impl ScopedTotals {
 
 pub(super) async fn evaluate(
     entries: &EntryStore, policy: &CompiledPolicy, config: &FileSystemConfig, scope: &DirectoryScope,
-    profile: Option<&HeatProfile>, heat_fid: Option<LuFid>,
+    profile: Option<&HeatProfile>, heat_fid: Option<LuFid>, sample: bool,
 ) -> Result<ScopedTotals, PolicyError> {
     let migration = policy
         .pool_migration()
@@ -235,9 +250,14 @@ pub(super) async fn evaluate(
         .await?;
     let mut directories = DirectoryIndex::new(root);
     let mut totals = ScopedTotals::default();
+    if sample {
+        let page = candidate_page(&mut tx, policy, profile, now, database_now, None, true).await?;
+        directories.load_ancestors(&mut tx, &config.id, &page).await?;
+        totals.sample = preview_files(policy, scope, &mut directories, &page)?;
+    }
     let mut after = None;
     loop {
-        let page = candidate_page(&mut tx, policy, profile, now, database_now, after).await?;
+        let page = candidate_page(&mut tx, policy, profile, now, database_now, after, false).await?;
         let Some(last) = page.last() else {
             break;
         };
@@ -266,18 +286,80 @@ pub(super) async fn evaluate(
     Ok(totals)
 }
 
+fn preview_files(
+    policy: &CompiledPolicy, scope: &DirectoryScope, directories: &mut DirectoryIndex, page: &[CandidateLink],
+) -> Result<Vec<PreviewFile>, PolicyError> {
+    let mut samples = Vec::new();
+    for links in page.chunk_by(|a, b| a.link.object_id == b.link.object_id) {
+        let file = &links[0];
+        let fid =
+            fid_codec::decode(&file.link.object_id).ok_or_else(|| PolicyError::Store("invalid preview FID".into()))?;
+        let mut evidence = LinkEvidence::default();
+        let mut paths = BTreeSet::new();
+        for link in links {
+            let parent = link.link.parent();
+            evidence.observe(parent.and_then(|id| directories.locate(id, scope)));
+            if paths.len() < 8
+                && let Some(parts) = parent.and_then(|id| directories.walk_to_root(id))
+                && let Some(name) = link.link.name.as_deref()
+            {
+                let path = parts
+                    .into_iter()
+                    .chain([name])
+                    .map(String::from_utf8_lossy)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                paths.insert(format!("/{path}"));
+            }
+        }
+        let outcome = match evidence.decide(if file.lustre_link_count_known { file.nlink } else { 0 }) {
+            ScopeDecision::Deferred(_) => "incomplete_link_evidence",
+            ScopeDecision::Excluded(super::ExclusionReason::LinkInExcludedSubtree) => "link_in_excluded_subtree",
+            ScopeDecision::Excluded(super::ExclusionReason::LinkOutsideScope) => "link_outside_scope",
+            ScopeDecision::Allowed => match (file.eligible, file.branch) {
+                (Some(false), _) => "filtered",
+                (Some(true), Some(branch)) if branch > 0 => "planned",
+                (Some(true), Some(branch)) if branch < 0 => "retained",
+                (Some(true), Some(_)) => "no_rule",
+                _ => "condition_unknown",
+            },
+        };
+        let rule = matches!(outcome, "planned" | "retained")
+            .then(|| file.branch.and_then(|branch| policy.rule_labels.get(&branch).cloned()))
+            .flatten();
+        samples.push(PreviewFile {
+            fid,
+            paths: paths.into_iter().collect(),
+            rule,
+            outcome,
+        });
+    }
+    Ok(samples)
+}
+
 async fn candidate_page(
     db: &mut MySqlConnection, policy: &CompiledPolicy, profile: Option<&HeatProfile>, now: DateTime<Utc>,
-    database_now: i64, after: Option<Fid>,
+    database_now: i64, after: Option<Fid>, sample: bool,
 ) -> Result<Vec<CandidateLink>, PolicyError> {
     // Limit the FIDs before joining their names, so a file's links stay in one page.
-    let mut query = QueryBuilder::new(
-        "SELECT page.object_id, page.size, page.nlink, page.lustre_link_count_known,
+    let mut query = QueryBuilder::new("");
+    policy.push_namespace_paths(&mut query, None);
+    query.push(
+        "SELECT page.object_id, page.size, page.nlink, page.lustre_link_count_known, page.branch, page.eligible,
                 CASE WHEN page.matched IS NULL THEN page.heat_reason END AS heat_reason,
                 edge.parent_kind, edge.parent_id, edge.name
          FROM (SELECT * FROM (
              SELECT entries.filesystem_id, entries.object_kind, entries.object_id, size, nlink, lustre_link_count_known, ",
     );
+    if sample {
+        query.push("CAST((");
+        push_expression(&mut query, &policy.decision, &policy.decision_params);
+        query.push(") AS SIGNED) AS branch, (");
+        policy.push_scope(&mut query, Some(database_now));
+        query.push(") AS eligible, ");
+    } else {
+        query.push("NULL AS branch, NULL AS eligible, ");
+    }
     if policy.uses_read_heat {
         query
             .push("COALESCE(heat_status, ")
@@ -302,15 +384,28 @@ async fn candidate_page(
     if let Some(after) = after {
         query.push(" AND entries.object_id > ").push_bind(after.to_vec());
     }
-    query.push(") AS evaluated WHERE matched ");
-    query.push(if policy.uses_read_heat {
-        "IS NOT FALSE"
+    if sample {
+        query
+            .push(" AND (entries.kind = 0 AND CAST(entries.pool_name AS BINARY) = CAST(")
+            .push_bind(
+                policy
+                    .pool_migration()
+                    .expect("scoped pool migration")
+                    .source_pool
+                    .as_str(),
+            )
+            .push(" AS BINARY))) AS evaluated");
     } else {
-        "IS TRUE"
-    });
+        query.push(") AS evaluated WHERE matched ");
+        query.push(if policy.uses_read_heat {
+            "IS NOT FALSE"
+        } else {
+            "IS TRUE"
+        });
+    }
     query
         .push(" ORDER BY object_id LIMIT ")
-        .push_bind(CATALOG_BATCH as u32)
+        .push_bind(if sample { PREVIEW_SAMPLE } else { CATALOG_BATCH } as u32)
         .push(
             ") AS page LEFT JOIN scoped_namespace_edges AS edge USING (filesystem_id, object_kind, object_id)
          ORDER BY page.object_id",

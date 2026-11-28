@@ -269,16 +269,26 @@ CREATE TABLE `policy_worker_lock` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
+CREATE TABLE `console_lustre_resources` (
+  `observer_id` varbinary(255) NOT NULL,
+  `filesystem_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `metadata` JSON NOT NULL,
+  PRIMARY KEY (`observer_id`, `filesystem_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
 CREATE TABLE `policy_runs` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `policy_id` bigint unsigned NOT NULL,
   `revision` bigint unsigned NOT NULL,
-  `state` enum('queued','running','previewed','finished','deferred','cancelled') NOT NULL DEFAULT 'queued',
+  `state` enum('queued','running','previewed','finished','deferred','cancelled','paused','awaiting_approval') NOT NULL DEFAULT 'queued',
   `reason` varchar(255) DEFAULT NULL,
   `candidate_count` bigint unsigned DEFAULT NULL,
   `estimated_bytes` bigint unsigned DEFAULT NULL,
   `cursor_id` binary(16) DEFAULT NULL,
+  `cursor_value` bigint DEFAULT NULL,
+  `paused_millis` bigint unsigned NOT NULL DEFAULT 0,
   `requested_by` varchar(255) DEFAULT NULL,
+  `approved_by` varchar(255) DEFAULT NULL,
   `created_at` datetime(6) NOT NULL DEFAULT current_timestamp(6),
   `started_at` datetime(6) DEFAULT NULL,
   `updated_at` datetime(6) NOT NULL DEFAULT current_timestamp(6) ON UPDATE current_timestamp(6),
@@ -307,6 +317,9 @@ CREATE TABLE `policy_operations` (
   `finished_at` datetime(6) DEFAULT NULL,
   `completion_evidence` JSON DEFAULT NULL,
   `attempted` tinyint(1) NOT NULL DEFAULT 0,
+  `attempt_count` int unsigned DEFAULT NULL,
+  `attempts_reserved` int unsigned NOT NULL DEFAULT 1,
+  `migration_lease_until` datetime(6) DEFAULT NULL,
   `generation` JSON DEFAULT NULL,
   `principal` JSON DEFAULT NULL,
   `size` bigint unsigned NOT NULL,
@@ -314,16 +327,28 @@ CREATE TABLE `policy_operations` (
   `checked_at` datetime(6) DEFAULT NULL,
   `pending_fid` binary(16) GENERATED ALWAYS AS (case when `state` in ('submitting','submitted','unknown') then `fid` else NULL end) STORED,
   `migration_plan` JSON DEFAULT NULL,
+  `paths` JSON DEFAULT NULL,
   `pending_migration_fs` varchar(64) GENERATED ALWAYS AS (case when `migration_plan` is not null and `state` in ('submitting','submitted','unknown') then `filesystem` else NULL end) STORED,
   PRIMARY KEY (`id`),
   UNIQUE KEY `run_id` (`run_id`,`fid`),
   UNIQUE KEY `filesystem` (`filesystem`,`pending_fid`),
-  UNIQUE KEY `idx_policy_migration_fs` (`pending_migration_fs`),
+  KEY `idx_policy_migration_fs` (`pending_migration_fs`),
   KEY `idx_policy_operations_pending` (`pending_fid`,`checked_at`,`id`),
   KEY `idx_policy_profile_pending` (`execution_profile`,`pending_fid`),
   KEY `idx_policy_operations_run_id` (`run_id`,`id`),
   KEY `idx_policy_operations_run_state_id` (`run_id`,`state`,`id`),
   CONSTRAINT `policy_operations_ibfk_1` FOREIGN KEY (`run_id`) REFERENCES `policy_runs` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+CREATE TABLE `policy_run_controls` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `run_id` bigint unsigned NOT NULL,
+  `action` enum('pause','resume','cancel','approve') NOT NULL,
+  `actor` varchar(255) NOT NULL,
+  `occurred_at` datetime(6) NOT NULL DEFAULT current_timestamp(6),
+  PRIMARY KEY (`id`),
+  KEY `idx_run_controls_run` (`run_id`,`id`),
+  CONSTRAINT `fk_run_controls_run` FOREIGN KEY (`run_id`) REFERENCES `policy_runs` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
 
 CREATE TABLE `policy_breakers` (
@@ -344,4 +369,4 @@ CREATE TABLE rbh_schema (
   id tinyint unsigned NOT NULL PRIMARY KEY CHECK (id = 1),
   version int unsigned NOT NULL
 ) ENGINE=InnoDB;
-INSERT INTO rbh_schema (id, version) VALUES (1, 1);
+INSERT INTO rbh_schema (id, version) VALUES (1, 2);

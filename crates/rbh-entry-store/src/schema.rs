@@ -2,11 +2,12 @@ use sqlx::{MySql, Pool};
 
 use crate::error::{Result, StoreError};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 const REQUIRED_TABLES: &[&str] = &[
     "changelog_cursor",
     "classifiers",
+    "console_lustre_resources",
     "entries",
     "filesystem_baselines",
     "filesystem_resource_snapshots",
@@ -20,6 +21,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "policy_resource_heads",
     "policy_resource_revisions",
     "policy_revisions",
+    "policy_run_controls",
     "policy_runs",
     "policy_worker_lock",
     "removed_entries",

@@ -5,6 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -75,17 +76,49 @@ impl LustreApi {
 }
 
 pub(crate) fn open_by_fid(mount: &Path, fid: &LuFid, flags: libc::c_int) -> Result<Option<OwnedFd>> {
-    validate_mount(mount)?;
-    let path = CString::new(mount.as_os_str().as_bytes())?;
     let raw_fid = fid.into_raw();
-    // SAFETY: path and raw_fid are valid for the call.
-    let fd = unsafe { sys::llapi_open_by_fid(path.as_ptr(), &raw_fid, flags | libc::O_CLOEXEC) };
+    let flags = flags | libc::O_CLOEXEC;
+    let (fd, operation) = if let Some(open_at) = fid_open_at() {
+        let directory = crate::mount::open_directory(mount)?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the directory is live and stat has room for the output.
+        if unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: successful fstatfs initialized stat.
+        if unsafe { stat.assume_init() }.f_type != LUSTRE_SUPER_MAGIC {
+            return Err(LustreApiError::NotALustreMount(mount.to_owned()));
+        }
+        // The path-based Lustre helper caches a root fd that blocks unmount.
+        // SAFETY: directory and raw_fid remain live for the call.
+        let fd = unsafe { open_at(directory.as_raw_fd(), &raw_fid, flags) };
+        (fd, "llapi_open_by_fid_at")
+    } else {
+        validate_mount(mount)?;
+        let path = CString::new(mount.as_os_str().as_bytes())?;
+        // SAFETY: path and raw_fid remain live for the call.
+        let fd = unsafe { sys::llapi_open_by_fid(path.as_ptr(), &raw_fid, flags) };
+        (fd, "llapi_open_by_fid")
+    };
     if fd == -libc::ENOENT || fd == -libc::ESTALE {
         return Ok(None);
     }
-    check_rc(fd, "llapi_open_by_fid")?;
+    check_rc(fd, operation)?;
     // SAFETY: the successful open returned an owned file descriptor.
     Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+type FidOpenAt = unsafe extern "C" fn(libc::c_int, *const sys::lu_fid, libc::c_int) -> libc::c_int;
+
+pub(crate) fn fid_open_at() -> Option<FidOpenAt> {
+    static OPEN_AT: OnceLock<Option<FidOpenAt>> = OnceLock::new();
+    *OPEN_AT.get_or_init(|| {
+        // SAFETY: liblustreapi remains loaded and this is the published ABI.
+        unsafe {
+            let symbol = libc::dlsym(libc::RTLD_DEFAULT, c"llapi_open_by_fid_at".as_ptr());
+            (!symbol.is_null()).then(|| std::mem::transmute::<*mut c_void, FidOpenAt>(symbol))
+        }
+    })
 }
 
 /// Check the kernel filesystem type before a FID operation.

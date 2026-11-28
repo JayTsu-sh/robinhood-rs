@@ -3,17 +3,24 @@ import { Link, history } from '@umijs/max';
 import { Button, Empty, Popover, Select, Space, Tag, Typography } from 'antd';
 import { useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
+import InventoryStatistics from '@/components/InventoryStatistics';
+import ResourceManagement, { useResourceManagement } from '@/components/ResourceManagement';
 import {
   Availability, CapacityStatus, CollectionStatus, MountStatus, formatBytes,
   formatObservationTime, formatUsage, useObservationClock,
 } from '@/components/ResourceStatus';
 import { filesystemDetailsPath, listFilesystems, refreshFilesystems, type FilesystemResource } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
+import type { ResourceRegistration } from '@/services/resourceManagement';
 
-const resourceColumns = (now: number): ProColumns<FilesystemResource>[] => [
+const resourceColumns = (now: number, registrations: Map<string, ResourceRegistration>): ProColumns<FilesystemResource>[] => [
   {
     title: '文件系统 ID', dataIndex: 'id', width: 150,
-    render: (_, { id }) => <Link to={filesystemDetailsPath(id)} className="console-mono">{id}</Link>,
+    render: (_, { id }) => {
+      const name = registrations.get(id)?.name;
+      return <><Link to={filesystemDetailsPath(id)}>{name || id}</Link>
+        {name && name !== id && <div className="console-mono">{id}</div>}</>;
+    },
   },
   {
     title: '挂载路径',
@@ -86,6 +93,8 @@ const resourceColumns = (now: number): ProColumns<FilesystemResource>[] => [
 
 export default function Resources() {
   const { state, refresh } = useInventory(listFilesystems, refreshFilesystems);
+  const { management, refresh: reloadManagement } = useResourceManagement();
+  const registrations = new Map(management?.resources.map((resource) => [resource.id, resource]));
   const now = useObservationClock();
   const [availability, setAvailability] = useState('all');
   const allRows = state.status === 'ready' ? state.data : [];
@@ -98,8 +107,17 @@ export default function Resources() {
       title="Lustre 集群"
       status={state.status}
       error={state.status === 'error' ? state.message : undefined}
-      refresh={refresh}
+      refresh={() => { refresh(); reloadManagement(); }}
+      action={management && <ResourceManagement management={management}
+        onRefresh={() => { refresh(); reloadManagement(); }} />}
     >
+      <InventoryStatistics items={[
+        ['已接入文件系统', allRows.length],
+        ['已挂载', allRows.filter(({ mountStatus }) => mountStatus === 'mounted').length],
+        ['分层不可用', allRows.filter(({ tieringAvailable }) => !tieringAvailable).length],
+        ['可用 Pool', allRows.reduce((sum, { tieringAvailable, pools }) =>
+          sum + (tieringAvailable ? pools?.filter(({ eligible }) => eligible).length ?? 0 : 0), 0)],
+      ]} />
       <div className="console-table">
         <div className="console-controls">
           <Select
@@ -115,7 +133,7 @@ export default function Resources() {
           />
         </div>
         <ProTable
-          columns={resourceColumns(now)}
+          columns={resourceColumns(now, registrations)}
           dataSource={rows}
           rowKey="id"
           onRow={({ id }) => ({

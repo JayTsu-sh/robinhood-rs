@@ -9,6 +9,88 @@ use serde_json::{Value, json};
 use crate::{PolicyWriters, handlers::scoped_api_tests::state_without_database_connection};
 
 #[tokio::test]
+#[ignore = "requires isolated MariaDB"]
+async fn console_registration_is_authorized_and_restored_without_mounting() {
+    use axum::http::{StatusCode, header::AUTHORIZATION};
+    use sha2::{Digest, Sha256};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let entries = EntryStore::connect(&std::env::var("RBH_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let mut app = state_without_database_connection();
+    app.entry_store = entries.clone();
+    app.policy_store = rbh_policy::PolicyStore::new(entries.pool().clone()).with_configured_filesystems([]);
+    let observer = uuid::Uuid::new_v4().simple().to_string();
+    let resources = || ResourceObservations::new(entries.pool().clone(), observer.clone(), Vec::new());
+    let admin = |resources| {
+        crate::ResourceAdministration::new(app.clone(), resources, observer.clone(), Some(root.clone())).unwrap()
+    };
+    let writer = PolicyWriters::from_digest_json(
+        &json!({"mount-operator": hex::encode(Sha256::digest("mount-rest-test"))}).to_string(),
+    )
+    .unwrap();
+    let initial = resources();
+    let mut server = TestServer::new(admin(initial.clone()).routes(writer.clone())).unwrap();
+    let id = FileSystemId::new(format!("mount-{}", &observer[..12])).unwrap();
+    let endpoint = "/api/filesystems/management";
+    let request = json!({
+        "id": id, "name": "Lustre 测试资源",
+        "mount": { "type": "managed", "filesystem": "testfs", "mgsNids": "192.0.2.1@tcp",
+          "mountNow": false, "autoMount": true }
+    });
+    server
+        .post(endpoint)
+        .json(&request)
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    server.add_header(AUTHORIZATION, "Bearer mount-rest-test");
+    let unsafe_path = json!({
+        "id": id, "name": "Lustre 测试资源",
+        "mount": { "type": "managed", "filesystem": "testfs", "mgsNids": "192.0.2.1@tcp", "path": "/tmp" }
+    });
+    server
+        .post(endpoint)
+        .json(&unsafe_path)
+        .await
+        .assert_status_bad_request();
+    server
+        .post(endpoint)
+        .json(&request)
+        .await
+        .assert_status(StatusCode::CREATED);
+    assert!(initial.contains(&id));
+    assert!(!root.join(id.as_str()).exists());
+    let resource = format!("{endpoint}/{id}");
+    server
+        .post(&resource)
+        .json(&json!({"action":"rename","name":"已改名"}))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    server
+        .post(&resource)
+        .json(&json!({"action":"set_tier","pool":"cold","tier":"cold"}))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    let next = resources();
+    let restarted = admin(next.clone());
+    restarted.restore().await.unwrap();
+    assert!(next.contains(&id));
+    let mut server = TestServer::new(restarted.routes(writer)).unwrap();
+    server.add_header(AUTHORIZATION, "Bearer mount-rest-test");
+    let view = server.get(endpoint).await.json::<Value>();
+    assert_eq!(view["resources"][0]["name"], "已改名");
+    assert_eq!(view["resources"][0]["tiers"]["cold"], "cold");
+    server
+        .post(&resource)
+        .json(&json!({"action":"remove"}))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert!(!next.contains(&id));
+}
+
+#[tokio::test]
 async fn daemon_serves_the_console_and_assets_beside_the_api() {
     let assets = tempfile::tempdir().unwrap();
     std::fs::write(

@@ -3,15 +3,24 @@ import { linkSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node
 import { readFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { expect, test, type APIRequestContext } from '@playwright/test';
+import type { FileOperation } from '../src/services/executions';
 
 const action = 'lustre.pool_migrate';
 
-test('an operator creates a scoped policy in the console and downloads real Lustre results', async ({ page, request }) => {
-  const root = process.env.RBH_CONSOLE_EXECUTION_TEST_ROOT;
-  const mount = process.env.RBH_CONSOLE_EXECUTION_TEST_MOUNT;
-  const filesystem = process.env.RBH_CONSOLE_EXECUTION_TEST_FS;
-  const token = process.env.RBH_CONSOLE_EXECUTION_TEST_TOKEN;
-  test.skip(!root || !mount || !filesystem || !token, 'requires a disposable Lustre directory, daemon and writer');
+test('an operator creates a scoped policy in the console and downloads real Lustre results', { tag: '@daemon' }, async ({ page, request }) => {
+  const fixture = {
+    RBH_CONSOLE_EXECUTION_TEST_ROOT: process.env.RBH_CONSOLE_EXECUTION_TEST_ROOT,
+    RBH_CONSOLE_EXECUTION_TEST_MOUNT: process.env.RBH_CONSOLE_EXECUTION_TEST_MOUNT,
+    RBH_CONSOLE_EXECUTION_TEST_FS: process.env.RBH_CONSOLE_EXECUTION_TEST_FS,
+    RBH_CONSOLE_EXECUTION_TEST_TOKEN: process.env.RBH_CONSOLE_EXECUTION_TEST_TOKEN,
+  };
+  test.skip(Object.values(fixture).every((value) => value === undefined), 'requires a disposable Lustre directory, daemon and writer');
+  const missing = Object.entries(fixture).filter(([, value]) => !value?.trim()).map(([name]) => name);
+  if (missing.length > 0) throw new Error(`Missing Lustre console test settings: ${missing.join(', ')}`);
+  const {
+    RBH_CONSOLE_EXECUTION_TEST_ROOT: root, RBH_CONSOLE_EXECUTION_TEST_MOUNT: mount,
+    RBH_CONSOLE_EXECUTION_TEST_FS: filesystem, RBH_CONSOLE_EXECUTION_TEST_TOKEN: token,
+  } = fixture;
   test.setTimeout(120_000);
   const writer = { Authorization: `Bearer ${token}` };
   const lfs = (...args: string[]) => execFileSync('lfs', args, { encoding: 'utf8' }).trim();
@@ -50,6 +59,16 @@ test('an operator creates a scoped policy in the console and downloads real Lust
       floorDefaults: { minApprovers: 1, approverRoles: ['approver'] },
     }],
     ['system-safety-policies', 'SystemSafetyPolicy', { scope: { filesystems: [filesystem] }, allowedActions: [action] }],
+    ['execution-profiles', 'ExecutionProfile', {
+      concurrency: { global: 2 },
+      retry: { maxAttempts: 1, backoff: 'fixed', initialDelay: '1s', maxDelay: '1s', retryableErrors: ['transient_io'] },
+      workerLease: { ttl: '1m', renewEvery: '10s', onLeaseLost: 'stop_and_reconcile' },
+      circuitBreaker: { scopes: [{
+        domain: { key: 'policy' }, errorClasses: ['backend_unavailable'], evaluation: 'any',
+        conditions: [{ type: 'consecutive_failures', threshold: 1 }],
+        onOpen: 'suspend_submissions', resetMode: 'manual',
+      }] },
+    }],
   ] as const) {
     const response = await request.post(`/api/${path}`, {
       headers: writer, data: { apiVersion: 'hsm.storage.io/v1alpha3', kind, metadata: { name: label }, spec },
@@ -129,6 +148,7 @@ test('an operator creates a scoped policy in the console and downloads real Lust
   const governanceOption = new RegExp(`^${label} · 修订 `);
   await select('授权策略', governanceOption);
   await select('审批策略', governanceOption);
+  await select('执行模式', '实际执行');
   await next();
   await page.getByRole('button', { name: '计算预览' }).click();
   const preview = page.getByRole('region', { name: '预览结果' });
@@ -253,6 +273,52 @@ test('an operator creates a scoped policy in the console and downloads real Lust
   expect(pool(files[5])).toBe('cold');
   expect(members).toContain(ost(files[5]));
   expect(fid(files[5])).toBe(ids[5]);
+
+  // Limit copy bandwidth so both operations remain observable through the run API.
+  const parallelFiles = ['parallel-a', 'parallel-b'].map((name) => join(root!, 'team', name));
+  const parallelContent = parallelFiles.map((_, index) => Buffer.alloc(4 * 1024 * 1024, index + 1));
+  parallelFiles.forEach((file, index) => {
+    lfs('setstripe', '-p', 'hot', '-c', '1', file);
+    writeFileSync(file, parallelContent[index]);
+  });
+  const parallelFids = parallelFiles.map(fid);
+  await scanFixture();
+  const parallel = structuredClone(document);
+  parallel.metadata.name += '-parallel';
+  parallel.spec.enabled = true;
+  parallel.spec.target.where.all[0] = { field: 'object.size', op: 'eq', value: '4MiB' };
+  parallel.spec.execution.profileRef = label;
+  parallel.spec.execution.budget.run.maxObjectLogicalBytes = '8MiB';
+  const params = {
+    ...parallel.spec.rules.defaults.action.params, maxFileBytes: '4MiB', maxConcurrency: 2, maxMibPerSecond: 2,
+  };
+  const parallelId = await create({
+    ...parallel,
+    spec: {
+      ...parallel.spec,
+      rules: { ...parallel.spec.rules, defaults: { action: { type: action, params } } },
+    },
+  });
+  const parallelSubmission = await request.post(`/api/policies/${parallelId}/run`, { headers: writer });
+  expect(parallelSubmission.status(), await parallelSubmission.text()).toBe(202);
+  const parallelRun = (await parallelSubmission.json()).runIdExact;
+  const parallelOperations = async (): Promise<FileOperation[]> => {
+    const response = await request.get(`/api/runs/${parallelRun}/operations`);
+    expect(response.ok()).toBe(true);
+    return (await response.json()).items;
+  };
+  await expect.poll(async () => (await parallelOperations())
+    .filter(({ state }) => state === 'submitting').map(({ fid }) => fid).sort(),
+  { intervals: [100], timeout: 10_000 }).toEqual([...parallelFids].sort());
+  await expect.poll(async () => (await readRun(request, parallelRun)).state, { timeout: 20_000 }).toBe('finished');
+  expect(await parallelOperations()).toEqual(expect.arrayContaining(parallelFids.map((fid) => expect.objectContaining({
+    fid, state: 'completed', completionEvidence: expect.objectContaining({ pool: 'cold' }),
+  }))));
+  parallelFiles.forEach((file, index) => {
+    expect(fid(file)).toBe(parallelFids[index]);
+    expect(pool(file)).toBe('cold');
+    expect(readFileSync(file).equals(parallelContent[index])).toBe(true);
+  });
 });
 
 async function readRun(request: APIRequestContext, id: string) {

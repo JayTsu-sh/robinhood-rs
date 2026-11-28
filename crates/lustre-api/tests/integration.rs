@@ -163,6 +163,34 @@ fn hsm_state_get_on_plain_file() {
 }
 
 #[test]
+fn fid_lookups_release_the_mount_directory() {
+    let Some(root) = std::env::var_os("RBH_TEST_MIGRATION_HOT_DIR") else {
+        return;
+    };
+    let mount = fs::canonicalize(std::env::var_os("RBH_TEST_LUSTRE_MOUNT").expect("set the Lustre mount")).unwrap();
+    let path = fs::canonicalize(root).unwrap().join(unique_name("rbh_fid_lookup"));
+    fs::write(&path, b"FID lookup fixture").unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let mount_descriptors = || {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter(|target| target == &mount)
+            .count()
+    };
+    let original = mount_descriptors();
+    let api = LustreApi;
+    let fid = api.path_to_fid(&path).unwrap();
+    assert_eq!(
+        api.fid_to_path(mount.to_str().unwrap(), &fid).unwrap(),
+        path.strip_prefix(&mount).unwrap()
+    );
+    assert!(api.get_ost_layout_by_fid(&mount, &fid).unwrap().is_some());
+    assert_eq!(mount_descriptors(), original);
+}
+
+#[test]
 fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
     use lustre_api::migration::{FileVersion, MigrationLimits, MigrationOwnership, MigrationPlacement, MigrationPlan};
     use std::os::unix::fs::{FileExt, MetadataExt};
@@ -204,6 +232,10 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
         target_pool: "cold".into(),
         stripe_count: 1,
         stripe_size: 1024 * 1024,
+        max_bytes_per_second: None,
+        min_target_free_percent: None,
+        filesystem_concurrency: None,
+        expected_mount_source: None,
     };
     let generation = FileVersion::from(&metadata);
     assert!(matches!(
@@ -227,7 +259,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
             &plan,
             generation,
             limits,
-            &MigrationOwnership::acquire(&fsname).unwrap()
+            &MigrationOwnership::acquire(&fsname, fid).unwrap()
         ),
         Err(lustre_api::migration::MigrationError::Deferred(
             "admission_window_closed"
@@ -254,7 +286,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
             &plan,
             generation,
             limits,
-            &MigrationOwnership::acquire(&fsname).unwrap()
+            &MigrationOwnership::acquire(&fsname, fid).unwrap()
         ),
         Err(lustre_api::migration::MigrationError::Deferred(
             "migration_deadline_elapsed"

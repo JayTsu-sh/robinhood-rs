@@ -147,6 +147,25 @@ async fn scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_r
     assert_eq!(preview["revision"], serde_json::Value::Null);
     assert_eq!(preview["candidateCount"], 1);
     assert_eq!(preview["estimatedBytes"], 100);
+    assert!(
+        preview["sampleFiles"].as_array().unwrap().iter().any(|sample| {
+            sample["outcome"] == "planned" && sample["paths"] == json!(["/team/a", "/team/project/a"])
+        })
+    );
+    let mut namespace = document.clone();
+    namespace["spec"]["target"]["where"] = json!({"field": "object.path", "op": "glob", "value": "/team/*"});
+    namespace["spec"]["rules"]["entries"][0]["name"] = "matches-path".into();
+    let response = server.post("/api/policies/preview").json(&namespace).await;
+    response.assert_status_ok();
+    let filtered = response.json::<serde_json::Value>();
+    assert_eq!(filtered["candidateCount"], 1);
+    assert!(
+        filtered["sampleFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sample| sample["rule"] == "matches-path")
+    );
     assert_eq!(
         preview["directoryScope"],
         json!({

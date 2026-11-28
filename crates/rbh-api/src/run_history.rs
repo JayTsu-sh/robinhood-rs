@@ -1,18 +1,21 @@
 use std::{io, time::Duration};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{Path, Query, State},
-    http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE},
+    http::{
+        HeaderMap, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::stream;
 use lustre_api::LuFid;
 use rbh_policy::store::{
-    HistoryOperation, HistoryPage, OperationFilter, OperationSearch, OperationState, OperationSummary, RunHistory,
-    RunReportSnapshot, RunSearch, RunState,
+    HistoryOperation, HistoryPage, OperationFilter, OperationSearch, OperationState, OperationSummary,
+    RunActivationMode, RunControl, RunHistory, RunReportSnapshot, RunSearch, RunState,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -30,7 +33,10 @@ const REPORT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/runs", get(list_runs))
+        .route("/runs/summary", get(run_statistics))
         .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/control", post(control_run))
+        .route("/runs/{id}/telemetry", get(run_telemetry))
         .route("/runs/{id}/operations", get(list_operations))
         .route("/runs/{id}/operations/summary", get(summarize_operations))
         .route("/runs/{id}/reports/{kind}", get(export_report))
@@ -43,6 +49,7 @@ struct RunQuery {
     policy_name: Option<String>,
     run_id: Option<u64>,
     state: Option<RunState>,
+    activation_mode: Option<RunActivationMode>,
     before_id: Option<u64>,
     limit: Option<u16>,
 }
@@ -53,6 +60,7 @@ struct OperationQuery {
     state: Option<OperationState>,
     reason: Option<String>,
     fid: Option<String>,
+    path: Option<String>,
     #[serde(default)]
     exceptions_only: bool,
     after_id: Option<u64>,
@@ -61,9 +69,14 @@ struct OperationQuery {
 
 impl OperationQuery {
     fn filter(self) -> Result<OperationFilter, ApiError> {
+        let path = trimmed(self.path);
+        if path.as_ref().is_some_and(|path| path.len() > 4096) {
+            return Err(ApiError::BadRequest("path search exceeds 4096 bytes".into()));
+        }
         Ok(OperationFilter {
             state: self.state,
             reason: self.reason.filter(|reason| !reason.is_empty()),
+            path,
             exceptions_only: self.exceptions_only,
             fid: trimmed(self.fid)
                 .map(|value| value.parse::<LuFid>())
@@ -94,10 +107,144 @@ async fn list_runs(
         policy_name: trimmed(query.policy_name),
         run_id: query.run_id,
         state: query.state,
+        activation_mode: query.activation_mode,
         before_id: query.before_id,
         limit: page_limit(query.limit)?,
     };
     Ok(Json(state.policy_store.search_policy_runs(filter).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatisticsQuery {
+    policy_id: Option<u64>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct RunStatistics {
+    total: u64,
+    queued: u64,
+    running: u64,
+    paused: u64,
+    awaiting_approval: u64,
+    ended: u64,
+    exception_runs: u64,
+    completed_objects: u64,
+    failed_objects: u64,
+    completed_last_day: u64,
+    completed_logical_bytes: String,
+}
+
+#[tracing::instrument(skip_all)]
+async fn run_statistics(
+    State(state): State<AppState>, Query(query): Query<StatisticsQuery>,
+) -> Result<Json<RunStatistics>, ApiError> {
+    let stats = sqlx::query_as(
+        "WITH runs AS (SELECT id, state FROM policy_runs WHERE (? IS NULL OR policy_id = ?)),
+           results AS (
+             SELECT o.run_id, SUM(o.state = 'completed') AS completed, SUM(o.state = 'failed') AS failed,
+               SUM(o.state IN ('failed','unknown','deferred')) AS exceptions,
+               SUM(o.state = 'completed' AND o.finished_at >= UTC_TIMESTAMP(6) - INTERVAL 1 DAY) AS last_day,
+               SUM(CASE WHEN o.state = 'completed' THEN o.size ELSE 0 END) AS logical_bytes
+             FROM runs r JOIN policy_operations o ON o.run_id = r.id GROUP BY o.run_id
+           )
+           SELECT CAST(COUNT(*) AS UNSIGNED) AS total,
+             CAST(COALESCE(SUM(state = 'queued'),0) AS UNSIGNED) AS queued,
+             CAST(COALESCE(SUM(state = 'running'),0) AS UNSIGNED) AS running,
+             CAST(COALESCE(SUM(state = 'paused'),0) AS UNSIGNED) AS paused,
+             CAST(COALESCE(SUM(state = 'awaiting_approval'),0) AS UNSIGNED) AS awaiting_approval,
+             CAST(COALESCE(SUM(state NOT IN ('queued','running','paused','awaiting_approval')),0) AS UNSIGNED) AS ended,
+             CAST(COALESCE(SUM(exceptions > 0),0) AS UNSIGNED) AS exception_runs,
+             CAST(COALESCE(SUM(completed),0) AS UNSIGNED) AS completed_objects,
+             CAST(COALESCE(SUM(failed),0) AS UNSIGNED) AS failed_objects,
+             CAST(COALESCE(SUM(last_day),0) AS UNSIGNED) AS completed_last_day,
+             CAST(COALESCE(SUM(logical_bytes),0) AS CHAR) AS completed_logical_bytes
+           FROM runs LEFT JOIN results ON results.run_id = runs.id",
+    )
+    .bind(query.policy_id)
+    .bind(query.policy_id)
+    .fetch_one(state.entry_store.pool())
+    .await
+    .map_err(|error| ApiError::Internal(format!("run statistics: {error}")))?;
+    Ok(Json(stats))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunTelemetry {
+    controls: Vec<ControlEvent>,
+    completions: Vec<CompletionSample>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct ControlEvent {
+    action: String,
+    actor: String,
+    occurred_at_millis: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct CompletionSample {
+    minute: i64,
+    logical_bytes: String,
+}
+
+#[tracing::instrument(skip(state))]
+async fn run_telemetry(State(state): State<AppState>, Path(id): Path<u64>) -> Result<Json<RunTelemetry>, ApiError> {
+    let pool = state.entry_store.pool();
+    let found = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM policy_runs WHERE id = ?)")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map_err(telemetry_error)?;
+    if !found {
+        return Err(run_not_found(id));
+    }
+    let controls = sqlx::query_as(
+        "SELECT CAST(action AS CHAR) AS action, actor,
+            TIMESTAMPDIFF(MICROSECOND, '1970-01-01', occurred_at) DIV 1000 AS occurred_at_millis FROM policy_run_controls
+         WHERE run_id = ? ORDER BY id DESC LIMIT 100",
+    ).bind(id).fetch_all(pool).await.map_err(telemetry_error)?;
+    let completions = sqlx::query_as(
+        "SELECT TIMESTAMPDIFF(MINUTE, '1970-01-01', finished_at) AS minute,
+                CAST(SUM(size) AS CHAR) AS logical_bytes
+         FROM policy_operations WHERE run_id = ? AND state = 'completed' AND finished_at IS NOT NULL
+         GROUP BY minute ORDER BY minute DESC LIMIT 30",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .map_err(telemetry_error)?;
+    Ok(Json(RunTelemetry { controls, completions }))
+}
+
+fn telemetry_error(error: sqlx::Error) -> ApiError {
+    ApiError::Internal(format!("run telemetry: {error}"))
+}
+
+#[derive(Deserialize)]
+struct RunCommand {
+    action: RunControl,
+}
+
+#[tracing::instrument(skip_all, fields(id))]
+async fn control_run(
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::PolicyWriters>,
+    headers: HeaderMap, Json(command): Json<RunCommand>,
+) -> Result<StatusCode, ApiError> {
+    let actor = writers.authorize(&headers)?;
+    state
+        .policy_store
+        .control_run(id, command.action, actor)
+        .await
+        .map_err(|error| match error {
+            rbh_policy::PolicyError::NotFound(_) => run_not_found(id),
+            error => error.into(),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[tracing::instrument(skip(state))]

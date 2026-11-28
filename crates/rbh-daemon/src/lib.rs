@@ -455,7 +455,15 @@ pub async fn run() -> anyhow::Result<()> {
         console_collect_secs > 0,
         "RBH_CONSOLE_COLLECT_SECS must be greater than zero"
     );
-    let app = rbh_api::router_with_console(state, writers, console_resources.clone(), console_dir);
+    let administration = rbh_api::ResourceAdministration::new(
+        state.clone(),
+        console_resources.clone(),
+        observer_id.to_owned(),
+        std::env::var_os("RBH_LUSTRE_MANAGED_ROOT").map(std::path::PathBuf::from),
+    )?;
+    administration.restore().await?;
+    let app = rbh_api::router_with_console(state, writers.clone(), console_resources.clone(), console_dir)
+        .merge(administration.routes(writers));
 
     // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
     let listen_addr = std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

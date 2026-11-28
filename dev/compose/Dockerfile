@@ -38,16 +38,21 @@ RUN CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --locked --release -p robinhoo
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3t64 libnl-genl-3-200 libreadline8t64 libyaml-0-2 \
+        ca-certificates libkeyutils1 libssl3t64 libnl-genl-3-200 libreadline8t64 libyaml-0-2 mount \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /tmp/fake-mount
+    && mkdir -p /tmp/fake-mount \
+    && install -d -m 0700 /mnt/rbh-lustre
 COPY --from=build /src/target/release/robinhood /usr/sbin/robinhood
 COPY --from=build /src/target/release/rbh /usr/bin/rbh
 COPY --from=build /src/crates/rbh-entry-store/schema.sql /usr/share/robinhood/schema.sql
 COPY --from=console /web/dist/ /usr/share/robinhood/console/
 COPY --from=build /usr/lib/liblustreapi.so.1.0.0 /usr/local/lib/liblustreapi.so.1
 COPY --from=build /usr/lib/liblnetconfig.so.4.0.0 /usr/local/lib/liblnetconfig.so.4
-RUN ldconfig
+COPY --from=build /sbin/mount.lustre /usr/sbin/mount.lustre
+COPY --from=build /usr/sbin/lctl /usr/sbin/lctl
+COPY --from=build /usr/bin/lfs /usr/bin/lfs
+RUN ldconfig \
+    && LD_BIND_NOW=1 /usr/bin/lfs --version
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/sbin/robinhood"]

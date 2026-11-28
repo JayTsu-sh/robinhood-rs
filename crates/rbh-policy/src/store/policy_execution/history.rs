@@ -16,19 +16,21 @@ pub use reports::{OperationResults, OperationSummary, RunReportSnapshot};
 
 const PINNED_RUN: &str = "FROM policy_runs r JOIN policy_revisions rev USING (policy_id, revision)";
 const POLICY_NAME: &str = "CAST(JSON_VALUE(definition, '$.metadata.name') AS CHAR CHARACTER SET utf8mb4)";
-const RUN_HISTORY_FIELDS: &str =
-    "CAST(r.id AS CHAR) AS id_exact, CAST(r.policy_id AS CHAR) AS policy_id_exact,
+const RUN_HISTORY_FIELDS: &str = "CAST(r.id AS CHAR) AS id_exact, CAST(r.policy_id AS CHAR) AS policy_id_exact,
     CAST(r.revision AS CHAR) AS revision_exact,
-    IF(JSON_VALUE(rev.definition, '$.spec.execution.activation.mode') = 'enforced', 'enforced', 'preview') AS activation_mode,
     IF(JSON_VALUE(rev.definition, '$.spec.mode') = 'one_shot', 'one_shot', 'continuous') AS policy_mode,
-    CAST(r.estimated_bytes AS CHAR) AS estimated_bytes_exact";
+        CAST(r.estimated_bytes AS CHAR) AS estimated_bytes_exact";
+const ACTIVATION_MODE: &str =
+    "IF(JSON_VALUE(rev.definition, '$.spec.execution.activation.mode') = 'enforced', 'enforced', 'preview')";
 const POLICY_WITH_LATEST_RUN: &str =
-    "CAST(latest.id AS CHAR) AS latest_id, CAST(latest.revision AS CHAR) AS latest_revision,
+    "p.next_run, CAST(latest.id AS CHAR) AS latest_id, CAST(latest.revision AS CHAR) AS latest_revision,
         latest.state AS latest_state, latest.started_at AS latest_started_at
      FROM policies p JOIN policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision
      LEFT JOIN policy_runs latest ON latest.id = COALESCE(
         (SELECT id FROM policy_runs WHERE policy_id = p.id AND state = 'running' ORDER BY id DESC LIMIT 1),
         (SELECT id FROM policy_runs WHERE policy_id = p.id AND state = 'queued' ORDER BY id DESC LIMIT 1),
+        (SELECT id FROM policy_runs WHERE policy_id = p.id AND state = 'paused' AND revision = p.revision ORDER BY id DESC LIMIT 1),
+        (SELECT id FROM policy_runs WHERE policy_id = p.id AND state = 'awaiting_approval' AND revision = p.revision ORDER BY id DESC LIMIT 1),
         (SELECT id FROM policy_runs WHERE policy_id = p.id ORDER BY id DESC LIMIT 1)
      ) WHERE p.name IS NOT NULL";
 
@@ -84,10 +86,19 @@ impl RunHistory {
 pub enum RunState {
     Queued,
     Running,
+    Paused,
+    AwaitingApproval,
     Previewed,
     Finished,
     Deferred,
     Cancelled,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunActivationMode {
+    Enforced,
+    Preview,
 }
 
 #[derive(Debug)]
@@ -96,6 +107,7 @@ pub struct RunSearch {
     pub policy_name: Option<String>,
     pub run_id: Option<u64>,
     pub state: Option<RunState>,
+    pub activation_mode: Option<RunActivationMode>,
     pub before_id: Option<u64>,
     pub limit: u16,
 }
@@ -144,6 +156,8 @@ pub struct OperationFilter {
     pub state: Option<OperationState>,
     #[serde(rename = "reasonContains")]
     pub reason: Option<String>,
+    #[serde(rename = "pathContains", skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub exceptions_only: bool,
     pub fid: Option<LuFid>,
 }
@@ -161,6 +175,10 @@ impl OperationFilter {
         }
         if let Some(fid) = self.fid {
             query.push(" AND o.fid = ").push_bind(fid_codec::encode(&fid).to_vec());
+        }
+        if let Some(path) = &self.path {
+            query.push(" AND EXISTS (SELECT 1 FROM JSON_TABLE(COALESCE(o.paths, '[]'), '$[*]' COLUMNS(path_text VARCHAR(4096) PATH '$')) AS seen WHERE LOCATE(")
+                .push_bind(path).push(", seen.path_text) > 0)");
         }
     }
 }
@@ -200,6 +218,7 @@ pub struct LatestRun {
 struct PolicyWithLatestRun {
     #[sqlx(flatten)]
     policy: PolicyRevision,
+    next_run: Option<DateTime<Utc>>,
     latest_id: Option<String>,
     latest_revision: Option<String>,
     latest_state: Option<String>,
@@ -208,6 +227,7 @@ struct PolicyWithLatestRun {
 
 impl PolicyWithLatestRun {
     fn into_policy(mut self) -> PolicyRevision {
+        self.policy.next_run = self.next_run;
         if let (Some(id), Some(revision), Some(state)) = (self.latest_id, self.latest_revision, self.latest_state) {
             self.policy.latest_run = Some(LatestRun {
                 id,
@@ -251,7 +271,7 @@ impl PolicyStore {
     #[tracing::instrument(skip(self))]
     pub async fn search_policy_runs(&self, filter: RunSearch) -> Result<HistoryPage<RunHistory>, PolicyError> {
         let mut query = QueryBuilder::<MySql>::new(format!(
-            "SELECT {RUN_FIELDS}, {POLICY_NAME} AS policy_name, {RUN_HISTORY_FIELDS} {PINNED_RUN}"
+            "SELECT {RUN_FIELDS}, {POLICY_NAME} AS policy_name, {RUN_HISTORY_FIELDS}, {ACTIVATION_MODE} AS activation_mode {PINNED_RUN}"
         ));
         if let Some(policy_name) = filter.policy_name {
             // Match each immutable revision once even if it owns many runs.
@@ -277,6 +297,12 @@ impl PolicyStore {
         }
         if let Some(state) = filter.state {
             query.push(" AND r.state = ").push_bind(state);
+        }
+        if let Some(mode) = filter.activation_mode {
+            query.push(format!(" AND {ACTIVATION_MODE} = ")).push_bind(match mode {
+                RunActivationMode::Enforced => "enforced",
+                RunActivationMode::Preview => "preview",
+            });
         }
         if let Some(before_id) = filter.before_id {
             query.push(" AND r.id < ").push_bind(before_id);
@@ -320,7 +346,7 @@ impl PolicyStore {
 
 async fn pinned_run(id: u64, executor: impl sqlx::MySqlExecutor<'_>) -> Result<Option<RunHistory>, PolicyError> {
     Ok(sqlx::query_as(&format!(
-        "SELECT {RUN_FIELDS}, {POLICY_NAME} AS policy_name, {RUN_HISTORY_FIELDS} {PINNED_RUN} WHERE r.id = ?"
+        "SELECT {RUN_FIELDS}, {POLICY_NAME} AS policy_name, {RUN_HISTORY_FIELDS}, {ACTIVATION_MODE} AS activation_mode {PINNED_RUN} WHERE r.id = ?"
     ))
     .bind(id)
     .fetch_optional(executor)

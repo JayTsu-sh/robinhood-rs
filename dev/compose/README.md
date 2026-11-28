@@ -38,11 +38,12 @@ docker compose exec rbh-daemon rbh --filesystem lustre status
 curl -fsS http://localhost:8080/api/action-contracts/lustre.pool_migrate
 ```
 
-The image links to the Lustre user-space libraries. The stack has an empty
+The image includes the Lustre user-space libraries and client tools. The stack has an empty
 placeholder directory for the `lustre` scope and no Lustre mount, MDT reader
 or OSS. Use it to query a seeded catalog and preview native HSM policy
 candidates. Run changelog, heat sampling, HSM execution and pool migration
 tests on a node with a real Lustre mount.
+[Deploy a container that mounts Lustre](../../README.md#deploy-a-container-that-mounts-lustre)
 
 An empty catalog triggers an initial scan. Expect scan retries until the
 daemon restarts with a seeded catalog.

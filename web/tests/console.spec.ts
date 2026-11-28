@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 import type { FilesystemResource } from '../src/services/tiering';
 
-test('the daemon serves the compiled console and its real read APIs', async ({ page, request }) => {
+test('the daemon serves the compiled console and its real read APIs', { tag: '@daemon' }, async ({ page, request }) => {
   const [policyResponse, resourceResponse] = await Promise.all([
     request.get('/api/policies?configuredOnly=true'),
     request.get('/api/filesystems'),

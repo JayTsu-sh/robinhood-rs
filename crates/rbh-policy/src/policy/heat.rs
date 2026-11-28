@@ -230,7 +230,9 @@ pub(super) const UNKNOWN_SCORES: &str =
 async fn batch_fids(
     pool: &MySqlPool, policy: &CompiledPolicy, after: [u8; 16], limit: u16,
 ) -> Result<Vec<LuFid>, PolicyError> {
-    let mut query = QueryBuilder::new("SELECT object_id FROM scoped_entries AS entries");
+    let mut query = QueryBuilder::new("");
+    policy.push_namespace_paths(&mut query, None);
+    query.push("SELECT object_id FROM scoped_entries AS entries");
     query
         .push(UNKNOWN_SCORES)
         .push("WHERE filesystem_id = ")
@@ -499,6 +501,7 @@ pub(super) async fn preview<Revision>(
         resource_bindings,
         read_heat: Some(heat),
         directory_scope: None,
+        sample_files: Vec::new(),
     })
 }
 
@@ -583,7 +586,9 @@ pub(crate) async fn dispatch_deferrals(
     tx: &mut sqlx::Transaction<'_, MySql>, policy: &CompiledPolicy, profile: &HeatProfile, now: DateTime<Utc>,
     database_time_micros: Option<i64>, after: &[u8], through: Option<&[u8]>,
 ) -> Result<BTreeMap<String, u64>, PolicyError> {
-    let mut query = QueryBuilder::new("SELECT COALESCE(heat_status, ");
+    let mut query = QueryBuilder::new("");
+    policy.push_namespace_paths(&mut query, None);
+    query.push("SELECT COALESCE(heat_status, ");
     query
         .push_bind(MISSING)
         .push(") AS reason, CAST(COUNT(*) AS UNSIGNED) FROM scoped_entries AS entries ");
