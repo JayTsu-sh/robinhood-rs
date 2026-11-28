@@ -134,7 +134,9 @@ test('the compiled wizard previews and saves a real disabled revision, with exac
   await saveWithWriter();
   await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
   await expect(page.getByText('已停用', { exact: true })).toBeVisible();
-  const pathMatch = /\/policies\/(\d+)\/revisions\/1$/.exec(page.url());
+  await expect(page.getByRole('button', { name: '启用策略' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '立即运行' })).toBeDisabled();
+  const pathMatch = /\/policies\/(\d+)$/.exec(page.url());
   expect(pathMatch).not.toBeNull();
   const id = pathMatch![1];
   const path = `/api/policies/${id}`;
@@ -148,7 +150,6 @@ test('the compiled wizard previews and saves a real disabled revision, with exac
   await page.reload();
   await page.getByRole('tab', { name: '策略配置' }).click();
   await expect(page.locator('pre')).toContainText('迁移候选');
-  await page.getByRole('link', { name: '查看当前修订' }).click();
   await page.getByRole('link', { name: '编辑策略' }).click();
   await page.getByLabel('描述').fill('浏览器尚未保存的修改');
   for (let i = 0; i < 5; i += 1) await next();

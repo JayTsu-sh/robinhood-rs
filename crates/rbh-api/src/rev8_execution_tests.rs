@@ -309,6 +309,63 @@ fn open_policy_store(entries: &EntryStore, hsm: Arc<HsmFixture>) -> PolicyStore 
 }
 
 #[tokio::test]
+async fn manual_run_checks_the_requested_revision_and_reports_an_active_run() {
+    if !integration_enabled() {
+        return;
+    }
+    let env = Scenario::setup().await;
+    let mut policy = rev8_archive_policy(env.filesystem.as_str(), env.filesystem.as_str());
+    policy["spec"]["execution"]["budget"]["run"]["maxObjectLogicalBytes"] = json!(9_007_199_254_740_993_u64);
+    let id = env.create(&policy).await;
+    let url = format!("/api/policies/{id}/run");
+    env.server
+        .post(&url)
+        .add_header("If-Match", "\"2\"")
+        .await
+        .assert_status(StatusCode::CONFLICT);
+    let first = env.server.post(&url).add_header("If-Match", "\"1\"").await;
+    first.assert_status(StatusCode::ACCEPTED);
+    let first: Value = first.json();
+    assert_eq!(first["runIdExact"], first["runId"].to_string());
+    let repeated = env.server.post(&url).add_header("If-Match", "\"1\"").await;
+    repeated.assert_status(StatusCode::CONFLICT);
+    assert_eq!(repeated.json::<Value>()["activeRunIdExact"], first["runIdExact"]);
+
+    env.entries
+        .register_filesystem(&FileSystemConfig {
+            id: env.filesystem.clone(),
+            backend: BackendKind::Lustre,
+            mount_path: "/unavailable".into(),
+            capabilities: BackendCapabilities::default(),
+        })
+        .await
+        .unwrap();
+    let policy_url = format!("/api/policies/{id}");
+    env.server
+        .patch(&policy_url)
+        .add_header("If-Match", "\"1\"")
+        .json(&json!({"enabled": false}))
+        .await
+        .assert_status_ok();
+    policy["spec"]["enabled"] = false.into();
+    let saved: Value = env.server.get(&policy_url).await.json();
+    assert_eq!(saved["definition"], policy);
+    env.server
+        .post(&url)
+        .add_header("If-Match", "\"2\"")
+        .await
+        .assert_status_bad_request();
+    let url = format!("/api/runs/{}", first["runId"]);
+    env.reconcile_until(&env.stores, async || {
+        env.server.get(&url).await.json::<Value>()["state"] == "cancelled"
+    })
+    .await;
+    let run: Value = env.server.get(&url).await.json();
+    assert_eq!(run["revisionExact"], "1");
+    assert_eq!(run["state"], "cancelled");
+}
+
+#[tokio::test]
 async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after_policy_changes() {
     if !integration_enabled() {
         return;
@@ -515,6 +572,14 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
         once_run,
         "a safety revision must not repeat a finished one-shot"
     );
+    let once_policy: Value = server.get(&format!("/api/policies/{once}")).await.json();
+    let revision = once_policy["revisionExact"].as_str().unwrap();
+    let repeated = server
+        .post(&format!("/api/policies/{once}/run"))
+        .add_header("If-Match", format!("\"{revision}\""))
+        .await;
+    repeated.assert_status(StatusCode::CONFLICT);
+    assert_eq!(repeated.json::<Value>()["existingRunIdExact"], once_run.to_string());
     let completed = &env.operations(id, run).await[0];
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["revision"], 1);

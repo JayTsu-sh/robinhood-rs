@@ -85,6 +85,15 @@ For an instance unit, edit `rbh-daemon@INSTANCE.service`. The service
 credentials must allow opening the source files for write and setting
 the source owner and group on each temporary copy.
 
+Directory-scoped policies also need live FID-to-path lookup on the
+executor mount. Use the mount's `user_fid2path` setting if permitted by
+the deployment. With `nouser_fid2path`, grant the executor service
+`CAP_DAC_READ_SEARCH` if its privilege policy allows it. This capability
+bypasses Linux read and directory-search permission checks. The daemon
+probes live lookup when enabling a scoped policy and reports missing
+access. Each migration checks the namespace again before exchanging
+layouts.
+
 ## Signals
 
 | Signal   | Effect                                                        |

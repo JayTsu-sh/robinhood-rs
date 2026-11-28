@@ -30,6 +30,10 @@ pub enum PolicyError {
     NameConflict(String),
     #[error("policy {id} has advanced from revision {expected} to {current}")]
     RevisionConflict { id: u64, expected: u64, current: u64 },
+    #[error("policy already has an active run")]
+    ActiveRun { id: u64 },
+    #[error("the one-shot policy already has a run")]
+    OneShotRun { id: u64 },
     #[error("resource not found: {0}")]
     ResourceNotFound(String),
     #[error("{0}")]

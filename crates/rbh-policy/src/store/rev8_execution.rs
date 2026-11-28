@@ -183,19 +183,38 @@ impl PolicyStore {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn request_rev8_run(&self, id: u64, actor: &str) -> Result<u64, PolicyError> {
+    pub async fn request_rev8_run(
+        &self, id: u64, actor: &str, expected_revision: Option<u64>,
+    ) -> Result<u64, PolicyError> {
         let mut tx = self.lock_configuration().await?;
         let row: Option<(u64, Json<Value>)> = sqlx::query_as(
             "SELECT revision, definition FROM policies WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL FOR UPDATE",
         ).bind(id).fetch_optional(&mut *tx).await?;
         let (revision, definition) = row.ok_or(PolicyError::NotFound(id))?;
+        super::check_policy_revision(id, expected_revision, Some(revision))?;
         if definition["spec"]["enabled"] == false {
             return Err(invalid("the policy is disabled"));
+        }
+        if expected_revision.is_some()
+            && let Some(existing) = sqlx::query_scalar(
+                "SELECT id FROM rev8_runs WHERE policy_id = ? AND revision = ? AND state IN ('queued','running')
+                 ORDER BY state = 'running' DESC, id DESC LIMIT 1",
+            )
+            .bind(id)
+            .bind(revision)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            return Err(PolicyError::ActiveRun { id: existing });
         }
         if definition["spec"]["mode"] == "one_shot"
             && let Some(existing) = existing_one_shot_run(&mut tx, id, revision, &definition).await?
         {
-            return Ok(existing);
+            return if expected_revision.is_some() {
+                Err(PolicyError::OneShotRun { id: existing })
+            } else {
+                Ok(existing)
+            };
         }
         let run = sqlx::query("INSERT INTO rev8_runs (policy_id, revision, requested_by) VALUES (?, ?, ?)")
             .bind(id)

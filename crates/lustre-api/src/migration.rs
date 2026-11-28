@@ -113,10 +113,11 @@ static ACTIVE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 pub struct MigrationOwnership(String);
 
 /// Limits checked by the blocking migration while it owns the source lock.
-pub struct MigrationLimits<F> {
+pub struct MigrationLimits<F, G> {
     pub deadline: Instant,
     pub expected_access: Option<FileAccessTime>,
-    pub before_swap: F,
+    pub check_links: F,
+    pub before_swap: G,
 }
 
 impl MigrationOwnership {
@@ -184,6 +185,7 @@ impl LustreApi {
         let limits = MigrationLimits {
             deadline,
             expected_access: None,
+            check_links: |_: &File| Ok(()),
             before_swap: || true,
         };
         self.migrate_reserved_pool(mount, fid, plan, expected, limits, ownership)
@@ -193,7 +195,8 @@ impl LustreApi {
     #[tracing::instrument(skip(self, plan, expected, limits, ownership), fields(mount = %mount.display(), %fid))]
     pub fn migrate_reserved_pool(
         &self, mount: &Path, fid: &LuFid, plan: &MigrationPlan, expected: FileVersion,
-        limits: MigrationLimits<impl FnOnce() -> bool>, ownership: MigrationOwnership,
+        mut limits: MigrationLimits<impl FnMut(&File) -> Result<(), MigrationError>, impl FnOnce() -> bool>,
+        ownership: MigrationOwnership,
     ) -> Result<VerifiedPlacement, MigrationError> {
         let deadline = limits.deadline;
         if !valid_pool_name(&plan.source_pool)
@@ -213,6 +216,7 @@ impl LustreApi {
         let src = open_source(mount, fid)?.ok_or(MigrationError::Deferred("fid_missing"))?;
         let group = GroupLock::acquire(&src)?;
         check_deadline(deadline)?;
+        (limits.check_links)(&src)?;
         let source = src.metadata()?;
         if !source.is_file() || source.nlink() == 0 || FileVersion::from(&source) != expected {
             return Err(MigrationError::Deferred("source_generation_changed"));
@@ -247,12 +251,15 @@ impl LustreApi {
         if !matches_target(&destination, plan, &pools.pool_members(&plan.target_pool)?) {
             return Err(MigrationError::Deferred("volatile_layout_mismatch"));
         }
+        eligible_hsm(self, mount, fid)?;
+        // Keep the last link check next to the swap. The source group lock
+        // protects data I/O while another client's namespace changes can race.
+        (limits.check_links)(&src)?;
         let final_source = src.metadata()?;
         if FileVersion::from(&final_source) != expected {
             return Err(MigrationError::Deferred("source_generation_changed"));
         }
         check_access_time(&final_source, limits.expected_access)?;
-        eligible_hsm(self, mount, fid)?;
         if !(limits.before_swap)() {
             return Err(MigrationError::Deferred("admission_window_closed"));
         }
@@ -489,7 +496,7 @@ fn seek(file: &File, offset: u64, whence: i32) -> io::Result<Option<u64>> {
     }
 }
 
-fn check_deadline(deadline: Instant) -> Result<(), MigrationError> {
+pub(crate) fn check_deadline(deadline: Instant) -> Result<(), MigrationError> {
     if Instant::now() >= deadline {
         Err(MigrationError::Deferred("migration_deadline_elapsed"))
     } else {

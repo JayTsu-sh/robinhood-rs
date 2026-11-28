@@ -209,7 +209,7 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
       const saved = await savePolicy(policyDocument(config, settings), base, token);
       clearDraft();
       allowNavigation.current = true;
-      history.replace(policyDetailsPath(saved.idExact, saved.revisionExact));
+      history.replace(policyDetailsPath(saved.idExact));
     } catch (error) {
       const response = writeError(error);
       if (response?.status === 401) {

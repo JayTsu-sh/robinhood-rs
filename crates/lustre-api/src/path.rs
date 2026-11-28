@@ -22,6 +22,9 @@ use crate::error::{Result, check_rc};
 use crate::fid::LuFid;
 use crate::sys;
 
+mod live_links;
+pub use live_links::LiveLinks;
+
 /// Maximum path length returned by `llapi_fid2path`. Matches Linux's PATH_MAX.
 const RBH_PATH_MAX: usize = 4096;
 

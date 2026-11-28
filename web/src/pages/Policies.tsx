@@ -5,6 +5,7 @@ import { Button, Empty, Flex, Input, Select, Tag } from 'antd';
 import { useState } from 'react';
 import { LatestRunLink, runStateOptions } from '@/components/ExecutionStatus';
 import InventoryPage from '@/components/InventoryPage';
+import PolicyExecutionActions from '@/components/PolicyExecutionActions';
 import { policyDetailsPath, policyEditPath } from '@/services/policies';
 import { filesystemDetailsPath, listTieringPolicies, type TieringPolicy } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
@@ -39,17 +40,20 @@ const columns: ProColumns<TieringPolicy>[] = [
     width: 205,
     render: (_, row) => <LatestRunLink run={row.latestRun} />,
   },
-  {
-    title: '操作',
-    width: 85,
-    render: (_, row) => row.editable ? <Link to={policyEditPath(row.id)}>编辑</Link> : '—',
-  },
 ];
 
 const loadPolicies = (signal: AbortSignal) => listTieringPolicies(signal, true);
 
 export default function Policies() {
   const { state, refresh } = useInventory(loadPolicies);
+  const actions: ProColumns<TieringPolicy> = {
+    title: '操作',
+    width: 175,
+    render: (_, row) => <Flex gap={12} align="center" wrap>
+      {row.editable && <Link to={policyEditPath(row.id)}>编辑</Link>}
+      <PolicyExecutionActions key={row.revision} {...row} onRefresh={refresh} />
+    </Flex>,
+  };
   const [search, setSearch] = useState('');
   const [enabled, setEnabled] = useState('all');
   const [runState, setRunState] = useState('all');
@@ -120,13 +124,13 @@ export default function Policies() {
           {policyId && <Tag>策略 ID {policyId}</Tag>}
         </div>
         <ProTable
-          columns={columns}
+          columns={[...columns, actions]}
           dataSource={rows}
           rowKey="id"
           search={false}
           toolBarRender={false}
           pagination={rows.length > 10 ? { defaultPageSize: 10 } : false}
-          scroll={{ x: 1035 }}
+          scroll={{ x: 1130 }}
           locale={{
             emptyText: <Empty className="console-empty" image={Empty.PRESENTED_IMAGE_SIMPLE} description={
               allRows.length ? '没有符合筛选条件的策略' : '暂无分层策略'

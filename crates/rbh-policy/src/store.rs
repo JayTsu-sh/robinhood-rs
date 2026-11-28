@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -69,6 +70,17 @@ pub struct SavedRev8Policy {
     pub revision: u64,
     pub id_exact: String,
     pub revision_exact: String,
+}
+
+impl SavedRev8Policy {
+    fn new(id: u64, revision: u64) -> Self {
+        Self {
+            id,
+            revision,
+            id_exact: id.to_string(),
+            revision_exact: revision.to_string(),
+        }
+    }
 }
 
 const REV8_POLICY_FIELDS: &str = "r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by,
@@ -164,10 +176,11 @@ impl PolicyStore {
                 .await?;
             check_policy_revision(id, Some(expected), current)?;
         }
-        if input.enables_directory_scope() {
-            return Err(rev8::invalid(
-                "spec.enabled must be false for spec.target.directoryScope until live link checks are available",
-            ));
+        if let Rev8PolicyWrite::Update { id, expected_revision } = write
+            && document["spec"]["enabled"] == false
+            && let Some(saved) = self.deactivate_rev8(id, expected_revision, document, actor).await?
+        {
+            return Ok(saved);
         }
         self.ensure_configured(input.filesystem())?;
         let config = rev8::validate_filesystem(entries, input.filesystem()).await?;
@@ -185,6 +198,18 @@ impl PolicyStore {
                     "enforced activation requires an accessible Lustre mount: {error}"
                 ))
             })?;
+            if input.has_directory_scope() {
+                let mount = config.mount_path.clone();
+                let probe =
+                    rev8::execution::lustre_call(move || lustre_api::LustreApi.verify_migration_namespace(&mount));
+                tokio::time::timeout(Duration::from_secs(5), probe)
+                    .await
+                    .map_err(|_| rev8::invalid("spec.target.directoryScope live FID-to-path check timed out"))?
+                    .map_err(|error| PolicyError::Store(format!("live namespace probe: {error}")))?
+                    .map_err(|error| rev8::invalid(format!(
+                        "spec.target.directoryScope requires live FID-to-path access on the executor mount. Check Lustre user_fid2path or the daemon's CAP_DAC_READ_SEARCH. {error:?}"
+                    )))?;
+            }
             Some(runtime.principal.clone())
         } else {
             None
@@ -256,12 +281,50 @@ impl PolicyStore {
         };
         record_rev8_revision(&mut tx, id, bindings, actor).await?;
         tx.commit().await?;
-        Ok(SavedRev8Policy {
+        Ok(SavedRev8Policy::new(id, revision))
+    }
+
+    // Stopping dispatch must work even if the resources used by the current
+    // policy have become unavailable. Edits still go through full validation.
+    async fn deactivate_rev8(
+        &self, id: u64, expected_revision: Option<u64>, document: &serde_json::Value, actor: &str,
+    ) -> Result<Option<SavedRev8Policy>, PolicyError> {
+        let mut tx = self.lock_configuration().await?;
+        let row: Rev8PolicyRow = sqlx::query_as(&format!(
+            "SELECT {REV8_POLICY_FIELDS}
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision
+             WHERE p.id = ? AND p.name IS NOT NULL"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(PolicyError::NotFound(id))?;
+        let revision = check_policy_revision(id, expected_revision, Some(row.revision))?;
+        let mut stopped = row.definition.0;
+        if stopped["spec"]["enabled"] == false {
+            return Ok(None);
+        }
+        stopped["spec"]["enabled"] = false.into();
+        if &stopped != document {
+            return Ok(None);
+        }
+        sqlx::query(
+            "UPDATE policies SET definition = ?, enabled = FALSE, revision = revision + 1, rev8_next_run = NULL
+             WHERE id = ?",
+        )
+        .bind(Json(document))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        record_rev8_revision(
+            &mut tx,
             id,
-            revision,
-            id_exact: id.to_string(),
-            revision_exact: revision.to_string(),
-        })
+            row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default(),
+            actor,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(SavedRev8Policy::new(id, revision + 1)))
     }
 
     #[tracing::instrument(skip(self))]

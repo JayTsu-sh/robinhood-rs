@@ -12,3 +12,5 @@
 #include <sys/ioctl.h>
 
 enum { RBH_LL_IOC_HSM_REQUEST = LL_IOC_HSM_REQUEST };
+/* OBD_IOC_FID2PATH from lustre_ioctl.h, which older client packages may omit. */
+enum { RBH_OBD_IOC_FID2PATH = _IOWR('f', 150, long) };

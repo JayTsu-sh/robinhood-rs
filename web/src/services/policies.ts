@@ -62,20 +62,40 @@ export function writerTransportAllowed() {
     (hostname === 'localhost' || hostname === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(hostname)));
 }
 
-export function savePolicy(document: object, base?: SavedRevision, token?: string) {
+function policyWriteHeaders(base?: SavedRevision, token?: string) {
   if (token && !writerTransportAllowed()) {
     throw new Error('请通过本机回环地址或 HTTPS 连接后使用 Rev.8 writer。');
   }
   const headers: Record<string, string> = {};
   if (base) headers['If-Match'] = `"${base.revision}"`;
   if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+export function savePolicy(document: object, base?: SavedRevision, token?: string) {
   return request<Pick<PolicyRevision, 'idExact' | 'revisionExact'>>(base ? `/api${policyDetailsPath(base.id)}` : '/api/policies', {
-    method: base ? 'PUT' : 'POST', data: document, headers, timeout: 60_000, skipErrorHandler: true,
+    method: base ? 'PUT' : 'POST', data: document, headers: policyWriteHeaders(base, token), timeout: 60_000,
+    skipErrorHandler: true,
+  });
+}
+
+export function setPolicyEnabled(base: SavedRevision, enabled: boolean, token?: string, signal?: AbortSignal) {
+  return request<Pick<PolicyRevision, 'idExact' | 'revisionExact'>>(`/api${policyDetailsPath(base.id)}`, {
+    method: 'PATCH', data: { enabled }, headers: policyWriteHeaders(base, token), signal, timeout: 60_000,
+    skipErrorHandler: true,
+  });
+}
+
+export function requestPolicyRun(base: SavedRevision, token?: string, signal?: AbortSignal) {
+  return request<{ runIdExact: string }>(`/api${policyDetailsPath(base.id)}/run`, {
+    method: 'POST', headers: policyWriteHeaders(base, token), signal, timeout: 60_000, skipErrorHandler: true,
   });
 }
 
 export function writeError(error: unknown) {
   return (error as {
-    response?: { status?: number; data?: { currentRevisionExact?: string; field?: string } };
+    response?: { status?: number; data?: {
+      currentRevisionExact?: string; activeRunIdExact?: string; existingRunIdExact?: string; field?: string;
+    } };
   } | undefined)?.response;
 }

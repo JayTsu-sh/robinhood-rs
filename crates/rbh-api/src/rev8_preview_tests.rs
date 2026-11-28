@@ -216,11 +216,10 @@ async fn scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_r
     let writer = rev8_test_server(state);
     let mut enabled = document.clone();
     enabled["spec"]["enabled"] = true.into();
-    writer
-        .post("/api/policies")
-        .json(&enabled)
-        .await
-        .assert_status_bad_request();
+    enabled["spec"]["rules"]["entries"][0]["action"]["params"]["targetPool"] = "nonexistent".into();
+    let response = writer.post("/api/policies").json(&enabled).await;
+    response.assert_status_bad_request();
+    assert!(response.text().contains("targetPool"));
     let created = writer.post("/api/policies").json(&document).await;
     created.assert_status(axum::http::StatusCode::CREATED);
     let id = created.json::<serde_json::Value>()["id"].as_u64().unwrap();

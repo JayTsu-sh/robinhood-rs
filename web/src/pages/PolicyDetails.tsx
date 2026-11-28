@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
 import { LatestRunLink } from '@/components/ExecutionStatus';
 import { PolicyBindings, PolicyConfiguration } from '@/components/PolicyConfiguration';
+import PolicyExecutionActions from '@/components/PolicyExecutionActions';
 import RunHistoryTable from '@/components/RunHistoryTable';
 import { policyPoolPair, readEditablePolicy } from '@/domain/tieringPolicy';
 import { executionFilters, runHistoryPath } from '@/services/executions';
@@ -29,7 +30,7 @@ function PolicyJson({ id, revision }: { id: string; revision: string }) {
   );
 }
 
-function Details({ row, historical }: { row: PolicyRevision; historical: boolean }) {
+function Details({ row, historical, refresh }: { row: PolicyRevision; historical: boolean; refresh: () => void }) {
   const { definition, idExact: id, revisionExact: revision } = row;
   const previous = BigInt(revision) - 1n;
   const { metadata, spec } = definition;
@@ -77,6 +78,8 @@ function Details({ row, historical }: { row: PolicyRevision; historical: boolean
         {historical && <Link to={policyDetailsPath(id)}>查看当前修订</Link>}
         {previous > 0n && <Link to={policyDetailsPath(id, previous.toString())}>查看上一修订</Link>}
         {decoded && !historical && <Link to={policyEditPath(id)}>编辑策略</Link>}
+        {pair && !historical && <PolicyExecutionActions id={id} revision={revision} name={metadata.name}
+          enabled={spec.enabled !== false} showToggle latestRun={row.latestRun} onRefresh={refresh} />}
         {!decoded && !historical && readPolicyDraft(id) && <Link to={policyEditPath(id)}>查看本地草稿</Link>}
         <Button loading={downloading} onClick={exportDefinition}>导出 Rev.8 JSON</Button>
       </Flex>
@@ -138,7 +141,8 @@ function PolicyRevisionPage({ id, revision }: { id: string; revision?: string })
     <InventoryPage title={title} status={state.status} error={state.status === 'error' ? state.message : undefined}
       refresh={refresh}
       action={<Link to="/policies">返回策略列表</Link>}>
-      {state.status === 'ready' && <Details key={state.data.revisionExact} row={state.data} historical={revision !== undefined} />}
+      {state.status === 'ready' && <Details key={state.data.revisionExact} row={state.data}
+        historical={revision !== undefined} refresh={refresh} />}
     </InventoryPage>
   );
 }

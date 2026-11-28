@@ -4,6 +4,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
+    sync::Arc,
 };
 
 mod directory_scope;
@@ -12,7 +13,7 @@ pub mod heat;
 pub mod resources;
 mod scoped_preview;
 mod tiering;
-use directory_scope::DirectoryScope;
+pub(crate) use directory_scope::{AdmittedLinks, DirectoryScope};
 pub use directory_scope::{DeferralReason, ExclusionReason, ScopeSummary};
 use resources::{ResourceBinding, ResourceKind};
 pub use tiering::PoolMigration;
@@ -37,7 +38,7 @@ pub struct CompiledPolicy {
     pub(crate) selectors: BTreeSet<String>,
     pub(crate) uses_read_heat: bool,
     pub(crate) uses_last_access: bool,
-    directory_scope: Option<DirectoryScope>,
+    directory_scope: Option<Arc<DirectoryScope>>,
     pool_migration: Option<PoolMigration>,
     pub(crate) where_clause: String,
     pub(crate) params: Vec<QueryParam>,
@@ -133,10 +134,6 @@ impl Policy {
         &self.spec.target.filesystem
     }
 
-    pub(crate) fn enables_directory_scope(&self) -> bool {
-        self.spec.enabled != Some(false) && self.spec.target.directory_scope.is_some()
-    }
-
     pub(crate) fn references(&self) -> [(ResourceKind, &str, &str); 3] {
         [
             (
@@ -155,6 +152,10 @@ impl Policy {
                 "spec.governance.approvalPolicyRef",
             ),
         ]
+    }
+
+    pub(crate) fn has_directory_scope(&self) -> bool {
+        self.spec.target.directory_scope.is_some()
     }
 
     pub(crate) fn compile(self, selectors: &BTreeMap<String, JsonValue>) -> Result<CompiledPolicy, PolicyError> {
@@ -237,7 +238,7 @@ impl Policy {
             decision,
             decision_params: query_params(decision_params),
             uses_read_heat,
-            directory_scope,
+            directory_scope: directory_scope.map(Arc::new),
             pool_migration,
             uses_last_access: conditions.uses_last_access,
             enabled: spec.enabled.unwrap_or(true),
@@ -299,6 +300,10 @@ impl CompiledPolicy {
 
     pub(crate) fn has_directory_scope(&self) -> bool {
         self.directory_scope.is_some()
+    }
+
+    pub(crate) fn directory_scope(&self) -> Option<Arc<DirectoryScope>> {
+        self.directory_scope.clone()
     }
 
     fn scope(&self, database_time_micros: Option<i64>) -> (Cow<'_, str>, Cow<'_, [QueryParam]>) {

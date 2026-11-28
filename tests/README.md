@@ -95,9 +95,7 @@ counts cover objects that match the indexed pool and Rev.8 rules or are
 pending a heat observation. The candidate estimate covers the catalog's
 indexed files before execution budgets and live admission checks. Saved
 policies use `POST /api/policies/{id}/preview` with their pinned resource
-bindings. Policies with a directory scope require `spec.enabled: false`
-until live link checks are available. Preview also works with a read-only
-Lustre mount.
+bindings. Preview also works with a read-only Lustre mount.
 
 The namespace replay regression uses the same isolated database and needs
 no live mount.
@@ -128,6 +126,36 @@ existing Rev.8 writer with `RBH_REV8_WRITERS_FILE` and provide its fixture
 token and registration ID to Playwright as `RBH_CONSOLE_WIZARD_TEST_TOKEN`
 and `RBH_CONSOLE_WIZARD_TEST_FS`. Set `RBH_CONSOLE_TEST_URL` to the test
 daemon and run `npm --prefix web run test:e2e`.
+
+### Scoped pool migration
+
+Use a disposable directory that inherits the hot pool layout to test
+namespace changes after copying and before exchanging layouts.
+
+```sh
+RBH_TEST_LUSTRE_MOUNT=/mnt/lustre \
+  RBH_TEST_MIGRATION_HOT_DIR=/mnt/lustre/.rbh-tiering-lab/hot \
+  cargo test --locked -p rbh-policy directory_and_link_changes_during_copy -- --ignored
+```
+
+For the bundled console test, register the full Lustre mount with HSM,
+stripe and OST capabilities in a daemon with a disposable database. Set
+`RBH_REV8_HSM_PRINCIPAL_FILE` to a workload identity with service account
+`tiering-daemon` and configure a test writer. Give Playwright a new empty
+test directory beneath the mount in `RBH_CONSOLE_EXECUTION_TEST_ROOT`,
+the mount in `RBH_CONSOLE_EXECUTION_TEST_MOUNT`, the registration ID in
+`RBH_CONSOLE_EXECUTION_TEST_FS`, and the test writer token in
+`RBH_CONSOLE_EXECUTION_TEST_TOKEN`. Run the test with
+`npm --prefix web run test:e2e -- policy-execution.spec.ts` against that
+daemon. The test creates fixtures and exercises both cycle and on-demand
+scheduling, including the source placement of excluded and HSM-managed
+files.
+
+The final check reads the live link namespace immediately before the swap.
+Lustre group locking and the swap's data-version guard protect file I/O.
+A rename on another client may still land between the namespace check and
+the layout exchange. Providing atomic directory-scope enforcement would
+require a server-side namespace guard across the exchange.
 
 ### What's covered where
 

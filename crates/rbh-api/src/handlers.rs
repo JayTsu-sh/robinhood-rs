@@ -40,7 +40,10 @@ pub fn api_routes() -> Router<AppState> {
         .route("/policies", post(create_policy).get(list_policies))
         .route(
             "/policies/{id}",
-            get(get_policy).put(update_policy).delete(delete_policy),
+            get(get_policy)
+                .put(update_policy)
+                .patch(set_policy_enabled)
+                .delete(delete_policy),
         )
         .route("/policies/{id}/run", post(run_policy_now))
         .route("/policies/{id}/runs", get(list_rev8_runs))
@@ -207,6 +210,42 @@ fn expected_policy_revision(headers: &HeaderMap) -> Result<Option<u64>, ApiError
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyActivation {
+    enabled: bool,
+}
+
+#[tracing::instrument(skip_all, fields(id))]
+async fn set_policy_enabled(
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    headers: HeaderMap, Json(activation): Json<PolicyActivation>,
+) -> Result<Json<SavedRev8Policy>, ApiError> {
+    let actor = writers.authorize(&headers)?;
+    let expected = expected_policy_revision(&headers)?;
+    let row = state
+        .policy_store
+        .get_rev8(id)
+        .await?
+        .ok_or(PolicyError::NotFound(id))?;
+    let mut definition = row.definition.0;
+    definition["spec"]["enabled"] = activation.enabled.into();
+    Ok(Json(
+        state
+            .policy_store
+            .save_rev8(
+                &state.entry_store,
+                Rev8PolicyWrite::Update {
+                    id,
+                    expected_revision: expected.or(Some(row.revision)),
+                },
+                &definition,
+                actor,
+            )
+            .await?,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PreviewQuery {
@@ -305,8 +344,16 @@ async fn run_policy_now(
             return Ok(Json(state.policy_store.preview_rev8(&state.entry_store, id).await?).into_response());
         }
     }
-    let run = state.policy_store.request_rev8_run(id, actor).await?;
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"runId": run}))).into_response())
+    let expected_revision = expected_policy_revision(&headers)?;
+    let run = state
+        .policy_store
+        .request_rev8_run(id, actor, expected_revision)
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"runId": run, "runIdExact": run.to_string()})),
+    )
+        .into_response())
 }
 
 #[tracing::instrument(skip_all, fields(id))]
@@ -1227,6 +1274,26 @@ impl IntoResponse for ApiError {
                         "error": error.to_string(),
                         "currentRevision": current,
                         "currentRevisionExact": current.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+            ApiError::Policy(error @ PolicyError::ActiveRun { id }) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": error.to_string(),
+                        "activeRunIdExact": id.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+            ApiError::Policy(error @ PolicyError::OneShotRun { id }) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": error.to_string(),
+                        "existingRunIdExact": id.to_string(),
                     })),
                 )
                     .into_response();

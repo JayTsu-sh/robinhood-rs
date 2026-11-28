@@ -1,8 +1,12 @@
 //! The policy's namespace rule. Both indexed and live evidence use paths
 //! relative to the configured Lustre root.
 
-use std::collections::BTreeMap;
+#[cfg(test)]
+mod lustre_tests;
 
+use std::{collections::BTreeMap, fs::File, os::unix::ffi::OsStrExt, path::Path, sync::Arc, time::Instant};
+
+use lustre_api::{LuFid, LustreApi, migration::MigrationError, path::LiveLinks};
 use serde::{Deserialize, Serialize};
 
 use super::invalid;
@@ -21,9 +25,27 @@ pub(super) struct ScopeDocument {
 
 type Components = Vec<Vec<u8>>;
 
-pub(super) struct DirectoryScope {
+pub(crate) struct DirectoryScope {
     root: Components,
     excluded_subtrees: Vec<Components>,
+}
+
+pub(crate) struct AdmittedLinks {
+    scope: Arc<DirectoryScope>,
+    selected: LiveLinks,
+}
+
+impl AdmittedLinks {
+    pub(crate) fn recheck(
+        &self, mount: &Path, fid: &LuFid, source: &File, deadline: Instant,
+    ) -> Result<(), MigrationError> {
+        let observed = LustreApi.migration_link_paths_for_file(mount, fid, source, deadline)?;
+        self.scope.check_live(&observed)?;
+        if observed != self.selected {
+            return Err(MigrationError::Deferred("link_evidence_changed"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +111,14 @@ impl TryFrom<ScopeDocument> for DirectoryScope {
 }
 
 impl DirectoryScope {
+    pub(crate) fn admit(
+        self: Arc<Self>, mount: &Path, fid: &LuFid, deadline: Instant,
+    ) -> Result<AdmittedLinks, MigrationError> {
+        let selected = LustreApi.migration_link_paths(mount, fid, deadline)?;
+        self.check_live(&selected)?;
+        Ok(AdmittedLinks { scope: self, selected })
+    }
+
     pub(super) fn locate_parent(&self, components: &[&[u8]]) -> LinkLocation {
         if self.excluded_subtrees.iter().any(|path| starts_with(components, path)) {
             LinkLocation::ExcludedSubtree
@@ -97,6 +127,35 @@ impl DirectoryScope {
         } else {
             LinkLocation::OutsideScope
         }
+    }
+
+    fn check_live(&self, links: &LiveLinks) -> Result<(), MigrationError> {
+        let paths = links.relative_paths();
+        let expected = u32::try_from(paths.len()).map_err(|_| MigrationError::Deferred("incomplete_link_evidence"))?;
+        let mut evidence = LinkEvidence::default();
+        for path in paths {
+            let location = match path {
+                Some(path) => path.parent().map(|parent| self.locate_live_parent(parent)),
+                None => Some(LinkLocation::OutsideScope),
+            };
+            evidence.observe(location);
+        }
+        let reason = match evidence.decide(expected) {
+            ScopeDecision::Allowed => return Ok(()),
+            ScopeDecision::Excluded(ExclusionReason::LinkInExcludedSubtree) => "link_in_excluded_subtree",
+            ScopeDecision::Excluded(ExclusionReason::LinkOutsideScope) => "link_outside_scope",
+            ScopeDecision::Deferred(DeferralReason::IncompleteLinkEvidence) => "incomplete_link_evidence",
+        };
+        Err(MigrationError::Deferred(reason))
+    }
+
+    fn locate_live_parent(&self, parent: &Path) -> LinkLocation {
+        let bytes = parent.as_os_str().as_bytes();
+        let components = bytes
+            .split(|&byte| byte == b'/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        self.locate_parent(&components)
     }
 }
 
