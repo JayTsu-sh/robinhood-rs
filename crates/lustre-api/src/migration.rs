@@ -188,15 +188,15 @@ impl LustreApi {
             check_links: |_: &File| Ok(()),
             before_swap: || true,
         };
-        self.migrate_reserved_pool(mount, fid, plan, expected, limits, ownership)
+        self.migrate_reserved_pool(mount, fid, plan, expected, limits, &ownership)
     }
 
-    /// Carry process-local ownership into the blocking task before it is scheduled.
+    /// Keep the caller's reservation through the layout exchange and result handling.
     #[tracing::instrument(skip(self, plan, expected, limits, ownership), fields(mount = %mount.display(), %fid))]
     pub fn migrate_reserved_pool(
         &self, mount: &Path, fid: &LuFid, plan: &MigrationPlan, expected: FileVersion,
         mut limits: MigrationLimits<impl FnMut(&File) -> Result<(), MigrationError>, impl FnOnce() -> bool>,
-        ownership: MigrationOwnership,
+        ownership: &MigrationOwnership,
     ) -> Result<VerifiedPlacement, MigrationError> {
         let deadline = limits.deadline;
         if !valid_pool_name(&plan.source_pool)

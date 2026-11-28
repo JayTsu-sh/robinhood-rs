@@ -181,12 +181,14 @@ struct CandidateLink {
     link: CatalogLink,
     size: u64,
     nlink: u32,
+    lustre_link_count_known: bool,
     heat_reason: Option<String>,
 }
 
 impl ScopedTotals {
     fn record(&mut self, file: &CandidateLink, evidence: &LinkEvidence) -> Result<(), PolicyError> {
-        match evidence.decide(file.nlink) {
+        let expected_links = if file.lustre_link_count_known { file.nlink } else { 0 };
+        match evidence.decide(expected_links) {
             ScopeDecision::Allowed => {
                 if let Some(reason) = &file.heat_reason {
                     *self.heat_deferrals.entry(reason.clone()).or_default() += 1;
@@ -270,11 +272,11 @@ async fn candidate_page(
 ) -> Result<Vec<CandidateLink>, PolicyError> {
     // Limit the FIDs before joining their names, so a file's links stay in one page.
     let mut query = QueryBuilder::new(
-        "SELECT page.object_id, page.size, page.nlink,
+        "SELECT page.object_id, page.size, page.nlink, page.lustre_link_count_known,
                 CASE WHEN page.matched IS NULL THEN page.heat_reason END AS heat_reason,
                 edge.parent_kind, edge.parent_id, edge.name
          FROM (SELECT * FROM (
-             SELECT entries.filesystem_id, entries.object_kind, entries.object_id, size, nlink, ",
+             SELECT entries.filesystem_id, entries.object_kind, entries.object_id, size, nlink, lustre_link_count_known, ",
     );
     if policy.uses_read_heat {
         query

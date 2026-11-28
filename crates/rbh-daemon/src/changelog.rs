@@ -11,11 +11,14 @@
 //! the file to refresh changed fields.
 //! For layout events, we reread the actual Lustre OST layout by FID.
 
+use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use lustre_api::{LuFid, LustreApi};
@@ -26,7 +29,9 @@ use rbh_entry_store::model::{
 };
 use rbh_entry_store::store::{EntryStore, LustreLinkState};
 
-const CATCHUP_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+const CATCHUP_QUIET_PERIOD: Duration = Duration::from_secs(1);
+const LINK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_LINK_LOOKUPS_PER_MOUNT: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 enum LustreIngestError {
@@ -707,7 +712,7 @@ async fn apply_event(
 
         ChangelogEvent::Hardlink { fid, parent, name } => {
             let state = if store.get_lustre_entry(filesystem, fid).await?.is_some() {
-                lustre_link_state(mount, *fid).await?
+                lustre_link_state(mount, *fid).await
             } else {
                 // Seed metadata without assigning the historical name. The
                 // link transaction checks the current owner of that name.
@@ -752,7 +757,7 @@ async fn apply_event(
                 store.remove_lustre_entry(filesystem, fid, event_time).await?;
                 Ok(true)
             } else {
-                let state = lustre_link_state(mount, *fid).await?;
+                let state = lustre_link_state(mount, *fid).await;
                 store
                     .unlink_lustre_name(filesystem, fid, *parent, name, state, event_time)
                     .await?;
@@ -786,7 +791,7 @@ async fn apply_event(
                 && let ObjectId::Lustre(other) = *key.object()
                 && other != *fid
             {
-                displaced = Some((other, lustre_link_state(mount, other).await?));
+                displaced = Some((other, lustre_link_state(mount, other).await));
             }
             let existing = store.get_lustre_entry(filesystem, fid).await?;
             if let Some(mut entry) = existing {
@@ -851,17 +856,66 @@ async fn apply_event(
     }
 }
 
-async fn lustre_link_state(mount: &Path, fid: LuFid) -> Result<LustreLinkState, LustreIngestError> {
-    let mount = mount.to_owned();
-    let observed = tokio::task::spawn_blocking(move || LustreApi.link_count_by_fid(&mount, fid)).await?;
-    Ok(match observed {
-        Ok(Some(count)) => LustreLinkState::Present(count),
-        Ok(None) => LustreLinkState::Missing,
-        Err(error) => {
+// Keep ownership across MDT consumers and listener reconnects.
+static ACTIVE_LINK_LOOKUPS: LazyLock<Mutex<HashSet<(PathBuf, LuFid)>>> = LazyLock::new(Mutex::default);
+
+struct LinkLookupSlot((PathBuf, LuFid));
+
+impl LinkLookupSlot {
+    fn acquire(mount: &Path, fid: LuFid) -> Option<Self> {
+        let mut active = ACTIVE_LINK_LOOKUPS.lock().ok()?;
+        let per_mount = active.iter().filter(|(path, _)| path == mount).count();
+        let key = (mount.to_owned(), fid);
+        (per_mount < MAX_LINK_LOOKUPS_PER_MOUNT && active.insert(key.clone())).then(|| Self(key))
+    }
+}
+
+impl Drop for LinkLookupSlot {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_LINK_LOOKUPS.lock() {
+            active.remove(&self.0);
+        }
+    }
+}
+
+async fn lustre_link_state(mount: &Path, fid: LuFid) -> LustreLinkState {
+    // Retain the slot until the syscall returns, even if its waiter times out.
+    let Some(slot) = LinkLookupSlot::acquire(mount, fid) else {
+        return LustreLinkState::Unavailable;
+    };
+    let (result, pending) = oneshot::channel();
+    // Tokio waits for its blocking pool on shutdown. Detach this bounded
+    // native call so a stuck Lustre client cannot delay daemon shutdown.
+    if let Err(error) = std::thread::Builder::new()
+        .name("lustre-link-count".into())
+        .spawn(move || {
+            let (mount, _) = &slot.0;
+            let observation = LustreApi.link_count_by_fid(mount, fid);
+            drop(slot);
+            if result.send(observation).is_err() {
+                tracing::debug!(%fid, "Lustre link count returned after its waiter stopped");
+            }
+        })
+    {
+        tracing::warn!(%fid, %error, "could not start Lustre link count worker");
+        return LustreLinkState::Unavailable;
+    }
+    match tokio::time::timeout(LINK_LOOKUP_TIMEOUT, pending).await {
+        Ok(Ok(Ok(Some(count)))) => LustreLinkState::Present(count),
+        Ok(Ok(Ok(None))) => LustreLinkState::Missing,
+        Ok(Ok(Err(error))) => {
             tracing::warn!(%fid, %error, "could not read the Lustre file's link count");
             LustreLinkState::Unavailable
         }
-    })
+        Ok(Err(error)) => {
+            tracing::warn!(%fid, %error, "Lustre link count worker failed");
+            LustreLinkState::Unavailable
+        }
+        Err(_) => {
+            tracing::warn!(%fid, "Lustre link count lookup timed out");
+            LustreLinkState::Unavailable
+        }
+    }
 }
 
 async fn refresh_lustre_atime(

@@ -28,10 +28,12 @@ pub enum LustreLinkState {
 }
 
 impl LustreLinkState {
-    fn catalog_count(self) -> u32 {
-        match self {
-            Self::Present(count) => count,
-            Self::Missing | Self::Unavailable => 0,
+    fn apply_observed_count(self, entry: &mut ScopedEntryRow) -> bool {
+        if let Self::Present(count) = self {
+            entry.nlink = count;
+            true
+        } else {
+            false
         }
     }
 }
@@ -171,7 +173,7 @@ impl EntryStore {
         }
 
         let mut tx = self.pool.begin().await?;
-        upsert_scoped_entry_tx(&mut tx, entry, None).await?;
+        upsert_scoped_entry_tx(&mut tx, entry, None, None).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -199,7 +201,7 @@ impl EntryStore {
                     object: entry.key.object().backend(),
                 });
             }
-            upsert_scoped_entry_tx(&mut tx, entry, None).await?;
+            upsert_scoped_entry_tx(&mut tx, entry, None, None).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -673,7 +675,7 @@ impl EntryStore {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        upsert_scoped_entry_tx(&mut tx, &entry, None).await?;
+        upsert_scoped_entry_tx(&mut tx, &entry, None, None).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -704,7 +706,7 @@ impl EntryStore {
         for (name, value) in tags {
             xattrs.insert(name.clone(), serde_json::Value::String(value.clone()));
         }
-        upsert_scoped_entry_tx(&mut tx, &entry, None).await?;
+        upsert_scoped_entry_tx(&mut tx, &entry, None, None).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1276,7 +1278,7 @@ impl EntryStore {
         entry.pool_name = layout.pool_name;
         entry.stripe_items = layout.stripe_items;
         let fid_bin = fid_codec::encode(fid);
-        upsert_scoped_entry_tx(&mut tx, &entry, layout.observed_at).await?;
+        upsert_scoped_entry_tx(&mut tx, &entry, layout.observed_at, None).await?;
         replace_lustre_stripes(&mut tx, filesystem, &fid_bin, &entry.stripe_items).await?;
         tx.commit().await?;
         Ok(true)
@@ -1330,17 +1332,22 @@ impl EntryStore {
             .bind(name)
             .fetch_optional(&mut *tx)
             .await?;
-            if occupied.is_none() {
+            let inserted = occupied.is_none();
+            if inserted {
                 upsert_lustre_link_tx(&mut tx, filesystem, fid, &parent, name).await?;
             }
             let owns_name = occupied.as_deref().is_none_or(|current| current == fid_id);
-            if owns_name && entry.parent.is_none() {
+            let set_parent = owns_name && entry.parent.is_none();
+            if set_parent {
                 entry.parent = Some(EntryKey::new(filesystem.clone(), ObjectId::Lustre(parent)));
                 entry.name = bytes::Bytes::copy_from_slice(name);
             }
-            entry.nlink = state.catalog_count();
-            entry.last_seen = observed_at;
-            upsert_scoped_entry_tx(&mut tx, &entry, None).await?;
+            let count_known = state.apply_observed_count(&mut entry);
+            if inserted || set_parent || count_known {
+                entry.last_seen = observed_at;
+                let count_known = (inserted || count_known).then_some(count_known);
+                upsert_scoped_entry_tx(&mut tx, &entry, None, count_known).await?;
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -1412,7 +1419,7 @@ impl EntryStore {
             renamed.parent = Some(EntryKey::new(filesystem.clone(), ObjectId::Lustre(parent)));
             renamed.name = entry.name.clone();
             renamed.last_seen = entry.last_seen;
-            upsert_scoped_entry_tx(&mut tx, &renamed, None).await?;
+            upsert_scoped_entry_tx(&mut tx, &renamed, None, None).await?;
             upsert_lustre_link_tx(&mut tx, filesystem, &entry.fid, &parent, &entry.name).await?;
         } else {
             upsert_lustre_entry_tx(&mut tx, filesystem, entry).await?;
@@ -1947,7 +1954,7 @@ async fn update_lustre_after_unlink(
     tx: &mut Transaction<'_, MySql>, mut entry: ScopedEntryRow, parent: LuFid, name: &[u8], state: LustreLinkState,
     observed_at: i64,
 ) -> Result<()> {
-    entry.nlink = state.catalog_count();
+    let count_known = state.apply_observed_count(&mut entry);
     entry.last_seen = observed_at;
     if entry.name == name
         && entry
@@ -1974,7 +1981,7 @@ async fn update_lustre_after_unlink(
             entry.name = name.into();
         }
     }
-    upsert_scoped_entry_tx(tx, &entry, None).await
+    upsert_scoped_entry_tx(tx, &entry, None, Some(count_known)).await
 }
 
 async fn remove_lustre_entry_tx(tx: &mut Transaction<'_, MySql>, entry: &ScopedEntryRow, rm_time: i64) -> Result<()> {
@@ -2040,7 +2047,7 @@ async fn upsert_lustre_entry_tx(
             observation = None;
         }
     }
-    upsert_scoped_entry_tx(tx, &scoped, observation).await?;
+    upsert_scoped_entry_tx(tx, &scoped, observation, Some(true)).await?;
     if replace_stripes {
         replace_lustre_stripes(tx, filesystem, &fid_bin, &scoped.stripe_items).await?;
     }
@@ -2095,6 +2102,7 @@ async fn replace_lustre_stripes(
 
 async fn upsert_scoped_entry_tx(
     tx: &mut sqlx::Transaction<'_, MySql>, entry: &ScopedEntryRow, layout_observed_at: Option<i64>,
+    lustre_link_count_known: Option<bool>,
 ) -> Result<()> {
     let (object_kind, object_id) = encode_object_id(*entry.key.object());
     let (parent_kind, parent_id) = match entry.parent.as_ref() {
@@ -2120,9 +2128,11 @@ async fn upsert_scoped_entry_tx(
         r"INSERT INTO scoped_entries
             (filesystem_id, object_kind, object_id, entry_data, parent_kind, parent_id, fid,
              name, kind, size, blocks, uid, gid, projid, mode, nlink, atime, mtime, ctime,
-             stripe_count, stripe_size, pool_name, sm_status, last_seen, depth, layout_observed_at, pool_entered_at)
+             stripe_count, stripe_size, pool_name, sm_status, last_seen, depth, layout_observed_at,
+             pool_entered_at, lustre_link_count_known)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  CASE WHEN ? THEN TIMESTAMPDIFF(MICROSECOND, '1970-01-01', UTC_TIMESTAMP(6)) END)
+                  CASE WHEN ? THEN TIMESTAMPDIFF(MICROSECOND, '1970-01-01', UTC_TIMESTAMP(6)) END,
+                  COALESCE(?, TRUE))
           ON DUPLICATE KEY UPDATE
             entry_data = VALUES(entry_data), parent_kind = VALUES(parent_kind), parent_id = VALUES(parent_id),
             fid = VALUES(fid), name = VALUES(name), kind = VALUES(kind), size = VALUES(size),
@@ -2135,7 +2145,8 @@ async fn upsert_scoped_entry_tx(
                 ELSE VALUES(pool_entered_at)
             END,
             pool_name = VALUES(pool_name), sm_status = VALUES(sm_status), last_seen = VALUES(last_seen),
-            depth = VALUES(depth), layout_observed_at = COALESCE(VALUES(layout_observed_at), layout_observed_at)",
+            depth = VALUES(depth), layout_observed_at = COALESCE(VALUES(layout_observed_at), layout_observed_at),
+            lustre_link_count_known = COALESCE(?, lustre_link_count_known)",
     )
     .bind(entry.key.filesystem().as_str())
     .bind(object_kind)
@@ -2164,6 +2175,8 @@ async fn upsert_scoped_entry_tx(
     .bind(entry.depth)
     .bind(layout_observed_at)
     .bind(observed_pool)
+    .bind(lustre_link_count_known)
+    .bind(lustre_link_count_known)
     .execute(&mut **tx)
     .await?;
     Ok(())

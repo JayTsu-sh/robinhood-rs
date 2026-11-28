@@ -199,13 +199,15 @@ impl PolicyStore {
         }
         let mut late_result = None;
         let result = if !active {
-            Err(MigrationError::Deferred("policy_revision_inactive"))
+            Some(Err(MigrationError::Deferred("policy_revision_inactive")))
         } else if let Some(reason) = candidate_deferral(&mut tx, dispatch, candidate).await? {
-            Err(MigrationError::Deferred(reason))
+            Some(Err(MigrationError::Deferred(reason)))
         } else if !verify_worker_permit(worker).await? {
-            Err(MigrationError::Deferred("permit_store_requires_synchronous_commit"))
+            Some(Err(MigrationError::Deferred(
+                "permit_store_requires_synchronous_commit",
+            )))
         } else if !dispatch.admission.window_open(Utc::now()) {
-            Err(MigrationError::Deferred("admission_window_closed"))
+            Some(Err(MigrationError::Deferred("admission_window_closed")))
         } else if Instant::now() < deadline {
             let expected = file_version(&generation);
             let mount = dispatch.config.mount_path.clone();
@@ -230,27 +232,30 @@ impl PolicyStore {
                     },
                     before_swap: || swap_gate.check().is_continue(),
                 };
-                LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, ownership)
+                let result = LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, &ownership);
+                // Recovery must wait until a possible late deferral has
+                // been journaled, including after the syscall returns.
+                (result, ownership)
             }));
             match tokio::time::timeout_at(deadline.into(), &mut migration).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(MigrationError::Uncertain(error.to_string())),
+                Ok(Ok((result, _ownership))) => Some(result),
+                Ok(Err(error)) => Some(Err(MigrationError::Uncertain(error.to_string()))),
                 Err(_) => {
                     if scoped {
                         late_result = Some(migration);
                     }
-                    Err(MigrationError::Uncertain(MIGRATION_DEADLINE_PENDING.into()))
+                    None
                 }
             }
         } else {
-            Err(MigrationError::Deferred("migration_deadline_elapsed"))
+            Some(Err(MigrationError::Deferred("migration_deadline_elapsed")))
         };
 
         // Release the policy, journal and catalog locks before updating the
         // catalog. The committed intent remains pending through this gap.
         tx.commit().await?;
         let (state, reason, evidence) = match result {
-            Ok(layout) => {
+            Some(Ok(layout)) => {
                 let entries = EntryStore::with_pool(self.pool.clone());
                 settle_layout(
                     &entries,
@@ -261,15 +266,16 @@ impl PolicyStore {
                 )
                 .await
             }
-            Err(MigrationError::Deferred(reason)) => ("deferred", Some(reason.to_owned()), None),
-            Err(error @ MigrationError::BeforeSwap(_)) => ("failed", Some(error.to_string()), None),
-            Err(error @ MigrationError::Uncertain(_)) => ("unknown", Some(error.to_string()), None),
+            Some(Err(MigrationError::Deferred(reason))) => ("deferred", Some(reason.to_owned()), None),
+            Some(Err(error @ MigrationError::BeforeSwap(_))) => ("failed", Some(error.to_string()), None),
+            Some(Err(error @ MigrationError::Uncertain(_))) => ("unknown", Some(error.to_string()), None),
+            None => ("unknown", Some(MIGRATION_DEADLINE_PENDING.into()), None),
         };
         finish_migration(self, operation, "submitting", state, reason, evidence).await?;
         if let Some(pending) = late_result {
             let pool = self.pool.clone();
             tokio::spawn(async move {
-                if let Ok(Err(MigrationError::Deferred(reason))) = pending.await
+                if let Ok((Err(MigrationError::Deferred(reason)), _ownership)) = pending.await
                     && let Err(error) = record_late_deferral(&pool, operation, reason).await
                 {
                     tracing::warn!(operation, %error, reason, "could not record the late pool migration deferral");
@@ -650,13 +656,12 @@ async fn record_late_deferral(pool: &sqlx::MySqlPool, operation: u64, reason: &'
          SET state = 'deferred', attempted = FALSE, reason = ?, checked_at = UTC_TIMESTAMP(6),
              finished_at = UTC_TIMESTAMP(6)
          WHERE id = ? AND (
-            (state = 'unknown' AND reason IN (?, 'migration_layout_unresolved'))
-            OR (state = 'deferred' AND reason IN ('swap_not_observed_in_source_pool', 'source_generation_changed'))
+            state = 'unknown'
+            OR (state = 'deferred' AND reason IN ('swap_not_observed_in_source_pool', 'source_generation_changed', 'fid_missing'))
          )",
     )
     .bind(reason)
     .bind(operation)
-    .bind(MigrationError::Uncertain(MIGRATION_DEADLINE_PENDING.into()).to_string())
     .execute(pool)
     .await?;
     Ok(())

@@ -227,7 +227,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
             &plan,
             generation,
             limits,
-            MigrationOwnership::acquire(&fsname).unwrap()
+            &MigrationOwnership::acquire(&fsname).unwrap()
         ),
         Err(lustre_api::migration::MigrationError::Deferred(
             "admission_window_closed"
@@ -254,7 +254,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
             &plan,
             generation,
             limits,
-            MigrationOwnership::acquire(&fsname).unwrap()
+            &MigrationOwnership::acquire(&fsname).unwrap()
         ),
         Err(lustre_api::migration::MigrationError::Deferred(
             "migration_deadline_elapsed"

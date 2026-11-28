@@ -147,9 +147,10 @@ the mount in `RBH_CONSOLE_EXECUTION_TEST_MOUNT`, the registration ID in
 `RBH_CONSOLE_EXECUTION_TEST_FS`, and the test writer token in
 `RBH_CONSOLE_EXECUTION_TEST_TOKEN`. Run the test with
 `npm --prefix web run test:e2e -- policy-execution.spec.ts` against that
-daemon. The test creates fixtures and exercises both cycle and on-demand
-scheduling, including the source placement of excluded and HSM-managed
-files.
+daemon. The test creates fixtures, previews and saves a policy through the
+six-step wizard, enables it, runs it, and downloads its execution report.
+It also verifies periodic scheduling and uses `lfs` to check the placement
+of migrated, excluded, and HSM-managed files.
 
 The final check reads the live link namespace immediately before the swap.
 Lustre group locking and the swap's data-version guard protect file I/O.

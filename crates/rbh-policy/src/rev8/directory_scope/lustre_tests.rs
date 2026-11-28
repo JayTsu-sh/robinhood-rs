@@ -74,6 +74,7 @@ fn directory_and_link_changes_during_copy_preserve_the_source_layout() {
             .unwrap();
         let mut checks = 0;
         let mut remaining_link = link.clone();
+        let ownership = MigrationOwnership::acquire(&filesystem).unwrap();
         let result = LustreApi.migrate_reserved_pool(
             &mount,
             &fid,
@@ -104,7 +105,7 @@ fn directory_and_link_changes_during_copy_preserve_the_source_layout() {
                 },
                 before_swap: || panic!("the operation must stop before the swap permit"),
             },
-            MigrationOwnership::acquire(&filesystem).unwrap(),
+            &ownership,
         );
         let error = result.err();
         assert!(
@@ -112,6 +113,10 @@ fn directory_and_link_changes_during_copy_preserve_the_source_layout() {
             "{scenario}: {error:?}"
         );
         assert_eq!(checks, 2);
+        assert!(matches!(
+            MigrationOwnership::acquire(&filesystem),
+            Err(MigrationError::Deferred("filesystem_migration_busy"))
+        ));
         assert_eq!(LustreApi.path_to_fid(&remaining_link).unwrap(), fid);
         assert_eq!(LustreApi.path_to_fid(&file).unwrap(), fid);
         assert_eq!(LustreApi.migration_source_layout(&mount, &fid).unwrap(), original);

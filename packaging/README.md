@@ -53,6 +53,13 @@ installation directory, such as the local `web/dist/` for development.
 The daemon only needs read access to the installed files. Node.js is a build
 dependency.
 
+For remote operators who use the existing Rev.8 writer, bind the daemon to
+a loopback listener such as `RBH_LISTEN_ADDR=127.0.0.1:8080` and terminate HTTPS
+at your reverse proxy. Forward both `/console/` and `/api/` from the same
+HTTPS origin to that listener. Preserve the request URI and the
+`Authorization` and `If-Match` headers. Open `https://<your-host>/console/`
+for writer actions. Local access can use `http://127.0.0.1:8080/console/`.
+
 The daemon schedules Lustre resource collection through `scheduler-rs` at
 startup and every 60 seconds by default. Set `RBH_CONSOLE_COLLECT_SECS` to a
 positive number of seconds to change the interval. The console reads the

@@ -39,6 +39,7 @@ async fn scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_r
     let sibling = indexed(3);
     let excluded = indexed(4);
     let excluded_child = indexed(5);
+    let unavailable = LuFid::new(0x200000401, 30, 0);
     let write = async |object, kind, size, nlink, parent| {
         entries
             .upsert_scoped_entry(&ScopedEntryRow {
@@ -115,6 +116,20 @@ async fn scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_r
     }
 
     let mut state = state_without_database_connection();
+    // A missing live observation can coincide with an apparently complete
+    // set of catalog links. Keep the previous count for ordinary readers.
+    write(ObjectId::Lustre(unavailable), EntryKind::File, 1000, 1, None).await;
+    entries
+        .link_lustre_name(
+            &filesystem,
+            &unavailable,
+            LuFid::new(0x200000401, 1, 0),
+            b"unavailable",
+            rbh_entry_store::store::LustreLinkState::Unavailable,
+            20,
+        )
+        .await
+        .unwrap();
     state.entry_store = entries.clone();
     state.policy_store = PolicyStore::new(entries.pool().clone()).with_configured_filesystems([filesystem.clone()]);
     let server = TestServer::new(crate::router(state.clone())).unwrap();
@@ -136,9 +151,14 @@ async fn scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_r
         preview["directoryScope"],
         json!({
             "excludedByReason": {"link_in_excluded_subtree": 1, "link_outside_scope": 2},
-            "deferredByReason": {"incomplete_link_evidence": 5}
+            "deferredByReason": {"incomplete_link_evidence": 6}
         })
     );
+    let entry = server
+        .get(&format!("/api/entries/{unavailable}?filesystem={filesystem}"))
+        .await;
+    entry.assert_status_ok();
+    assert_eq!(entry.json::<serde_json::Value>()["nlink"], 1);
     assert!(preview["resourceBindings"].as_array().unwrap().iter().any(|binding| {
         binding["name"] == "lustre.pool_migrate" && binding["revision"].as_u64().is_some_and(|revision| revision > 0)
     }));
@@ -234,6 +254,50 @@ async fn scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_r
     let runs = server.get(&format!("/api/policies/{id}/runs")).await;
     runs.assert_status_ok();
     assert_eq!(runs.json::<serde_json::Value>(), json!([]));
+
+    entries
+        .link_lustre_name(
+            &filesystem,
+            &unavailable,
+            LuFid::new(0x200000401, 1, 0),
+            b"unavailable",
+            rbh_entry_store::store::LustreLinkState::Present(1),
+            21,
+        )
+        .await
+        .unwrap();
+    entries
+        .unlink_lustre_name(
+            &filesystem,
+            &unavailable,
+            LuFid::new(0x200000401, 1, 0),
+            b"already-removed",
+            rbh_entry_store::store::LustreLinkState::Unavailable,
+            22,
+        )
+        .await
+        .unwrap();
+    entries
+        .link_lustre_name(
+            &filesystem,
+            &unavailable,
+            LuFid::new(0x200000401, 1, 0),
+            b"unavailable",
+            rbh_entry_store::store::LustreLinkState::Unavailable,
+            23,
+        )
+        .await
+        .unwrap();
+    let response = server.post(&format!("/api/policies/{id}/preview")).await;
+    response.assert_status_ok();
+    let recovered = response.json::<serde_json::Value>();
+    assert_eq!(recovered["candidateCount"], 2);
+    assert_eq!(recovered["estimatedBytes"], 1100);
+    assert_eq!(
+        recovered["directoryScope"]["deferredByReason"]["incomplete_link_evidence"],
+        5
+    );
+
     // Fill a second page while keeping every FID's hard links together.
     let large = 9_007_199_254_740_993_u64;
     for oid in 1000..1513 {
@@ -245,8 +309,8 @@ async fn scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_r
     let response = server.post("/api/policies/preview").json(&document).await;
     response.assert_status_ok();
     let preview = response.json::<serde_json::Value>();
-    let expected = large + 512 * 64 + 100;
-    assert_eq!(preview["candidateCount"], 514);
+    let expected = large + 512 * 64 + 1100;
+    assert_eq!(preview["candidateCount"], 515);
     assert_eq!(preview["estimatedBytes"], expected);
     assert_eq!(preview["estimatedBytesExact"], expected.to_string());
 }
