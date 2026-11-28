@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -20,6 +21,10 @@ use rbh_entry_store::{EntryStore, FileSystemConfig, FileSystemId};
 mod rev8_execution;
 mod rev8_heat;
 mod rev8_resources;
+pub use rev8_execution::history::{
+    HistoryOperation, HistoryPage, LatestRun, OperationFilter, OperationResults, OperationSearch, OperationState,
+    OperationSummary, RunHistory, RunReportSnapshot, RunSearch, RunState,
+};
 pub use rev8_execution::{Rev8Operation, Rev8Run};
 pub use rev8_heat::HeatSampler;
 pub use rev8_resources::ResourceRevision;
@@ -43,9 +48,56 @@ pub struct PolicyStore {
 pub struct Rev8PolicyRow {
     pub id: u64,
     pub revision: u64,
+    pub id_exact: String,
+    pub revision_exact: String,
     pub definition: Json<serde_json::Value>,
     pub resource_bindings: Option<Json<Vec<ResourceBinding>>>,
     pub modified_by: Option<String>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_run: Option<LatestRun>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Rev8PolicyWrite {
+    Create,
+    Update { id: u64, expected_revision: Option<u64> },
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedRev8Policy {
+    pub id: u64,
+    pub revision: u64,
+    pub id_exact: String,
+    pub revision_exact: String,
+}
+
+impl SavedRev8Policy {
+    fn new(id: u64, revision: u64) -> Self {
+        Self {
+            id,
+            revision,
+            id_exact: id.to_string(),
+            revision_exact: revision.to_string(),
+        }
+    }
+}
+
+const REV8_POLICY_FIELDS: &str = "r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by,
+    CAST(r.policy_id AS CHAR) AS id_exact, CAST(r.revision AS CHAR) AS revision_exact";
+
+const POLICY_HEAD_REVISION: &str =
+    "SELECT revision FROM policies WHERE id = ? AND name IS NOT NULL AND revision IS NOT NULL";
+
+fn check_policy_revision(id: u64, expected: Option<u64>, current: Option<u64>) -> Result<u64, PolicyError> {
+    let current = current.ok_or(PolicyError::NotFound(id))?;
+    if let Some(expected) = expected
+        && expected != current
+    {
+        return Err(PolicyError::RevisionConflict { id, expected, current });
+    }
+    Ok(current)
 }
 
 impl PolicyStore {
@@ -110,9 +162,27 @@ impl PolicyStore {
 
     #[tracing::instrument(skip(self, entries, document))]
     pub async fn save_rev8(
-        &self, entries: &EntryStore, id: Option<u64>, document: &serde_json::Value, actor: &str,
-    ) -> Result<u64, PolicyError> {
+        &self, entries: &EntryStore, write: Rev8PolicyWrite, document: &serde_json::Value, actor: &str,
+    ) -> Result<SavedRev8Policy, PolicyError> {
         let input = rev8::parse(document)?;
+        // Report stale edits before probing resources; check again under the write lock.
+        if let Rev8PolicyWrite::Update {
+            id,
+            expected_revision: Some(expected),
+        } = write
+        {
+            let current = sqlx::query_scalar(POLICY_HEAD_REVISION)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+            check_policy_revision(id, Some(expected), current)?;
+        }
+        if let Rev8PolicyWrite::Update { id, expected_revision } = write
+            && document["spec"]["enabled"] == false
+            && let Some(saved) = self.deactivate_rev8(id, expected_revision, document, actor).await?
+        {
+            return Ok(saved);
+        }
         self.ensure_configured(input.filesystem())?;
         let config = rev8::validate_filesystem(entries, input.filesystem()).await?;
         let activation = if input.enforced_and_enabled() {
@@ -129,12 +199,36 @@ impl PolicyStore {
                     "enforced activation requires an accessible Lustre mount: {error}"
                 ))
             })?;
+            if input.has_directory_scope() {
+                let mount = config.mount_path.clone();
+                let probe =
+                    rev8::execution::lustre_call(move || lustre_api::LustreApi.verify_migration_namespace(&mount));
+                tokio::time::timeout(Duration::from_secs(5), probe)
+                    .await
+                    .map_err(|_| rev8::invalid("spec.target.directoryScope live FID-to-path check timed out"))?
+                    .map_err(|error| PolicyError::Store(format!("live namespace probe: {error}")))?
+                    .map_err(|error| rev8::invalid(format!(
+                        "spec.target.directoryScope requires live FID-to-path access on the executor mount. Check Lustre user_fid2path or the daemon's CAP_DAC_READ_SEARCH. {error:?}"
+                    )))?;
+            }
             Some(runtime.principal.clone())
         } else {
             None
         };
         let next_run = input.schedule_after(Utc::now())?;
         let mut tx = self.lock_configuration().await?;
+        let update = match write {
+            Rev8PolicyWrite::Create => None,
+            Rev8PolicyWrite::Update { id, expected_revision } => {
+                // Revision writers already hold the configuration lock. Leave the
+                // policy row available to workers until the update is ready.
+                let current = sqlx::query_scalar(POLICY_HEAD_REVISION)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                Some((id, check_policy_revision(id, expected_revision, current)?))
+            }
+        };
         let (policy, bindings) = Self::bind_policy(&mut tx, input).await?;
         policy.validate_capabilities(&config)?;
         if let Some(migration) = policy.pool_migration() {
@@ -156,10 +250,10 @@ impl PolicyStore {
         let next_run = next_run.filter(|_| policy.enabled);
         let heat_filesystem =
             (policy.uses_read_heat && policy.pool_migration().is_some()).then_some(policy.filesystem.as_str());
-        let id = if let Some(id) = id {
-            let result = sqlx::query(
+        let (id, revision) = if let Some((id, current)) = update {
+            sqlx::query(
                 "UPDATE policies SET name = ?, definition = ?, revision = revision + 1, enabled = ?, rev8_next_run = ?, rev8_heat_filesystem = ?
-                 WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL",
+                 WHERE id = ?",
             )
             .bind(&policy.name)
             .bind(Json(document))
@@ -170,12 +264,9 @@ impl PolicyStore {
             .execute(&mut *tx)
             .await
             .map_err(|error| policy_write_error(error, &policy.name))?;
-            if result.rows_affected() == 0 {
-                return Err(PolicyError::NotFound(id));
-            }
-            id
+            (id, current + 1)
         } else {
-            sqlx::query(
+            let id = sqlx::query(
                 "INSERT INTO policies (name, kind, definition, enabled, revision, rev8_next_run, rev8_heat_filesystem) VALUES (?, 'Policy', ?, ?, 1, ?, ?)",
             )
             .bind(&policy.name)
@@ -186,38 +277,107 @@ impl PolicyStore {
             .execute(&mut *tx)
             .await
             .map_err(|error| policy_write_error(error, &policy.name))?
-            .last_insert_id()
+            .last_insert_id();
+            (id, 1)
         };
         record_rev8_revision(&mut tx, id, bindings, actor).await?;
         tx.commit().await?;
-        Ok(id)
+        Ok(SavedRev8Policy::new(id, revision))
+    }
+
+    // Stopping dispatch must work even if the resources used by the current
+    // policy have become unavailable. Edits still go through full validation.
+    async fn deactivate_rev8(
+        &self, id: u64, expected_revision: Option<u64>, document: &serde_json::Value, actor: &str,
+    ) -> Result<Option<SavedRev8Policy>, PolicyError> {
+        let mut tx = self.lock_configuration().await?;
+        let row: Rev8PolicyRow = sqlx::query_as(&format!(
+            "SELECT {REV8_POLICY_FIELDS}
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision
+             WHERE p.id = ? AND p.name IS NOT NULL"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(PolicyError::NotFound(id))?;
+        let revision = check_policy_revision(id, expected_revision, Some(row.revision))?;
+        let mut stopped = row.definition.0;
+        if stopped["spec"]["enabled"] == false {
+            return Ok(None);
+        }
+        stopped["spec"]["enabled"] = false.into();
+        if &stopped != document {
+            return Ok(None);
+        }
+        sqlx::query(
+            "UPDATE policies SET definition = ?, enabled = FALSE, revision = revision + 1, rev8_next_run = NULL
+             WHERE id = ?",
+        )
+        .bind(Json(document))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        record_rev8_revision(
+            &mut tx,
+            id,
+            row.resource_bindings.map(|bindings| bindings.0).unwrap_or_default(),
+            actor,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(SavedRev8Policy::new(id, revision + 1)))
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn get_rev8(&self, id: u64) -> Result<Option<Rev8PolicyRow>, PolicyError> {
-        Ok(sqlx::query_as(
-            "SELECT r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by
-             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.id = ? AND p.name IS NOT NULL",
-        ).bind(id).fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_as(&format!(
+            "SELECT {REV8_POLICY_FIELDS}
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.id = ? AND p.name IS NOT NULL"
+        )).bind(id).fetch_optional(&self.pool).await?)
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn list_rev8(&self) -> Result<Vec<Rev8PolicyRow>, PolicyError> {
-        Ok(sqlx::query_as(
-            "SELECT r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by
-             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.name IS NOT NULL ORDER BY p.id",
-        ).fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as(&format!(
+            "SELECT {REV8_POLICY_FIELDS}
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.name IS NOT NULL ORDER BY p.id"
+        )).fetch_all(&self.pool).await?)
+    }
+
+    /// List current revisions whose target belongs to this deployment's registry.
+    #[tracing::instrument(skip(self))]
+    pub async fn list_configured_rev8(&self) -> Result<Vec<Rev8PolicyRow>, PolicyError> {
+        let mut rows = self.list_rev8().await?;
+        self.retain_configured_rev8(&mut rows);
+        Ok(rows)
+    }
+
+    fn retain_configured_rev8(&self, rows: &mut Vec<Rev8PolicyRow>) {
+        if let Some(configured) = &self.configured_filesystems {
+            rows.retain(|row| {
+                row.definition["spec"]["target"]["filesystem"]
+                    .as_str()
+                    .and_then(|id| FileSystemId::new(id).ok())
+                    .is_some_and(|id| configured.contains(&id))
+            });
+        }
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn get_rev8_revision(&self, id: u64, revision: u64) -> Result<Rev8PolicyRow, PolicyError> {
-        sqlx::query_as(
-            "SELECT policy_id AS id, revision, definition, resource_bindings, modified_by
-             FROM rev8_policy_revisions WHERE policy_id = ? AND revision = ?",
-        )
+        Self::read_rev8_revision(id, revision, &self.pool).await
+    }
+
+    async fn read_rev8_revision(
+        id: u64, revision: u64, executor: impl sqlx::MySqlExecutor<'_>,
+    ) -> Result<Rev8PolicyRow, PolicyError> {
+        sqlx::query_as(&format!(
+            "SELECT {REV8_POLICY_FIELDS}
+             FROM rev8_policy_revisions r WHERE policy_id = ? AND revision = ?"
+        ))
         .bind(id)
         .bind(revision)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?
         .ok_or(PolicyError::NotFound(id))
     }
@@ -255,23 +415,35 @@ impl PolicyStore {
             .await
     }
 
-    async fn preview_compiled(
-        &self, entries: &EntryStore, policy: &CompiledPolicy, revision: u64, bindings: Vec<ResourceBinding>,
-        fid: Option<lustre_api::LuFid>,
-    ) -> Result<PreviewResult, PolicyError> {
-        if policy.uses_read_heat {
-            rev8::heat::preview(
-                entries,
-                policy,
-                self.read_heat.get(&policy.filesystem),
-                revision,
-                bindings,
-                fid,
-            )
-            .await
-        } else {
-            policy.preview(entries, revision, bindings).await
+    /// Compile an unsaved document against a read-only view of the current Rev.8 resources.
+    #[tracing::instrument(skip_all, fields(filesystem))]
+    pub async fn preview_rev8_document(
+        &self, entries: &EntryStore, document: &serde_json::Value,
+    ) -> Result<PreviewResult<()>, PolicyError> {
+        let input = rev8::parse(document)?;
+        tracing::Span::current().record("filesystem", tracing::field::display(input.filesystem()));
+        self.ensure_configured(input.filesystem())?;
+        let mut tx = self.pool.begin_with("START TRANSACTION READ ONLY").await?;
+        let (policy, bindings) = Self::bind_policy(&mut tx, input).await?;
+        tx.commit().await?;
+        let migration = policy
+            .pool_migration()
+            .ok_or_else(|| rev8::invalid("draft tiering preview requires lustre.pool_migrate"))?;
+        if !policy.has_directory_scope() {
+            let config = rev8::validate_filesystem(entries, &policy.filesystem).await?;
+            policy.validate_capabilities(&config)?;
+            migration.validate_pools(&config.mount_path).await?;
         }
+        self.preview_compiled(entries, &policy, (), bindings, None).await
+    }
+
+    async fn preview_compiled<Revision>(
+        &self, entries: &EntryStore, policy: &CompiledPolicy, revision: Revision, bindings: Vec<ResourceBinding>,
+        fid: Option<lustre_api::LuFid>,
+    ) -> Result<PreviewResult<Revision>, PolicyError> {
+        policy
+            .preview_with_heat(entries, revision, bindings, self.read_heat.get(&policy.filesystem), fid)
+            .await
     }
 }
 

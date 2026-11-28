@@ -1,3 +1,4 @@
+pub(super) mod history;
 mod migration;
 mod native_admission;
 mod native_recovery;
@@ -25,7 +26,7 @@ use super::PolicyStore;
 use crate::{
     PolicyError,
     rev8::{
-        self, ActionKind, BudgetLimits, CompiledPolicy, DB_EPOCH_MICROS, Invocation,
+        self, ActionKind, BudgetLimits, CompiledPolicy, DB_EPOCH_MICROS, Invocation, ScopeSummary,
         execution::{Admission, Generation, Profile},
         heat::{self, HeatProfile},
         invalid, push_expression,
@@ -36,7 +37,7 @@ use crate::{
 const BATCH_SIZE: usize = 64;
 const RUN_FIELDS: &str =
     "id, policy_id, revision, state, reason, candidate_count, estimated_bytes, requested_by, created_at, started_at,
-     heat_deferred_by_reason";
+     heat_deferred_by_reason, directory_scope";
 const OPERATION_FIELDS: &str =
     "o.id, o.run_id, r.policy_id, r.revision, o.filesystem, o.fid, o.action, o.archive_id, o.state,
      o.reason, o.attempted, o.generation, o.principal, o.size, o.accepted_at, o.completion_evidence, o.migration_plan,
@@ -57,6 +58,8 @@ pub struct Rev8Run {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heat_deferred_by_reason: Option<Json<BTreeMap<String, u64>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_scope: Option<Json<ScopeSummary>>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -182,19 +185,38 @@ impl PolicyStore {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn request_rev8_run(&self, id: u64, actor: &str) -> Result<u64, PolicyError> {
+    pub async fn request_rev8_run(
+        &self, id: u64, actor: &str, expected_revision: Option<u64>,
+    ) -> Result<u64, PolicyError> {
         let mut tx = self.lock_configuration().await?;
         let row: Option<(u64, Json<Value>)> = sqlx::query_as(
             "SELECT revision, definition FROM policies WHERE id = ? AND revision IS NOT NULL AND name IS NOT NULL FOR UPDATE",
         ).bind(id).fetch_optional(&mut *tx).await?;
         let (revision, definition) = row.ok_or(PolicyError::NotFound(id))?;
+        super::check_policy_revision(id, expected_revision, Some(revision))?;
         if definition["spec"]["enabled"] == false {
             return Err(invalid("the policy is disabled"));
+        }
+        if expected_revision.is_some()
+            && let Some(existing) = sqlx::query_scalar(
+                "SELECT id FROM rev8_runs WHERE policy_id = ? AND revision = ? AND state IN ('queued','running')
+                 ORDER BY state = 'running' DESC, id DESC LIMIT 1",
+            )
+            .bind(id)
+            .bind(revision)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            return Err(PolicyError::ActiveRun { id: existing });
         }
         if definition["spec"]["mode"] == "one_shot"
             && let Some(existing) = existing_one_shot_run(&mut tx, id, revision, &definition).await?
         {
-            return Ok(existing);
+            return if expected_revision.is_some() {
+                Err(PolicyError::OneShotRun { id: existing })
+            } else {
+                Ok(existing)
+            };
         }
         let run = sqlx::query("INSERT INTO rev8_runs (policy_id, revision, requested_by) VALUES (?, ?, ?)")
             .bind(id)
@@ -379,7 +401,7 @@ impl PolicyStore {
             };
             sqlx::query(
                 "UPDATE rev8_runs SET state = ?, reason = ?, candidate_count = ?, estimated_bytes = ?, started_at = ?,
-                 heat_deferred_by_reason = ? WHERE id = ?",
+                 heat_deferred_by_reason = ?, directory_scope = ? WHERE id = ?",
             )
             .bind(state)
             .bind(reason)
@@ -387,6 +409,7 @@ impl PolicyStore {
             .bind(preview.estimated_bytes)
             .bind(now)
             .bind(preview.read_heat.map(|heat| Json(heat.deferred_by_reason)))
+            .bind(preview.directory_scope.map(Json))
             .bind(run.id)
             .execute(&mut *tx)
             .await?;

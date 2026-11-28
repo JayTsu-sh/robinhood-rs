@@ -189,6 +189,14 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
 
     let api = LustreApi;
     let fid = api.path_to_fid(&path).unwrap();
+    assert_eq!(api.link_count_by_fid(mount, fid).unwrap(), Some(2));
+    let snapshot = api
+        .migration_link_paths(mount, &fid, Instant::now() + Duration::from_secs(15))
+        .unwrap();
+    let paths = snapshot.relative_paths().collect::<Vec<_>>();
+    assert_eq!(paths.len(), 2);
+    assert!(paths.contains(&path.strip_prefix(mount).ok()));
+    assert!(paths.contains(&link.strip_prefix(mount).ok()));
     let stripe = api.migration_source_layout(mount, &fid).unwrap();
     assert_eq!(stripe.pool.as_deref(), Some("hot"));
     let plan = MigrationPlan {
@@ -209,6 +217,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
     let limits = MigrationLimits {
         deadline: Instant::now() + Duration::from_secs(15),
         expected_access: None,
+        check_links: |_: &fs::File| Ok(()),
         before_swap: || false,
     };
     assert!(matches!(
@@ -218,7 +227,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
             &plan,
             generation,
             limits,
-            MigrationOwnership::acquire(&fsname).unwrap()
+            &MigrationOwnership::acquire(&fsname).unwrap()
         ),
         Err(lustre_api::migration::MigrationError::Deferred(
             "admission_window_closed"
@@ -231,6 +240,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
     let limits = MigrationLimits {
         deadline,
         expected_access: None,
+        check_links: |_: &fs::File| Ok(()),
         before_swap: || {
             entered.set(true);
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
@@ -244,7 +254,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
             &plan,
             generation,
             limits,
-            MigrationOwnership::acquire(&fsname).unwrap()
+            &MigrationOwnership::acquire(&fsname).unwrap()
         ),
         Err(lustre_api::migration::MigrationError::Deferred(
             "migration_deadline_elapsed"

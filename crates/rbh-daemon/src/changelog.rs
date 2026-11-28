@@ -11,22 +11,27 @@
 //! the file to refresh changed fields.
 //! For layout events, we reread the actual Lustre OST layout by FID.
 
+use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use lustre_api::LustreApi;
+use lustre_api::{LuFid, LustreApi};
 use lustre_changelog::ChangelogEvent;
 use rbh_change_source::{BackendChange, Change, ChangeSource, ContentChangeKind, MetadataChangeKind};
 use rbh_entry_store::model::{
     EntryKey, EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow, ScopedNamespaceEdge,
 };
-use rbh_entry_store::store::EntryStore;
+use rbh_entry_store::store::{EntryStore, LustreLinkState};
 
-const CATCHUP_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+const CATCHUP_QUIET_PERIOD: Duration = Duration::from_secs(1);
+const LINK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_LINK_LOOKUPS_PER_MOUNT: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 enum LustreIngestError {
@@ -706,25 +711,22 @@ async fn apply_event(
         }
 
         ChangelogEvent::Hardlink { fid, parent, name } => {
-            // Update the entry's parent/name to the new link location.
-            // A full hardlink implementation would insert into the names table.
-            if let Some(mut entry) = store.get_lustre_entry(filesystem, fid).await? {
-                entry.parent_fid = Some(*parent);
-                entry.name = name.clone();
-                entry.nlink = entry.nlink.saturating_add(1);
-                entry.last_seen = now_secs();
-                store.upsert_lustre_entry(filesystem, &entry).await?;
-                Ok(true)
+            let state = if store.get_lustre_entry(filesystem, fid).await?.is_some() {
+                lustre_link_state(mount, *fid).await
             } else {
-                // Entry not in catalog — try stat
-                match stat_entry_by_fid(mount, fid, Some(*parent), name.clone(), EntryKind::File).await {
-                    Ok(entry) => {
-                        store.upsert_lustre_entry(filesystem, &entry).await?;
-                        Ok(true)
-                    }
-                    Err(_) => Ok(false),
-                }
-            }
+                // Seed metadata without assigning the historical name. The
+                // link transaction checks the current owner of that name.
+                let Ok(entry) = stat_entry_by_fid(mount, fid, None, Bytes::new(), EntryKind::File).await else {
+                    return Ok(false);
+                };
+                let state = LustreLinkState::Present(entry.nlink);
+                store.upsert_lustre_entry(filesystem, &entry).await?;
+                state
+            };
+            store
+                .link_lustre_name(filesystem, fid, *parent, name, state, event_time)
+                .await?;
+            Ok(true)
         }
 
         // ── Deletion events ──
@@ -755,18 +757,11 @@ async fn apply_event(
                 store.remove_lustre_entry(filesystem, fid, event_time).await?;
                 Ok(true)
             } else {
+                let state = lustre_link_state(mount, *fid).await;
                 store
-                    .remove_scoped_namespace_edge(filesystem, ObjectId::Lustre(*parent), name)
+                    .unlink_lustre_name(filesystem, fid, *parent, name, state, event_time)
                     .await?;
-                // Decrement nlink if the entry exists.
-                if let Some(mut entry) = store.get_lustre_entry(filesystem, fid).await? {
-                    entry.nlink = entry.nlink.saturating_sub(1);
-                    entry.last_seen = now_secs();
-                    store.upsert_lustre_entry(filesystem, &entry).await?;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
+                Ok(true)
             }
         }
 
@@ -776,31 +771,43 @@ async fn apply_event(
         }
 
         // ── Rename ──
-        ChangelogEvent::Rename { fid, parent, name, .. } => {
+        ChangelogEvent::Rename {
+            fid,
+            parent,
+            name,
+            src_parent,
+            src_name,
+        } => {
             tracing::debug!(
                 fid = %fid,
                 dst_name = %String::from_utf8_lossy(name),
                 "processing Rename event"
             );
 
-            // Handle rename-overwrite: if an entry already occupies the
-            // destination (parent, name), it was displaced and must be removed.
-            //
-            // We first try (parent_fid, name) lookup. If that doesn't find a
-            // match, we fall back to a name-only search. The fallback handles
-            // entries from initial scans or old changelog replays where
-            // parent_fid may not yet be set correctly.
+            let mut displaced = None;
+            if let Some(key) = store
+                .lookup_scoped_namespace_child(filesystem, ObjectId::Lustre(*parent), name)
+                .await?
+                && let ObjectId::Lustre(other) = *key.object()
+                && other != *fid
+            {
+                displaced = Some((other, lustre_link_state(mount, other).await));
+            }
             let existing = store.get_lustre_entry(filesystem, fid).await?;
             if let Some(mut entry) = existing {
                 entry.parent_fid = Some(*parent);
                 entry.name = name.clone();
                 entry.last_seen = now_secs();
-                store.rename_lustre_entry(filesystem, &entry, event_time).await?;
+                store
+                    .rename_lustre_entry(filesystem, &entry, (*src_parent, src_name), event_time, displaced)
+                    .await?;
                 Ok(true)
             } else {
                 match stat_entry_by_fid(mount, fid, Some(*parent), name.clone(), EntryKind::File).await {
                     Ok(entry) => {
-                        store.rename_lustre_entry(filesystem, &entry, event_time).await?;
+                        store
+                            .rename_lustre_entry(filesystem, &entry, (*src_parent, src_name), event_time, displaced)
+                            .await?;
                         Ok(true)
                     }
                     Err(e) => {
@@ -846,6 +853,68 @@ async fn apply_event(
 
         ChangelogEvent::Layout { fid } => refresh_lustre_layout(store, filesystem, mount, fid).await,
         ChangelogEvent::XAttr { .. } => Ok(false),
+    }
+}
+
+// Keep ownership across MDT consumers and listener reconnects.
+static ACTIVE_LINK_LOOKUPS: LazyLock<Mutex<HashSet<(PathBuf, LuFid)>>> = LazyLock::new(Mutex::default);
+
+struct LinkLookupSlot((PathBuf, LuFid));
+
+impl LinkLookupSlot {
+    fn acquire(mount: &Path, fid: LuFid) -> Option<Self> {
+        let mut active = ACTIVE_LINK_LOOKUPS.lock().ok()?;
+        let per_mount = active.iter().filter(|(path, _)| path == mount).count();
+        let key = (mount.to_owned(), fid);
+        (per_mount < MAX_LINK_LOOKUPS_PER_MOUNT && active.insert(key.clone())).then(|| Self(key))
+    }
+}
+
+impl Drop for LinkLookupSlot {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_LINK_LOOKUPS.lock() {
+            active.remove(&self.0);
+        }
+    }
+}
+
+async fn lustre_link_state(mount: &Path, fid: LuFid) -> LustreLinkState {
+    // Retain the slot until the syscall returns, even if its waiter times out.
+    let Some(slot) = LinkLookupSlot::acquire(mount, fid) else {
+        return LustreLinkState::Unavailable;
+    };
+    let (result, pending) = oneshot::channel();
+    // Tokio waits for its blocking pool on shutdown. Detach this bounded
+    // native call so a stuck Lustre client cannot delay daemon shutdown.
+    if let Err(error) = std::thread::Builder::new()
+        .name("lustre-link-count".into())
+        .spawn(move || {
+            let (mount, _) = &slot.0;
+            let observation = LustreApi.link_count_by_fid(mount, fid);
+            drop(slot);
+            if result.send(observation).is_err() {
+                tracing::debug!(%fid, "Lustre link count returned after its waiter stopped");
+            }
+        })
+    {
+        tracing::warn!(%fid, %error, "could not start Lustre link count worker");
+        return LustreLinkState::Unavailable;
+    }
+    match tokio::time::timeout(LINK_LOOKUP_TIMEOUT, pending).await {
+        Ok(Ok(Ok(Some(count)))) => LustreLinkState::Present(count),
+        Ok(Ok(Ok(None))) => LustreLinkState::Missing,
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%fid, %error, "could not read the Lustre file's link count");
+            LustreLinkState::Unavailable
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%fid, %error, "Lustre link count worker failed");
+            LustreLinkState::Unavailable
+        }
+        Err(_) => {
+            tracing::warn!(%fid, "Lustre link count lookup timed out");
+            LustreLinkState::Unavailable
+        }
     }
 }
 
@@ -1261,6 +1330,188 @@ mod tests {
         api.get(&format!("/api/entries/{fid}?filesystem={filesystem}"))
             .await
             .assert_status(axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated MariaDB database"]
+    async fn lustre_link_events_keep_all_surviving_paths_on_replay() {
+        let url = std::env::var("RBH_TEST_DATABASE_URL").unwrap();
+        let store = EntryStore::connect(&url).await.unwrap();
+        let filesystem = FileSystemId::new(format!("lustre-links-{}", std::process::id())).unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let mount = live.path().to_path_buf();
+        let fids = mount.join(".lustre/fid");
+        std::fs::create_dir_all(&fids).unwrap();
+        store
+            .register_filesystem(&FileSystemConfig {
+                id: filesystem.clone(),
+                backend: BackendKind::Lustre,
+                mount_path: mount.clone(),
+                capabilities: BackendCapabilities::default(),
+            })
+            .await
+            .unwrap();
+        let fid = LuFid::new(0x200000401, 21, 0);
+        let displaced = LuFid::new(0x200000401, 22, 0);
+        let inside = LuFid::new(0x200000401, 1, 0);
+        let outside = LuFid::new(0x200000401, 2, 0);
+        let live_file = fids.join(fid.to_string());
+        let live_displaced = fids.join(displaced.to_string());
+        let live_alias = mount.join("live-alias");
+        std::fs::write(&live_file, b"live FID").unwrap();
+        std::fs::write(&live_displaced, b"live displaced FID").unwrap();
+        std::fs::hard_link(&live_file, &live_alias).unwrap();
+        let entry = |fid, parent, name: &'static [u8]| EntryRow {
+            fid,
+            parent_fid: Some(parent),
+            name: Bytes::from_static(name),
+            kind: EntryKind::File,
+            size: 100,
+            blocks: 1,
+            uid: 0,
+            gid: 0,
+            projid: 0,
+            mode: 0o600,
+            nlink: 2,
+            atime: 10,
+            mtime: 10,
+            ctime: 10,
+            stripe_count: None,
+            stripe_size: None,
+            stripe_items: Vec::new(),
+            layout_observed_at: None,
+            pool_name: Some("hot".into()),
+            sm_status: serde_json::json!({}),
+            last_seen: 10,
+            depth: 2,
+        };
+        store
+            .upsert_lustre_scan_batch(
+                &filesystem,
+                &[
+                    entry(fid, inside, b"kept"),
+                    entry(fid, outside, b"moving"),
+                    entry(displaced, inside, b"displaced-kept"),
+                    entry(displaced, inside, b"replaced"),
+                ],
+            )
+            .await
+            .unwrap();
+        let apply = async |event: ChangelogEvent| {
+            for _ in 0..2 {
+                apply_event(&store, &filesystem, &mount, &event, 20).await.unwrap();
+            }
+        };
+        let paths = async |fid| {
+            let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(fid));
+            store
+                .list_scoped_object_edges(&key)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|edge| edge.name)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let names = |paths: &[&'static [u8]]| {
+            paths
+                .iter()
+                .map(|path| Bytes::from_static(path))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        apply(ChangelogEvent::Rename {
+            fid,
+            src_parent: outside,
+            src_name: Bytes::from_static(b"moving"),
+            parent: inside,
+            name: Bytes::from_static(b"replaced"),
+        })
+        .await;
+        assert_eq!(paths(fid).await, names(&[b"kept", b"replaced"]));
+        assert_eq!(paths(displaced).await, names(&[b"displaced-kept"]));
+        assert_eq!(
+            store
+                .get_lustre_entry(&filesystem, &displaced)
+                .await
+                .unwrap()
+                .unwrap()
+                .nlink,
+            1
+        );
+
+        std::fs::remove_file(&live_alias).unwrap();
+        apply(ChangelogEvent::Unlink {
+            fid,
+            parent: inside,
+            name: Bytes::from_static(b"replaced"),
+            last_link: false,
+            hsm_exists: false,
+        })
+        .await;
+        let kept = store.get_lustre_entry(&filesystem, &fid).await.unwrap().unwrap();
+        assert_eq!(paths(fid).await, names(&[b"kept"]));
+        assert_eq!(kept.nlink, 1);
+        assert_eq!(kept.name, Bytes::from_static(b"kept"));
+
+        std::fs::hard_link(&live_file, &live_alias).unwrap();
+        // A metadata read can publish the live count ahead of the link event.
+        let mut fresh = kept;
+        fresh.nlink = 2;
+        store.upsert_lustre_entry(&filesystem, &fresh).await.unwrap();
+        apply(ChangelogEvent::Hardlink {
+            fid,
+            parent: outside,
+            name: Bytes::from_static(b"new-alias"),
+        })
+        .await;
+        assert_eq!(paths(fid).await, names(&[b"kept", b"new-alias"]));
+        assert_eq!(
+            store.get_lustre_entry(&filesystem, &fid).await.unwrap().unwrap().nlink,
+            2
+        );
+
+        apply(ChangelogEvent::Hardlink {
+            fid: displaced,
+            parent: outside,
+            name: Bytes::from_static(b"new-alias"),
+        })
+        .await;
+        assert_eq!(paths(displaced).await, names(&[b"displaced-kept"]));
+        assert_eq!(paths(fid).await, names(&[b"kept", b"new-alias"]));
+
+        std::fs::hard_link(&live_file, mount.join("unindexed")).unwrap();
+        std::fs::remove_file(&live_alias).unwrap();
+        apply(ChangelogEvent::Unlink {
+            fid,
+            parent: outside,
+            name: Bytes::from_static(b"new-alias"),
+            last_link: false,
+            hsm_exists: false,
+        })
+        .await;
+        assert_eq!(paths(fid).await, names(&[b"kept"]));
+        assert_eq!(
+            store.get_lustre_entry(&filesystem, &fid).await.unwrap().unwrap().nlink,
+            2
+        );
+
+        // A repeat with recovered evidence can refresh a count even when the
+        // namespace edge was already removed during an unavailable observation.
+        let mut missing_evidence = store.get_lustre_entry(&filesystem, &fid).await.unwrap().unwrap();
+        missing_evidence.nlink = 0;
+        store.upsert_lustre_entry(&filesystem, &missing_evidence).await.unwrap();
+        apply(ChangelogEvent::Unlink {
+            fid,
+            parent: outside,
+            name: Bytes::from_static(b"new-alias"),
+            last_link: false,
+            hsm_exists: false,
+        })
+        .await;
+        assert_eq!(
+            store.get_lustre_entry(&filesystem, &fid).await.unwrap().unwrap().nlink,
+            2
+        );
     }
 
     #[tokio::test]

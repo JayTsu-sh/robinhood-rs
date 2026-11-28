@@ -14,6 +14,7 @@ rbh-predicate = { path = "../rbh-predicate" }
 rbh-observability = { path = "../rbh-observability" }
 rbh-namespace = { path = "../rbh-namespace" }
 lustre-api = { path = "../lustre-api" }
+rbh-lustre-resources = { path = "../rbh-lustre-resources" }
 
 axum = { version = "0.8", features = ["json"] }
 futures-util = { workspace = true }
@@ -26,7 +27,7 @@ sqlx = { workspace = true }
 subtle = "2"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tower-http = { version = "0.6", features = ["trace", "request-id", "util"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "request-id", "util"] }
 tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 

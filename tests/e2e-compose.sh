@@ -52,5 +52,5 @@ for attempt in $(seq 1 60); do
 done
 
 docker run --interactive --rm --init --name "$SMOKE_CONTAINER" \
-    --network "container:$db_id" --env LD_BIND_NOW=1 \
+    --network "container:$db_id" --env LD_BIND_NOW=1 --env RBH_TEST_CONSOLE=1 \
     --entrypoint bash "$SMOKE_IMAGE" -s < "$ROOT/tests/e2e.sh"

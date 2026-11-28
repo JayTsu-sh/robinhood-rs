@@ -37,6 +37,7 @@ pub mod hsm;
 pub mod mdt;
 pub mod migration;
 pub mod path;
+pub mod pools;
 pub mod rec;
 pub mod stripe;
 

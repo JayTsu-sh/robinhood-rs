@@ -72,6 +72,92 @@ RBH_INTEGRATION=1 RBH_TEST_CHANGELOG_USER=cl3 \
 RBH_INTEGRATION=1 cargo test -p lustre-api --test integration -- --test-threads=1
 ```
 
+### Rev.8 directory scope preview
+
+Run the REST scenario with a fresh MariaDB database and a Lustre
+mount with non-empty `hot` and `cold` pools. The scenario seeds indexed
+namespace evidence in MariaDB and reads the mount and pool membership.
+
+```sh
+RBH_TEST_DATABASE_URL=mysql://root@127.0.0.1/rbh_preview_test \
+  RBH_TEST_LUSTRE_MOUNT=/mnt/lustre \
+  cargo test --locked -p rbh-api scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_run -- --ignored
+```
+
+The draft endpoint is `POST /api/policies/preview` and accepts a Rev.8 Policy
+pool migration document. `spec.target.directoryScope` accepts a root
+path such as `/team` and optional `excludedSubtrees` such as
+`["/team/archive"]`. Paths are relative to the registered Lustre root and
+begin with `/`. The response returns a null policy revision, the resolved
+resource revisions, and FID counts and logical bytes. The scoped result
+also includes the exact decimal text as `estimatedBytesExact`. Directory reason
+counts cover objects that match the indexed pool and Rev.8 rules or are
+pending a heat observation. The candidate estimate covers the catalog's
+indexed files before execution budgets and live admission checks. Saved
+policies use `POST /api/policies/{id}/preview` with their pinned resource
+bindings. Preview also works with a read-only Lustre mount.
+
+The namespace replay regression uses the same isolated database and needs
+no live mount.
+
+```sh
+RBH_TEST_DATABASE_URL=mysql://root@127.0.0.1/rbh_preview_test \
+  cargo test --locked -p rbh-daemon lustre_link_events_keep_all_surviving_paths_on_replay -- --ignored
+```
+
+### Console policy wizard
+
+The MariaDB revision test issues two edits with the same `If-Match: "1"`.
+One returns the saved revision and the other gets HTTP 409 with
+`currentRevision`. The immutable definition is available at
+`GET /api/policies/{id}/revisions/{revision}/definition`.
+
+```sh
+RBH_TEST_DATABASE_URL=mysql://root@127.0.0.1/rbh_wizard_test \
+  cargo test --locked -p rbh-api conditional_policy_edit_creates_one_revision_and_preserves_the_original -- --ignored
+```
+
+The Playwright wizard test can also run against the compiled console and a
+live, isolated daemon with a disposable database. Register a Lustre fixture
+root with writable `hot` and `cold` pools. Index three files on `hot` under
+`/team` with logical sizes of 100, 200, and 300 bytes and mtimes at least one
+second in the past. Link the 300-byte file outside `/team`. Configure an
+existing Rev.8 writer with `RBH_REV8_WRITERS_FILE` and provide its fixture
+token and registration ID to Playwright as `RBH_CONSOLE_WIZARD_TEST_TOKEN`
+and `RBH_CONSOLE_WIZARD_TEST_FS`. Set `RBH_CONSOLE_TEST_URL` to the test
+daemon and run `npm --prefix web run test:e2e`.
+
+### Scoped pool migration
+
+Use a disposable directory that inherits the hot pool layout to test
+namespace changes after copying and before exchanging layouts.
+
+```sh
+RBH_TEST_LUSTRE_MOUNT=/mnt/lustre \
+  RBH_TEST_MIGRATION_HOT_DIR=/mnt/lustre/.rbh-tiering-lab/hot \
+  cargo test --locked -p rbh-policy directory_and_link_changes_during_copy -- --ignored
+```
+
+For the bundled console test, register the full Lustre mount with HSM,
+stripe and OST capabilities in a daemon with a disposable database. Set
+`RBH_REV8_HSM_PRINCIPAL_FILE` to a workload identity with service account
+`tiering-daemon` and configure a test writer. Give Playwright a new empty
+test directory beneath the mount in `RBH_CONSOLE_EXECUTION_TEST_ROOT`,
+the mount in `RBH_CONSOLE_EXECUTION_TEST_MOUNT`, the registration ID in
+`RBH_CONSOLE_EXECUTION_TEST_FS`, and the test writer token in
+`RBH_CONSOLE_EXECUTION_TEST_TOKEN`. Run the test with
+`npm --prefix web run test:e2e -- policy-execution.spec.ts` against that
+daemon. The test creates fixtures, previews and saves a policy through the
+six-step wizard, enables it, runs it, and downloads its execution report.
+It also verifies periodic scheduling and uses `lfs` to check the placement
+of migrated, excluded, and HSM-managed files.
+
+The final check reads the live link namespace immediately before the swap.
+Lustre group locking and the swap's data-version guard protect file I/O.
+A rename on another client may still land between the namespace check and
+the layout exchange. Providing atomic directory-scope enforcement would
+require a server-side namespace guard across the exchange.
+
 ### What's covered where
 
 | Layer | File |

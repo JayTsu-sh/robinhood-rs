@@ -1,7 +1,7 @@
 //! Read Lustre's per-client inode heat without issuing file data reads.
 
 use std::{
-    ffi::{CStr, CString, c_int},
+    ffi::c_int,
     fs::File,
     io,
     os::fd::AsRawFd,
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     LuFid,
     error::check_rc,
-    mount::{mount_source, open_directory},
+    mount::{client_instance, mount_source, open_directory},
     sys,
 };
 
@@ -68,16 +68,7 @@ impl HeatMount {
     }
 
     fn identify(root: File, source: String, path: &Path) -> crate::Result<Self> {
-        let anchored = CString::new(format!("/proc/self/fd/{}", root.as_raw_fd()))?;
-        let mut name = [0; 64];
-        // SAFETY: the path is NUL-terminated and name is a writable buffer.
-        let rc = unsafe { sys::llapi_getname(anchored.as_ptr(), name.as_mut_ptr(), name.len()) };
-        check_rc(rc, "llapi_getname")?;
-        // SAFETY: llapi_getname returns a NUL-terminated string on success.
-        let instance = unsafe { CStr::from_ptr(name.as_ptr()) }.to_str()?.to_owned();
-        if instance.is_empty() || instance.contains('/') {
-            return Err(crate::LustreApiError::NotALustreMount(path.to_owned()));
-        }
+        let instance = client_instance(&root, path)?;
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
             .trim()
             .to_owned();

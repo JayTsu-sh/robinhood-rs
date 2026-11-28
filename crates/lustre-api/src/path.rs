@@ -5,7 +5,14 @@
 //! existing filesystem path; internally they issue an ioctl to the MDT.
 
 use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
+use std::fs::OpenOptions;
+use std::os::{
+    fd::AsRawFd,
+    unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+    },
+};
 use std::path::{Path, PathBuf};
 
 use core::ffi::{c_char, c_int, c_longlong};
@@ -14,6 +21,9 @@ use crate::LustreApi;
 use crate::error::{Result, check_rc};
 use crate::fid::LuFid;
 use crate::sys;
+
+mod live_links;
+pub use live_links::LiveLinks;
 
 /// Maximum path length returned by `llapi_fid2path`. Matches Linux's PATH_MAX.
 const RBH_PATH_MAX: usize = 4096;
@@ -65,6 +75,26 @@ impl LustreApi {
         // SAFETY: `buf` is `[c_char; N]`, which is `[i8; N]`. Reinterpret as bytes.
         let bytes: &[u8] = unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
         Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes).to_os_string()))
+    }
+
+    /// Read a FID's link count through the pinned open-by-FID directory.
+    ///
+    /// A missing directory is an error. Only an absent FID under the opened
+    /// directory returns `None`.
+    #[tracing::instrument(skip(self), fields(mount = %mount.display(), %fid))]
+    pub fn link_count_by_fid(&self, mount: &Path, fid: LuFid) -> Result<Option<u32>> {
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(mount.join(".lustre/fid"))?;
+        let path = PathBuf::from(format!("/proc/self/fd/{}/{fid}", directory.as_raw_fd()));
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => u32::try_from(metadata.nlink())
+                .map(Some)
+                .map_err(|_| crate::LustreApiError::RecordParse("Lustre link count exceeds u32")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Resolve an existing path to its FID.

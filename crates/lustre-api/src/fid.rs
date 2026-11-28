@@ -96,20 +96,13 @@ impl FromStr for LuFid {
             return Err(FidParseError::InvalidFormat(s.to_string()));
         }
 
-        let parse_hex = |p: &str| -> Result<u64, FidParseError> {
-            let hex = p.trim_start_matches("0x").trim_start_matches("0X");
-            Ok(u64::from_str_radix(hex, 16)?)
-        };
-
-        let seq = parse_hex(parts[0])?;
-        let oid_u64 = parse_hex(parts[1])?;
-        let ver_u64 = parse_hex(parts[2])?;
-        // oid and ver fit in u32 per the Lustre FID spec; truncation is the right behavior
-        // for values that fit (no overflow check since u32::MAX covers every real Lustre FID).
+        fn hex_digits(part: &str) -> &str {
+            part.trim_start_matches("0x").trim_start_matches("0X")
+        }
         Ok(Self {
-            seq,
-            oid: oid_u64 as u32,
-            ver: ver_u64 as u32,
+            seq: u64::from_str_radix(hex_digits(parts[0]), 16)?,
+            oid: u32::from_str_radix(hex_digits(parts[1]), 16)?,
+            ver: u32::from_str_radix(hex_digits(parts[2]), 16)?,
         })
     }
 }

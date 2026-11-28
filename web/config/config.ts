@@ -1,0 +1,26 @@
+import { defineConfig } from '@umijs/max';
+
+export default defineConfig({
+  title: 'Lustre 在线冷热分层控制台',
+  metas: [{ name: 'viewport', content: 'width=device-width, initial-scale=1' }],
+  history: { type: 'hash' },
+  publicPath: '/console/',
+  hash: true,
+  request: {},
+  proxy: {
+    '/api': { target: 'http://127.0.0.1:8080' },
+  },
+  routes: [
+    { path: '/', redirect: '/policies' },
+    { path: '/policies', component: '@/pages/Policies' },
+    { path: '/policies/preview', component: '@/pages/PolicyPreview' },
+    { path: '/policies/new', component: '@/pages/PolicyWizard' },
+    { path: '/policies/:id/edit', component: '@/pages/PolicyWizard' },
+    { path: '/policies/:id/revisions/:revision', component: '@/pages/PolicyDetails' },
+    { path: '/policies/:id', component: '@/pages/PolicyDetails' },
+    { path: '/runs', component: '@/pages/Runs' },
+    { path: '/runs/:id', component: '@/pages/RunDetails' },
+    { path: '/resources', component: '@/pages/Resources' },
+    { path: '/resources/detail', component: '@/pages/ResourceDetails' },
+  ],
+});

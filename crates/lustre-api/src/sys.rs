@@ -66,6 +66,7 @@ pub(crate) const HUA_CANCEL: u32 = bindings::hsm_user_action_HUA_CANCEL;
 // and used by the MDT enumeration path in `mdt::active_mdt_names`.
 pub(crate) const LL_STATFS_LMV: u32 = 1; // lustre_user.h line 723
 pub(crate) const LL_STATFS_LOV: u32 = 2; // lustre_user.h line 724
+pub(crate) const LL_STATFS_NODELAY: u32 = 4;
 pub(crate) const UUID_MAX: usize = 40; // lustre_user.h line 1388
 
 // ---------------------------------------------------------------------------
@@ -163,11 +164,12 @@ unsafe extern "C" {
         path: *mut c_char, type_: u32, index: u32, stat_buf: *mut obd_statfs, uuid_buf: *mut obd_uuid,
     ) -> c_int;
 
+    pub(crate) fn llapi_obd_fstatfs(
+        fd: c_int, type_: u32, index: u32, stat_buf: *mut obd_statfs, uuid_buf: *mut obd_uuid,
+    ) -> c_int;
+
     // Online pool migration -------------------------------------------------
 
-    pub(crate) fn llapi_get_poolmembers(
-        pool: *const c_char, list: *mut *mut c_char, count: c_int, buffer: *mut c_char, size: c_int,
-    ) -> c_int;
     pub(crate) fn llapi_file_fget_mdtidx(fd: c_int, index: *mut c_int) -> c_int;
     pub(crate) fn llapi_create_volatile_param(
         directory: *const c_char, mdt: c_int, flags: c_int, mode: libc::mode_t,

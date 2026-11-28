@@ -4,18 +4,23 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
+    sync::Arc,
 };
 
+mod directory_scope;
 pub mod execution;
 pub mod heat;
 pub mod resources;
+mod scoped_preview;
 mod tiering;
+pub(crate) use directory_scope::{AdmittedLinks, DirectoryScope};
+pub use directory_scope::{DeferralReason, ExclusionReason, ScopeSummary};
 use resources::{ResourceBinding, ResourceKind};
 pub use tiering::PoolMigration;
 
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use rbh_entry_store::store::{EntryStore, QueryParam};
-use rbh_entry_store::{BackendKind, EntryKind, FileSystemId};
+use rbh_entry_store::{EntryKind, FileSystemId};
 use rbh_predicate::{CmpOp, Field, Predicate, SqlParam, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -33,6 +38,8 @@ pub struct CompiledPolicy {
     pub(crate) selectors: BTreeSet<String>,
     pub(crate) uses_read_heat: bool,
     pub(crate) uses_last_access: bool,
+    directory_scope: Option<Arc<DirectoryScope>>,
+    pool_migration: Option<PoolMigration>,
     pub(crate) where_clause: String,
     pub(crate) params: Vec<QueryParam>,
     pub(crate) actions: Vec<Invocation>,
@@ -47,13 +54,17 @@ pub struct CompiledPolicy {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PreviewResult {
-    pub revision: u64,
+pub struct PreviewResult<Revision = u64> {
+    pub revision: Revision,
     pub candidate_count: u64,
     pub estimated_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_bytes_exact: Option<String>,
     pub resource_bindings: Vec<ResourceBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_heat: Option<heat::PreviewHeat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_scope: Option<ScopeSummary>,
 }
 
 /// Reject legacy and unsupported document versions at the REST boundary.
@@ -143,14 +154,24 @@ impl Policy {
         ]
     }
 
+    pub(crate) fn has_directory_scope(&self) -> bool {
+        self.spec.target.directory_scope.is_some()
+    }
+
     pub(crate) fn compile(self, selectors: &BTreeMap<String, JsonValue>) -> Result<CompiledPolicy, PolicyError> {
         let spec = self.spec;
+        let directory_scope = spec.target.directory_scope.map(DirectoryScope::try_from).transpose()?;
         let mut conditions = ConditionCompiler::new(selectors);
         let target_condition = conditions.compile(&spec.target.condition, "spec.target.where")?;
         let files = Predicate::Cmp {
             field: Field::Kind,
             cmp: CmpOp::Eq,
             value: Value::Num(EntryKind::File as i64),
+        };
+        let retained_pool = if directory_scope.is_some() && spec.enabled == Some(false) {
+            spec.rules.retained_pool_migration()?
+        } else {
+            None
         };
         let CompiledRules {
             excludes,
@@ -172,7 +193,11 @@ impl Policy {
             .activation
             .is_some_and(|activation| activation.mode == ActivationMode::Enforced);
         let mut params = query_params(scope.params);
-        if let Some(migration) = actions.iter().find_map(|invocation| invocation.migration.as_ref()) {
+        let pool_migration = actions
+            .iter()
+            .find_map(|invocation| invocation.migration.clone())
+            .or(retained_pool);
+        if let Some(migration) = &pool_migration {
             if !matches!(spec.trigger, Trigger::Periodic { .. }) {
                 return Err(invalid("lustre.pool_migrate requires a periodic trigger"));
             }
@@ -194,6 +219,8 @@ impl Policy {
                     "each execute decision in a heat-driven migration policy must require a read heat condition",
                 ));
             }
+        } else if directory_scope.is_some() {
+            return Err(invalid("spec.target.directoryScope requires lustre.pool_migrate"));
         } else if uses_read_heat && enforced {
             return Err(invalid("enforced read heat conditions require lustre.pool_migrate"));
         }
@@ -211,6 +238,8 @@ impl Policy {
             decision,
             decision_params: query_params(decision_params),
             uses_read_heat,
+            directory_scope: directory_scope.map(Arc::new),
+            pool_migration,
             uses_last_access: conditions.uses_last_access,
             enabled: spec.enabled.unwrap_or(true),
             enforced,
@@ -255,7 +284,7 @@ pub(crate) async fn validate_filesystem(
         .await
         .map_err(|error| PolicyError::Store(error.to_string()))?
         .ok_or_else(|| invalid(format!("spec.target.filesystem is not registered: {}", filesystem)))?;
-    if config.backend != BackendKind::Lustre || !config.capabilities.hsm {
+    if !config.supports_lustre_hsm() {
         return Err(invalid(format!(
             "spec.target.filesystem does not support Lustre HSM: {}",
             filesystem
@@ -266,7 +295,15 @@ pub(crate) async fn validate_filesystem(
 
 impl CompiledPolicy {
     pub(crate) fn pool_migration(&self) -> Option<&PoolMigration> {
-        self.actions.iter().find_map(|invocation| invocation.migration.as_ref())
+        self.pool_migration.as_ref()
+    }
+
+    pub(crate) fn has_directory_scope(&self) -> bool {
+        self.directory_scope.is_some()
+    }
+
+    pub(crate) fn directory_scope(&self) -> Option<Arc<DirectoryScope>> {
+        self.directory_scope.clone()
     }
 
     fn scope(&self, database_time_micros: Option<i64>) -> (Cow<'_, str>, Cow<'_, [QueryParam]>) {
@@ -296,8 +333,16 @@ impl CompiledPolicy {
         push_expression(query, &sql, &params);
     }
 
+    fn push_match(&self, query: &mut QueryBuilder<MySql>, database_time_micros: Option<i64>) {
+        query.push("((");
+        self.push_scope(query, database_time_micros);
+        query.push(") AND ((");
+        push_expression(query, &self.decision, &self.decision_params);
+        query.push(") > 0))");
+    }
+
     pub(crate) fn validate_capabilities(&self, config: &rbh_entry_store::FileSystemConfig) -> Result<(), PolicyError> {
-        if self.pool_migration().is_some() && !(config.capabilities.stripe && config.capabilities.ost) {
+        if self.pool_migration().is_some() && !config.supports_lustre_pool_migration() {
             return Err(invalid(
                 "lustre.pool_migrate requires filesystem stripe and OST capabilities",
             ));
@@ -309,8 +354,31 @@ impl CompiledPolicy {
     pub async fn preview(
         &self, entries: &EntryStore, revision: u64, resource_bindings: Vec<ResourceBinding>,
     ) -> Result<PreviewResult, PolicyError> {
+        self.preview_with_heat(entries, revision, resource_bindings, None, None)
+            .await
+    }
+
+    pub(crate) async fn preview_with_heat<Revision>(
+        &self, entries: &EntryStore, revision: Revision, resource_bindings: Vec<ResourceBinding>,
+        profile: Option<&heat::HeatProfile>, heat_fid: Option<lustre_api::LuFid>,
+    ) -> Result<PreviewResult<Revision>, PolicyError> {
         let config = validate_filesystem(entries, &self.filesystem).await?;
         self.validate_capabilities(&config)?;
+        if let Some(scope) = &self.directory_scope {
+            let observation = scoped_preview::evaluate(entries, self, &config, scope, profile, heat_fid).await?;
+            return Ok(PreviewResult {
+                revision,
+                candidate_count: observation.candidate_count,
+                estimated_bytes: observation.estimated_bytes,
+                estimated_bytes_exact: Some(observation.estimated_bytes.to_string()),
+                resource_bindings,
+                read_heat: observation.read_heat,
+                directory_scope: Some(observation.scope),
+            });
+        }
+        if self.uses_read_heat {
+            return heat::preview(entries, self, profile, revision, resource_bindings, heat_fid).await;
+        }
         let (scope, params) = self.scope(None);
         let where_clause = format!("{scope} AND ({}) > 0", self.decision);
         let params: Vec<_> = params.iter().chain(&self.decision_params).cloned().collect();
@@ -322,8 +390,10 @@ impl CompiledPolicy {
             revision,
             candidate_count,
             estimated_bytes,
+            estimated_bytes_exact: None,
             resource_bindings,
             read_heat: None,
+            directory_scope: None,
         })
     }
 }
@@ -385,6 +455,7 @@ struct Target {
     _consistency: Option<Consistency>,
     #[serde(rename = "where", default = "match_all")]
     condition: JsonValue,
+    directory_scope: Option<directory_scope::ScopeDocument>,
 }
 
 #[derive(Deserialize)]
@@ -511,6 +582,23 @@ struct CompiledRules {
 }
 
 impl Rules {
+    // A disabled scoped strategy can retain every file while still defining its pool pair.
+    fn retained_pool_migration(&self) -> Result<Option<PoolMigration>, PolicyError> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| !matches!(entry.decision, Decision::Skip))
+        {
+            return Ok(None);
+        }
+        self.defaults
+            .as_ref()
+            .and_then(|defaults| defaults.action.as_ref())
+            .filter(|action| action.kind == Some(ActionKind::PoolMigrate))
+            .map(|action| PoolMigration::parse(action.params.clone().unwrap_or_default(), "spec.rules.defaults"))
+            .transpose()
+    }
+
     fn compile(self, conditions: &mut ConditionCompiler<'_>) -> Result<CompiledRules, PolicyError> {
         if self.entries.is_empty() {
             return Err(invalid("spec.rules.entries must contain at least one rule"));

@@ -1,0 +1,16 @@
+[package]
+name = "rbh-lustre-resources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lustre resource observations, capacity samples and snapshot persistence."
+
+[dependencies]
+futures-util = { workspace = true }
+lustre-api = { path = "../lustre-api" }
+rbh-entry-store = { path = "../rbh-entry-store" }
+serde = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

@@ -28,14 +28,22 @@ use super::{
 use crate::{
     Rev8TickTask,
     rev8::{
-        ActionKind, BudgetLimits,
+        ActionKind, AdmittedLinks, BudgetLimits, DirectoryScope,
         execution::{Decision, FidObservation, NativeHsm, SubmissionDeferral, SubmissionGate, lustre_call},
         heat, push_expression,
         resources::safety_matches,
     },
 };
 
-pub(in crate::store) type PoolPreflight = Result<(Generation, StripeInfo, FileAccessTime), Cow<'static, str>>;
+pub(in crate::store) type PoolPreflight = Result<PoolSource, Cow<'static, str>>;
+const MIGRATION_DEADLINE_PENDING: &str = "migration_deadline_pending";
+
+pub(in crate::store) struct PoolSource {
+    generation: Generation,
+    layout: StripeInfo,
+    access_time: FileAccessTime,
+    links: Option<AdmittedLinks>,
+}
 
 pub(in crate::store) struct PoolRecovery {
     operation: Rev8Operation,
@@ -95,19 +103,18 @@ impl PolicyStore {
             run_deadline: deadline,
         };
         let backend = Arc::clone(&self.runtime.as_ref().expect("dispatch requires a runtime").hsm);
-        let (generation, source, access_time, deadline) = match self
+        let scope = dispatch.policy.directory_scope();
+        let (source, deadline) = match self
             .pool_preflights
             .read(
                 &self.pool,
                 filesystem,
                 request,
-                observe_pool_source(backend, key, invocation.clone(), deadline),
+                observe_pool_source(backend, key, invocation.clone(), scope, deadline),
             )
             .await?
         {
-            PreflightResult::Observed(Ok((generation, source, access_time)), deadline) => {
-                (generation, source, access_time, deadline)
-            }
+            PreflightResult::Observed(Ok(source), deadline) => (source, deadline),
             PreflightResult::Observed(Err(reason), _) => {
                 return self
                     .record_deferred(dispatch, candidate, invocation, &reason)
@@ -126,6 +133,12 @@ impl PolicyStore {
                 return Ok(ControlFlow::Continue(()));
             }
         };
+        let PoolSource {
+            generation,
+            layout: source,
+            access_time,
+            links,
+        } = source;
         let expected_access = dispatch.policy.uses_last_access.then_some(access_time);
         if let Some(access) = expected_access
             && access.seconds != candidate.atime
@@ -184,14 +197,17 @@ impl PolicyStore {
         if !lock_permit(&mut tx, operation).await? {
             return Ok(ControlFlow::Continue(()));
         }
+        let mut late_result = None;
         let result = if !active {
-            Err(MigrationError::Deferred("policy_revision_inactive"))
+            Some(Err(MigrationError::Deferred("policy_revision_inactive")))
         } else if let Some(reason) = candidate_deferral(&mut tx, dispatch, candidate).await? {
-            Err(MigrationError::Deferred(reason))
+            Some(Err(MigrationError::Deferred(reason)))
         } else if !verify_worker_permit(worker).await? {
-            Err(MigrationError::Deferred("permit_store_requires_synchronous_commit"))
+            Some(Err(MigrationError::Deferred(
+                "permit_store_requires_synchronous_commit",
+            )))
         } else if !dispatch.admission.window_open(Utc::now()) {
-            Err(MigrationError::Deferred("admission_window_closed"))
+            Some(Err(MigrationError::Deferred("admission_window_closed")))
         } else if Instant::now() < deadline {
             let expected = file_version(&generation);
             let mount = dispatch.config.mount_path.clone();
@@ -203,29 +219,43 @@ impl PolicyStore {
                     ControlFlow::Break(SubmissionDeferral::WindowClosed)
                 }
             });
-            let limits = MigrationLimits {
-                deadline,
-                expected_access,
-                before_swap: move || swap_gate.check().is_continue(),
-            };
             // Moving this guard into the closure retains ownership for the
             // real blocking operation, even after the run budget expires.
-            let migration =
-                lustre_call(move || LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, ownership));
-            match tokio::time::timeout_at(deadline.into(), migration).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(MigrationError::Uncertain(error.to_string())),
-                Err(_) => Err(MigrationError::Uncertain("migration_deadline_pending".into())),
+            let scoped = links.is_some();
+            let mut migration = Box::pin(lustre_call(move || {
+                let limits = MigrationLimits {
+                    deadline,
+                    expected_access,
+                    check_links: |source: &std::fs::File| match &links {
+                        Some(links) => links.recheck(&mount, &fid, source, deadline),
+                        None => Ok(()),
+                    },
+                    before_swap: || swap_gate.check().is_continue(),
+                };
+                let result = LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, &ownership);
+                // Recovery must wait until a possible late deferral has
+                // been journaled, including after the syscall returns.
+                (result, ownership)
+            }));
+            match tokio::time::timeout_at(deadline.into(), &mut migration).await {
+                Ok(Ok((result, _ownership))) => Some(result),
+                Ok(Err(error)) => Some(Err(MigrationError::Uncertain(error.to_string()))),
+                Err(_) => {
+                    if scoped {
+                        late_result = Some(migration);
+                    }
+                    None
+                }
             }
         } else {
-            Err(MigrationError::Deferred("migration_deadline_elapsed"))
+            Some(Err(MigrationError::Deferred("migration_deadline_elapsed")))
         };
 
         // Release the policy, journal and catalog locks before updating the
         // catalog. The committed intent remains pending through this gap.
         tx.commit().await?;
         let (state, reason, evidence) = match result {
-            Ok(layout) => {
+            Some(Ok(layout)) => {
                 let entries = EntryStore::with_pool(self.pool.clone());
                 settle_layout(
                     &entries,
@@ -236,11 +266,22 @@ impl PolicyStore {
                 )
                 .await
             }
-            Err(MigrationError::Deferred(reason)) => ("deferred", Some(reason.to_owned()), None),
-            Err(error @ MigrationError::BeforeSwap(_)) => ("failed", Some(error.to_string()), None),
-            Err(error @ MigrationError::Uncertain(_)) => ("unknown", Some(error.to_string()), None),
+            Some(Err(MigrationError::Deferred(reason))) => ("deferred", Some(reason.to_owned()), None),
+            Some(Err(error @ MigrationError::BeforeSwap(_))) => ("failed", Some(error.to_string()), None),
+            Some(Err(error @ MigrationError::Uncertain(_))) => ("unknown", Some(error.to_string()), None),
+            None => ("unknown", Some(MIGRATION_DEADLINE_PENDING.into()), None),
         };
         finish_migration(self, operation, "submitting", state, reason, evidence).await?;
+        if let Some(pending) = late_result {
+            let pool = self.pool.clone();
+            tokio::spawn(async move {
+                if let Ok((Err(MigrationError::Deferred(reason)), _ownership)) = pending.await
+                    && let Err(error) = record_late_deferral(&pool, operation, reason).await
+                {
+                    tracing::warn!(operation, %error, reason, "could not record the late pool migration deferral");
+                }
+            });
+        }
         Ok(ControlFlow::Continue(()))
     }
 
@@ -421,7 +462,8 @@ impl PolicyStore {
 }
 
 async fn observe_pool_source(
-    backend: Arc<dyn NativeHsm>, key: PreflightKey, invocation: Invocation, deadline: Instant,
+    backend: Arc<dyn NativeHsm>, key: PreflightKey, invocation: Invocation, scope: Option<Arc<DirectoryScope>>,
+    deadline: Instant,
 ) -> PoolPreflight {
     let PreflightKey {
         fid,
@@ -436,6 +478,16 @@ async fn observe_pool_source(
     let FidObservation::Present(observation) = observation else {
         return Err("fid_missing".into());
     };
+    let links = if let Some(scope) = scope {
+        let scope_mount = mount.clone();
+        let links = lustre_call(move || scope.admit(&scope_mount, &fid, deadline))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        Some(links)
+    } else {
+        None
+    };
     let generation = observation.generation;
     if (generation.size, generation.mtime, generation.ctime) != catalog_version {
         return Err("catalog_generation_changed".into());
@@ -448,7 +500,12 @@ async fn observe_pool_source(
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
-    Ok((generation, layout, observation.access_time))
+    Ok(PoolSource {
+        generation,
+        layout,
+        access_time: observation.access_time,
+        links,
+    })
 }
 
 async fn candidate_deferral(
@@ -587,6 +644,25 @@ async fn finish_migration(
     .bind(operation)
     .bind(previous)
     .execute(&store.pool)
+    .await?;
+    Ok(())
+}
+
+async fn record_late_deferral(pool: &sqlx::MySqlPool, operation: u64, reason: &'static str) -> Result<(), sqlx::Error> {
+    // A typed deferral from the original worker proves the swap was never
+    // attempted. Preserve that reason even if layout recovery ran first.
+    sqlx::query(
+        "UPDATE rev8_operations
+         SET state = 'deferred', attempted = FALSE, reason = ?, checked_at = UTC_TIMESTAMP(6),
+             finished_at = UTC_TIMESTAMP(6)
+         WHERE id = ? AND (
+            state = 'unknown'
+            OR (state = 'deferred' AND reason IN ('swap_not_observed_in_source_pool', 'source_generation_changed', 'fid_missing'))
+         )",
+    )
+    .bind(reason)
+    .bind(operation)
+    .execute(pool)
     .await?;
     Ok(())
 }

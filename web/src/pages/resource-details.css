@@ -1,0 +1,56 @@
+.resource-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.resource-panel {
+  padding: 0 20px 20px;
+  border: 1px solid #e0e7ef;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.resource-capacity {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+  gap: 10px;
+  margin: 20px 0 26px;
+}
+
+.resource-capacity > div {
+  padding: 14px;
+  border: 1px solid #eaf0f6;
+  border-radius: 8px;
+  background: #f7f9fc;
+}
+
+.resource-capacity dt {
+  color: #536780;
+}
+
+.resource-capacity dd {
+  margin: 4px 0 0;
+  font-size: 21px;
+  font-weight: 600;
+}
+
+.resource-panel h2.resource-subheading {
+  font-size: 18px;
+}
+
+.resource-policy-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.resource-policy-list li {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #eaf0f6;
+}

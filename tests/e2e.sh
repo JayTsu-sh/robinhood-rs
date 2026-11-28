@@ -117,6 +117,7 @@ start_daemon() {
     RBH_LUSTRE_MOUNT="$MOUNT" \
     RBH_CHANGELOG_USER="" \
     RBH_LOG="info" \
+    RBH_CONSOLE_COLLECT_SECS=2 \
     RBH_LISTEN_ADDR="127.0.0.1:$PORT" \
         env -u RBH_REV8_WRITERS_FILE -u RBH_REV8_HSM_PRINCIPAL_FILE \
         "$BIN_DAEMON" >"$LOG" 2>&1 &
@@ -193,6 +194,34 @@ SQL
 # 4a. health + count
 body="$(curl -fsS "$API/api/health")"
 assert_contains "$body" '"ok"' "health"
+
+if [[ "${RBH_TEST_CONSOLE:-0}" == 1 ]]; then
+    console="$(curl -fsS "$API/console/")"
+    assets="$(sed -nE 's/.*<script[^>]+src="(\/console\/[^"]+\.js)".*/\1/p' <<<"$console")"
+    [[ -n "$assets" ]] || die "console HTML has no compiled JavaScript URL"
+    while IFS= read -r asset; do
+        curl -fsS "$API$asset" >/dev/null
+    done <<<"$assets"
+    snapshot_time() {
+        test_sql "$DB" --skip-column-names -e "SELECT observed_at FROM filesystem_resource_snapshots WHERE filesystem_id='$FILESYSTEM'"
+    }
+    first=""
+    for _ in $(seq 1 15); do
+        current="$(snapshot_time)"
+        if [[ -z "$first" ]]; then
+            first="$current"
+        elif [[ -n "$current" && "$current" != "$first" ]]; then
+            break
+        fi
+        sleep 1
+    done
+    [[ -n "$first" && -n "$current" && "$current" != "$first" ]] || die 'scheduler did not advance the resource snapshot'
+    assert_contains "$(curl -fsS "$API/api/filesystems")" '"mountStatus":"unmounted"' "Lustre inventory"
+    detail="$(curl -fsS "$API/api/filesystems/detail?filesystem=$FILESYSTEM")"
+    assert_contains "$detail" '"mountStatus":"unmounted"' "Lustre resource detail"
+    assert_contains "$detail" '"capacity":{"status":"missing"' "missing Lustre capacity"
+    curl -fsS -X POST "$API/api/filesystems/refresh?filesystem=$FILESYSTEM" >/dev/null
+fi
 
 count_resp="$(curl -fsS "$API/api/entries/count?filesystem=$FILESYSTEM")"
 assert_contains "$count_resp" '"count":8' "entry count 8"

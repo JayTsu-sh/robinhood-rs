@@ -5,3 +5,13 @@
 !crates/**
 !src/
 !src/**
+!web/
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json
+!web/config/
+!web/config/**
+!web/src/
+!web/src/**
+web/src/.umi/
+web/src/.umi-production/

@@ -49,3 +49,5 @@ NNN_short_description.sql
 | `016_rev8_read_heat.sql` | business-client heat observations and sampling policy index |
 | `017_rev8_pool_residence.sql` | pool residence clock and run heat deferral counts |
 | `018_retire_legacy_policies.sql` | retire unversioned policy heads and restrict heat sampling to tiering policies |
+| `019_filesystem_resource_snapshots.sql` | periodic Lustre resource observations |
+| `020_rev8_run_history.sql` | indexes for run and operation history queries |
