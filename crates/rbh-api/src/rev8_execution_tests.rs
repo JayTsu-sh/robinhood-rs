@@ -177,6 +177,7 @@ impl Scenario {
         self.hsm.files.lock().unwrap().insert(
             fid,
             Observation {
+                access_time: lustre_api::migration::FileAccessTime { seconds: 10, nanos: 0 },
                 generation: Generation {
                     filesystem_name: "fixture".into(),
                     mount_source_id: Some("fixture".into()),

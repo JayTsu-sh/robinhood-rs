@@ -1389,6 +1389,10 @@ pub(crate) mod scoped_api_tests {
                 .await
                 .unwrap();
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         for (fs, oid, kind, size) in [
             (&first, 1, EntryKind::File, 64),
             (&first, 2, EntryKind::File, 128),
@@ -1412,7 +1416,7 @@ pub(crate) mod scoped_api_tests {
                     projid: 0,
                     mode: 0o644,
                     nlink: 1,
-                    atime: 0,
+                    atime: if oid == 2 { now } else { 0 },
                     mtime: 0,
                     ctime: 0,
                     stripe_count: None,
@@ -1465,6 +1469,21 @@ pub(crate) mod scoped_api_tests {
         assert_eq!(preview["revision"], 1);
         assert_eq!(preview["candidateCount"], 2);
         assert_eq!(preview["estimatedBytes"], 192);
+
+        let mut by_access = document.clone();
+        by_access["metadata"]["name"] = format!("last-access-preview-{suffix}").into();
+        by_access["spec"]["target"]["where"] =
+            serde_json::json!({"field": "object.last_access", "op": "older_than", "value": "2m"});
+        let created = server.post("/api/policies").json(&by_access).await;
+        created.assert_status(StatusCode::CREATED);
+        let access_id = created.json::<serde_json::Value>()["id"].as_u64().unwrap();
+        let access_url = format!("/api/policies/{access_id}");
+        let preview = server.post(&format!("{access_url}/preview")).await;
+        preview.assert_status_ok();
+        let preview = preview.json::<serde_json::Value>();
+        assert_eq!(preview["candidateCount"], 1);
+        assert_eq!(preview["estimatedBytes"], 64);
+        server.delete(&access_url).await.assert_status(StatusCode::NO_CONTENT);
 
         let rules = document["spec"]["rules"]["entries"].as_array_mut().unwrap();
         rules.push(serde_json::json!({

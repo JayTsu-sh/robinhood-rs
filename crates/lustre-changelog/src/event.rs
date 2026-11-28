@@ -125,6 +125,9 @@ pub enum ChangelogEvent {
     /// POSIX attrs changed (`CL_SETATTR`): mode, uid, gid.
     SetAttr { fid: LuFid },
 
+    /// Access time changed (`CL_ATIME`).
+    ATime { fid: LuFid },
+
     /// Modification time changed (`CL_MTIME`).
     MTime { fid: LuFid },
 
@@ -170,6 +173,7 @@ impl ChangelogEvent {
             | Self::Close { fid, .. }
             | Self::Truncate { fid }
             | Self::SetAttr { fid }
+            | Self::ATime { fid }
             | Self::MTime { fid }
             | Self::CTime { fid }
             | Self::XAttr { fid, .. }
@@ -193,6 +197,7 @@ impl ChangelogEvent {
             Self::Close { .. } => "CLOSE",
             Self::Truncate { .. } => "TRUNC",
             Self::SetAttr { .. } => "SATTR",
+            Self::ATime { .. } => "ATIME",
             Self::MTime { .. } => "MTIME",
             Self::CTime { .. } => "CTIME",
             Self::XAttr { .. } => "XATTR",
@@ -295,6 +300,7 @@ mod tests {
             },
             ChangelogEvent::Truncate { fid: f },
             ChangelogEvent::SetAttr { fid: f },
+            ChangelogEvent::ATime { fid: f },
             ChangelogEvent::MTime { fid: f },
             ChangelogEvent::CTime { fid: f },
             ChangelogEvent::XAttr {

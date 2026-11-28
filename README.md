@@ -435,6 +435,19 @@ layouts after a change. Entry responses expose the pool in `pool_name` and
 concrete OST indices in `stripe_items`. A layout spanning several pools has
 a null pool name and still reports its allocated OSTs.
 
+Periodic `lustre.pool_migrate` policies can match the Lustre access timestamp
+with `{"field":"object.last_access","op":"older_than","value":"2m"}`. Eligibility
+is evaluated on each policy run. Scans and available `ATIME` changelog records
+refresh the catalog timestamp. Before moving a candidate, the daemon refreshes
+a changed live atime and defers that attempt. It also checks the timestamp under
+the source lock before the layout swap. This predicate uses the atime visible
+to the executor's Lustre client. The client mount policy and the filesystem's
+atime propagation determine which reads update that timestamp.
+
+A completed pool migration confirms the target layout after closing the
+temporary descriptor that held the old stripes. OST usage can reflect the
+space reclaim after the operation is reported complete.
+
 `RBH_LUSTRE_MOUNT`, `RBH_FILESYSTEM_ID`, `RBH_MDTS`, and
 `RBH_CHANGELOG_USER` remain only as external configuration compatibility for a
 deployment that does not set `RBH_FILESYSTEMS_JSON`; they are translated into

@@ -11,8 +11,8 @@ use chrono::Utc;
 use lustre_api::{
     LuFid, LustreApi, StripeInfo,
     migration::{
-        FileVersion, MigrationError, MigrationLimits, MigrationOwnership, MigrationPlacement, MigrationPlan,
-        VerifiedPlacement,
+        FileAccessTime, FileVersion, MigrationError, MigrationLimits, MigrationOwnership, MigrationPlacement,
+        MigrationPlan, VerifiedPlacement,
     },
 };
 use rbh_entry_store::{BackendKind, EntryKey, EntryStore, FileSystemId, ObjectId};
@@ -35,7 +35,7 @@ use crate::{
     },
 };
 
-pub(in crate::store) type PoolPreflight = Result<(Generation, StripeInfo), Cow<'static, str>>;
+pub(in crate::store) type PoolPreflight = Result<(Generation, StripeInfo, FileAccessTime), Cow<'static, str>>;
 
 pub(in crate::store) struct PoolRecovery {
     operation: Rev8Operation,
@@ -87,6 +87,7 @@ impl PolicyStore {
             branch: candidate.branch,
             mount: dispatch.config.mount_path.clone(),
             catalog_version: (candidate.size, candidate.mtime, candidate.ctime),
+            catalog_atime: dispatch.policy.uses_last_access.then_some(candidate.atime),
         };
         let request = PreflightRequest {
             key: key.clone(),
@@ -94,7 +95,7 @@ impl PolicyStore {
             run_deadline: deadline,
         };
         let backend = Arc::clone(&self.runtime.as_ref().expect("dispatch requires a runtime").hsm);
-        let (generation, source, deadline) = match self
+        let (generation, source, access_time, deadline) = match self
             .pool_preflights
             .read(
                 &self.pool,
@@ -104,7 +105,9 @@ impl PolicyStore {
             )
             .await?
         {
-            PreflightResult::Observed(Ok((generation, source)), deadline) => (generation, source, deadline),
+            PreflightResult::Observed(Ok((generation, source, access_time)), deadline) => {
+                (generation, source, access_time, deadline)
+            }
             PreflightResult::Observed(Err(reason), _) => {
                 return self
                     .record_deferred(dispatch, candidate, invocation, &reason)
@@ -123,6 +126,19 @@ impl PolicyStore {
                 return Ok(ControlFlow::Continue(()));
             }
         };
+        let expected_access = dispatch.policy.uses_last_access.then_some(access_time);
+        if let Some(access) = expected_access
+            && access.seconds != candidate.atime
+        {
+            EntryStore::with_pool(self.pool.clone())
+                .advance_lustre_atime(filesystem, &fid, access.seconds, generation.mtime, generation.ctime)
+                .await
+                .map_err(|error| PolicyError::Store(error.to_string()))?;
+            return self
+                .record_deferred(dispatch, candidate, invocation, "source_access_time_changed")
+                .await
+                .map(ControlFlow::Continue);
+        }
         if source.pool.as_deref() != Some(&options.source_pool) {
             return self
                 .record_deferred(dispatch, candidate, invocation, "source_pool_changed")
@@ -181,6 +197,7 @@ impl PolicyStore {
             let mount = dispatch.config.mount_path.clone();
             let limits = MigrationLimits {
                 deadline,
+                expected_access,
                 before_swap: dispatch.admission.window_check(),
             };
             // Moving this guard into the closure retains ownership for the
@@ -424,7 +441,7 @@ async fn observe_pool_source(
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
-    Ok((generation, layout))
+    Ok((generation, layout, observation.access_time))
 }
 
 async fn candidate_deferral(

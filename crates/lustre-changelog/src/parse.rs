@@ -182,6 +182,7 @@ pub fn parse_event(mdt: &str, rec: &impl RawRec) -> Result<Option<ChangelogEvent
         ChangelogEventType::Close => ChangelogEvent::Close { fid, parent, name },
         ChangelogEventType::Truncate => ChangelogEvent::Truncate { fid },
         ChangelogEventType::SetAttr => ChangelogEvent::SetAttr { fid },
+        ChangelogEventType::ATime => ChangelogEvent::ATime { fid },
         ChangelogEventType::MTime => ChangelogEvent::MTime { fid },
         ChangelogEventType::CTime => ChangelogEvent::CTime { fid },
         ChangelogEventType::XAttr => {
@@ -205,7 +206,6 @@ pub fn parse_event(mdt: &str, rec: &impl RawRec) -> Result<Option<ChangelogEvent
         ChangelogEventType::Mark
         | ChangelogEventType::Open
         | ChangelogEventType::NoOpen
-        | ChangelogEventType::ATime
         | ChangelogEventType::Migrate
         | ChangelogEventType::FlrWrite
         | ChangelogEventType::Resync

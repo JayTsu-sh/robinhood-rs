@@ -1229,6 +1229,28 @@ impl EntryStore {
             .await
     }
 
+    /// Advance only atime for an existing FID whose catalog generation still matches.
+    pub async fn advance_lustre_atime(
+        &self, filesystem: &FileSystemId, fid: &LuFid, atime: i64, mtime: i64, ctime: i64,
+    ) -> Result<bool> {
+        let fid = fid_codec::encode(fid);
+        let result = sqlx::query(
+            "UPDATE scoped_entries SET atime = ?
+             WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?
+               AND kind = ? AND mtime = ? AND ctime = ? AND atime < ?",
+        )
+        .bind(atime)
+        .bind(filesystem.as_str())
+        .bind(fid.as_slice())
+        .bind(EntryKind::File as u8)
+        .bind(mtime)
+        .bind(ctime)
+        .bind(atime)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Update a file's catalog layout and OST index in one transaction.
     #[tracing::instrument(skip(self, layout), fields(%filesystem, %fid))]
     pub async fn refresh_lustre_layout(

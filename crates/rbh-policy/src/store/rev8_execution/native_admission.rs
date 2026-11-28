@@ -56,6 +56,7 @@ impl PolicyStore {
             branch: candidate.branch,
             mount: dispatch.config.mount_path.clone(),
             catalog_version: (candidate.size, candidate.mtime, candidate.ctime),
+            catalog_atime: None,
         };
         let backend = &self.runtime.as_ref().expect("dispatch requires a runtime").hsm;
         let tick_started = tick_deadline - Rev8TickTask::INTERVAL;

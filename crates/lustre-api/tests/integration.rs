@@ -208,6 +208,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
     let fsname = api.hsm_filesystem(mount).unwrap();
     let limits = MigrationLimits {
         deadline: Instant::now() + Duration::from_secs(15),
+        expected_access: None,
         before_swap: || false,
     };
     assert!(matches!(
@@ -229,6 +230,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
     let entered = std::cell::Cell::new(false);
     let limits = MigrationLimits {
         deadline,
+        expected_access: None,
         before_swap: || {
             entered.set(true);
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()));

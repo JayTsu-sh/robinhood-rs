@@ -59,6 +59,21 @@ impl From<&Metadata> for FileVersion {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileAccessTime {
+    pub seconds: i64,
+    pub nanos: i64,
+}
+
+impl From<&Metadata> for FileAccessTime {
+    fn from(metadata: &Metadata) -> Self {
+        Self {
+            seconds: metadata.atime(),
+            nanos: metadata.atime_nsec(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
     #[error("{0}")]
@@ -98,6 +113,7 @@ pub struct MigrationOwnership(String);
 /// Limits checked by the blocking migration while it owns the source lock.
 pub struct MigrationLimits<F> {
     pub deadline: Instant,
+    pub expected_access: Option<FileAccessTime>,
     pub before_swap: F,
 }
 
@@ -221,6 +237,7 @@ impl LustreApi {
         let ownership = MigrationOwnership::acquire(&fs)?;
         let limits = MigrationLimits {
             deadline,
+            expected_access: None,
             before_swap: || true,
         };
         self.migrate_reserved_pool(mount, fid, plan, expected, limits, ownership)
@@ -254,6 +271,7 @@ impl LustreApi {
         if !source.is_file() || source.nlink() == 0 || FileVersion::from(&source) != expected {
             return Err(MigrationError::Deferred("source_generation_changed"));
         }
+        check_access_time(&source, limits.expected_access)?;
         check_inode_flags(&src)?;
         eligible_hsm(self, mount, fid)?;
         let current =
@@ -292,6 +310,9 @@ impl LustreApi {
         eligible_hsm(self, mount, fid)?;
         if !(limits.before_swap)() {
             return Err(MigrationError::Deferred("admission_window_closed"));
+        }
+        if limits.expected_access.is_some() {
+            check_access_time(&src.metadata()?, limits.expected_access)?;
         }
         check_deadline(deadline)?;
 
@@ -394,6 +415,13 @@ fn matches_target(layout: &StripeInfo, plan: &MigrationPlan, members: &BTreeSet<
     is_in_pool(layout, &plan.target_pool, members)
         && layout.count == u32::from(plan.stripe_count)
         && layout.size == u64::from(plan.stripe_size)
+}
+
+fn check_access_time(metadata: &Metadata, expected: Option<FileAccessTime>) -> Result<(), MigrationError> {
+    if expected.is_some_and(|time| time != FileAccessTime::from(metadata)) {
+        return Err(MigrationError::Deferred("source_access_time_changed"));
+    }
+    Ok(())
 }
 
 fn open_source(mount: &Path, fid: &LuFid) -> crate::error::Result<Option<File>> {

@@ -32,6 +32,7 @@ pub struct CompiledPolicy {
     pub filesystem: FileSystemId,
     pub(crate) selectors: BTreeSet<String>,
     pub(crate) uses_read_heat: bool,
+    pub(crate) uses_last_access: bool,
     pub(crate) where_clause: String,
     pub(crate) params: Vec<QueryParam>,
     pub(crate) actions: Vec<Invocation>,
@@ -196,6 +197,11 @@ impl Policy {
         } else if uses_read_heat && enforced {
             return Err(invalid("enforced read heat conditions require lustre.pool_migrate"));
         }
+        if conditions.uses_last_access && enforced && actions.iter().any(|invocation| invocation.migration.is_none()) {
+            return Err(invalid(
+                "enforced object.last_access conditions require lustre.pool_migrate",
+            ));
+        }
         Ok(CompiledPolicy {
             name: self.metadata.name,
             filesystem: spec.target.filesystem,
@@ -205,6 +211,7 @@ impl Policy {
             decision,
             decision_params: query_params(decision_params),
             uses_read_heat,
+            uses_last_access: conditions.uses_last_access,
             enabled: spec.enabled.unwrap_or(true),
             enforced,
             one_shot: matches!(spec.mode, Some(RunMode::OneShot)),
@@ -571,10 +578,10 @@ impl Rules {
                 // guards all lower-priority execute decisions.
                 skip_requires_heat_to_pass |= !condition.can_fail_without_heat;
             }
-            if condition.uses_read_heat {
+            uses_read_heat |= condition.uses_read_heat;
+            if condition.may_be_unknown {
                 // An earlier unknown rule could override the remainder of
-                // first_match, so it must defer instead of falling through.
-                uses_read_heat = true;
+                // first_match, so defer instead of falling through.
                 clauses.push(format!(
                     "WHEN ({0}) IS NOT FALSE THEN CASE WHEN {0} THEN {branch} END",
                     condition.sql
@@ -776,25 +783,34 @@ impl FieldCondition {
                     value: Value::Num(bytes),
                 })
             }
-            "object.last_modified" if matches!(self.op, Comparison::OlderThan) => {
-                let age = as_string()
+            field @ ("object.last_modified" | "object.last_access") if matches!(self.op, Comparison::OlderThan) => {
+                let age_ms = as_string()
                     .ok()
                     .and_then(duration_millis)
-                    .and_then(|ms| i64::try_from(ms.div_ceil(1000)).ok())
                     .ok_or_else(|| invalid(format!("{path}.value must be a positive Rev.8 duration")))?;
-                let cutoff = now
-                    .timestamp()
-                    .checked_sub(age)
-                    .ok_or_else(|| invalid(format!("{path}.value exceeds the timestamp range")))?;
+                let (field, cmp, cutoff) = if field == "object.last_access" {
+                    let cutoff = i64::try_from(age_ms)
+                        .ok()
+                        .and_then(TimeDelta::try_milliseconds)
+                        .and_then(|duration| now.checked_sub_signed(duration))
+                        .map(|time| time.timestamp());
+                    (Field::Atime, CmpOp::Lt, cutoff)
+                } else {
+                    let cutoff = i64::try_from(age_ms.div_ceil(1000))
+                        .ok()
+                        .and_then(|age| now.timestamp().checked_sub(age));
+                    (Field::Mtime, CmpOp::Le, cutoff)
+                };
+                let cutoff = cutoff.ok_or_else(|| invalid(format!("{path}.value exceeds the timestamp range")))?;
                 Ok(Predicate::Cmp {
-                    field: Field::Mtime,
-                    cmp: CmpOp::Le,
+                    field,
+                    cmp,
                     value: Value::Num(cutoff),
                 })
             }
-            "object.last_modified" => Err(invalid(format!(
-                "{path}.op must be older_than for object.last_modified"
-            ))),
+            field @ ("object.last_modified" | "object.last_access") => {
+                Err(invalid(format!("{path}.op must be older_than for {field}")))
+            }
             "lustre.pool" => {
                 let cmp = self.op.equality(path)?;
                 let pool = as_string()?;
@@ -872,6 +888,7 @@ struct Condition {
     sql: String,
     params: Vec<SqlParam>,
     uses_read_heat: bool,
+    may_be_unknown: bool,
     // Conservative Boolean outcomes when every heat comparison is SQL NULL.
     can_match_without_heat: bool,
     can_fail_without_heat: bool,
@@ -879,11 +896,28 @@ struct Condition {
 
 impl Condition {
     fn indexed(predicate: Predicate) -> Self {
-        let (sql, params) = rbh_predicate::to_sql(&predicate);
+        let (sql, params, may_be_unknown) = match &predicate {
+            Predicate::Cmp {
+                field: Field::Atime,
+                cmp: CmpOp::Lt,
+                value: Value::Num(cutoff),
+            } => (
+                // A whole-second catalog timestamp cannot distinguish reads
+                // on either side of the cutoff within that second.
+                "CASE WHEN atime = ? THEN NULL ELSE atime < ? END".into(),
+                vec![SqlParam::Num(*cutoff), SqlParam::Num(*cutoff)],
+                true,
+            ),
+            _ => {
+                let (sql, params) = rbh_predicate::to_sql(&predicate);
+                (sql, params, false)
+            }
+        };
         Self {
             sql,
             params,
             uses_read_heat: false,
+            may_be_unknown,
             can_match_without_heat: !matches!(predicate, Predicate::False),
             can_fail_without_heat: !matches!(predicate, Predicate::True),
         }
@@ -904,6 +938,7 @@ impl Condition {
             });
         }
         let uses_read_heat = conditions.iter().any(|condition| condition.uses_read_heat);
+        let may_be_unknown = conditions.iter().any(|condition| condition.may_be_unknown);
         let (can_match_without_heat, can_fail_without_heat) = if operator == "AND" {
             (
                 conditions.iter().all(|condition| condition.can_match_without_heat),
@@ -918,9 +953,9 @@ impl Condition {
         let mut parts = Vec::with_capacity(conditions.len());
         let mut params = Vec::new();
         for condition in conditions {
-            // A missing indexed attribute is a non-match at the boundary with a
-            // heat expression. Only unavailable heat propagates as SQL NULL.
-            parts.push(if uses_read_heat && !condition.uses_read_heat {
+            // Missing ordinary catalog attributes remain non-matches.
+            // Preserve uncertainty from heat and the access-time boundary.
+            parts.push(if may_be_unknown && !condition.may_be_unknown {
                 format!("({}) IS TRUE", condition.sql)
             } else {
                 condition.sql
@@ -931,6 +966,7 @@ impl Condition {
             sql: format!("({})", parts.join(&format!(" {operator} "))),
             params,
             uses_read_heat,
+            may_be_unknown,
             can_match_without_heat,
             can_fail_without_heat,
         }
@@ -942,6 +978,7 @@ struct ConditionCompiler<'a> {
     stack: Vec<String>,
     referenced: BTreeSet<String>,
     remaining: usize,
+    uses_last_access: bool,
     now: DateTime<Utc>,
 }
 
@@ -952,6 +989,7 @@ impl<'a> ConditionCompiler<'a> {
             stack: Vec::new(),
             referenced: BTreeSet::new(),
             remaining: 4096,
+            uses_last_access: false,
             now: Utc::now(),
         }
     }
@@ -999,10 +1037,12 @@ impl<'a> ConditionCompiler<'a> {
                     sql: format!("read_heat.{column} {} ?", condition.op.ordinal(path)?.sql()),
                     params: vec![SqlParam::Num(value)],
                     uses_read_heat: true,
+                    may_be_unknown: true,
                     can_match_without_heat: false,
                     can_fail_without_heat: false,
                 });
             }
+            self.uses_last_access |= condition.field == "object.last_access";
             return condition.compile(path, self.now).map(Condition::indexed);
         }
         let Some((key, operand)) = fields.iter().next().filter(|_| fields.len() == 1) else {

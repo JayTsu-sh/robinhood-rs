@@ -101,6 +101,7 @@ struct Candidate {
     size: u64,
     mtime: i64,
     ctime: i64,
+    atime: i64,
     branch: i64,
 }
 
@@ -500,7 +501,7 @@ impl PolicyStore {
             None
         };
         let now = Utc::now();
-        let mut query = QueryBuilder::new("SELECT entries.object_id AS fid, size, mtime, ctime, CAST((");
+        let mut query = QueryBuilder::new("SELECT entries.object_id AS fid, size, mtime, ctime, atime, CAST((");
         push_expression(&mut query, &policy.decision, &policy.decision_params);
         query.push(") AS SIGNED) AS branch FROM scoped_entries AS entries ");
         if let Some(profile) = dispatch.heat {

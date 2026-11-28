@@ -4,7 +4,7 @@
 //! applies three rule categories in order:
 //!
 //! 1. **`IGNORE_ALWAYS`** — certain event types are dropped unconditionally
-//!    (Mark, Open, NoOpen, ATime). This is typically already handled at parse
+//!    (Mark, Open, NoOpen). This is typically already handled at parse
 //!    time (parse_event returns None), so it's a belt-and-suspenders check.
 //! 2. **`IGNORE_CANCEL`** — Create + Unlink (same FID) cancel each other;
 //!    Mkdir + Rmdir cancel each other. The zero-footprint pair is removed.
@@ -46,7 +46,7 @@ impl Deduplicator {
         let fid = env.event.fid();
 
         // M1 fix: IGNORE_ALWAYS is handled by parse_event returning None for
-        // Mark/Open/NoOpen/ATime. No separate check needed here — removed the
+        // Mark/Open/NoOpen. No separate check needed here — removed the
         // former no-op `is_always_ignored` method.
 
         let queue = self.queues.entry(fid).or_default();
@@ -91,7 +91,7 @@ impl Deduplicator {
     // ── Rule implementations ────────────────────────────────────────────
     //
     // M1 fix: removed the no-op `is_always_ignored` — IGNORE_ALWAYS types
-    // (Mark, Open, NoOpen, ATime) are already filtered by `parse_event`
+    // (Mark, Open, NoOpen) are already filtered by `parse_event`
     // returning `None`. No belt-and-suspenders check needed here.
 
     /// H3 fix: Check if the new event cancels an existing event in the queue.
@@ -138,13 +138,14 @@ impl Deduplicator {
     }
 
     /// Check if the new event is a redundant data-change signal that the queue
-    /// already holds. Close, Truncate, MTime, CTime, SetAttr on the same FID
+    /// already holds. Close, Truncate, ATime, MTime, CTime, SetAttr on the same FID
     /// collapse: the second one is dropped.
     fn is_masked(queue: &VecDeque<ChangelogEventEnvelope>, new: &ChangelogEvent) -> bool {
         let dominated = |kind: &str| queue.iter().any(|e| e.event.kind_name() == kind);
         match new {
             ChangelogEvent::Close { .. } => dominated("CLOSE"),
             ChangelogEvent::Truncate { .. } => dominated("TRUNC") || dominated("CLOSE"),
+            ChangelogEvent::ATime { .. } => dominated("ATIME") || dominated("SATTR") || dominated("CLOSE"),
             ChangelogEvent::MTime { .. } => dominated("MTIME") || dominated("CLOSE") || dominated("TRUNC"),
             ChangelogEvent::CTime { .. } => dominated("CTIME") || dominated("SATTR") || dominated("CLOSE"),
             ChangelogEvent::SetAttr { .. } => dominated("SATTR"),

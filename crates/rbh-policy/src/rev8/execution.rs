@@ -71,6 +71,7 @@ pub enum FidObservation {
 #[derive(Clone, Debug)]
 pub struct Observation {
     pub generation: Generation,
+    pub access_time: lustre_api::migration::FileAccessTime,
     pub state: HsmUserStateInfo,
 }
 
@@ -223,6 +224,7 @@ fn observe_fid(mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
         return Ok(FidObservation::Missing { mount_source_id });
     };
     Ok(FidObservation::Present(Observation {
+        access_time: (&metadata).into(),
         generation: Generation {
             filesystem_name: lookup.filesystem_name,
             mount_source_id: Some(mount_source_id),

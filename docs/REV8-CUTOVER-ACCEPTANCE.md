@@ -12,6 +12,7 @@
 | 无分层策略的通用部署 | REST 扫描完成后可按 FID 查询。创建、重命名、解除链接和外部布局变化由 MDT `lustre-MDT0000` 的 changelog 更新目录。验证了作用域内的 Top Size 和目录用量报告。启用的 Rev.8 Archive 经临时 copytool 完成，REST 有操作及实时 HSM 状态证据。 |
 | 并行配置两个文件系统作用域 | 同一 daemon 注册两个 Lustre 作用域，两边都部署采样配置。仅配置了启用升温策略的作用域启动采样，另一个作用域保留目录功能。删除最后一条升温策略后采样停止。升级前的 HSM 热度预览也未触发采样。 |
 | 按策略双向迁移 | REST 预览返回 1 个候选、131087 字节，预览期间布局仍在热池。启用降温后重启，由保存的周期和修订版触发迁移。文件在最短驻留期和业务读取阈值满足后自动升温。 |
+| 按最近访问时间自动降温 | 通过 REST 启用周期策略，使用 `object.last_access older_than 2m`。两次真实读取先后刷新 atime，第一次读取满 2 分钟时仍在热池。目录时间过期时活体查询更新 atime 并暂缓。第二次读取满 2 分钟后，由周期策略自动迁移。另一次在预检完成、获取源文件锁前读取，操作因 `source_access_time_changed` 暂缓。同一个 FID 在冷池保持在线，源热池用量随后回到基线。 |
 | 实际布局与文件身份 | FID `0x200000bd9:0x3e:0x0` 从热池 OST 3 到冷池 OST 10，再回到热池 OST 5。两个方向均核对了实时布局的池名和实际 OST，并检查了 inode、原路径、硬链接、稀疏分配及 SHA-256。 |
 | 与原生 HSM 共存 | 同一 daemon 完成原生 Archive、Release、Restore。已归档但在线、已释放的文件因 `hsm_state_ineligible` 暂缓。有活动 Archive 的文件因 `hsm_action_active` 暂缓。三者的布局都保持原样，同批符合资格的在线文件进入冷池。另在已选中 FID、锁定前发起 Archive，原迁移操作复核后因 `hsm_action_active` 暂缓，FID、布局和内容一致。 |
 | 布局交换前进程退出 | 对原 FID 的实时核对确认源池仍有效，操作标为 `swap_not_observed_in_source_pool`。后续周期再次校验并正常降温，FID 和内容一致。 |

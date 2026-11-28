@@ -29,6 +29,7 @@ pub(super) struct PreflightKey {
     pub branch: i64,
     pub mount: PathBuf,
     pub catalog_version: (u64, i64, i64),
+    pub catalog_atime: Option<i64>,
 }
 
 pub(super) struct PreflightRequest {

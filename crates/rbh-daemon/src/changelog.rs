@@ -7,7 +7,7 @@
 //! via `fid_to_path` + `symlink_metadata` to populate the full [`EntryRow`].
 //! Deletion events update only the originating filesystem's scoped catalog.
 //! For Rename, we update parent_fid + name and handle rename-overwrite.
-//! For metadata events (Close, SetAttr, Truncate, MTime, CTime), we re-stat
+//! For metadata events (Close, SetAttr, Truncate, ATime, MTime, CTime), we re-stat
 //! the file to refresh changed fields.
 //! For layout events, we reread the actual Lustre OST layout by FID.
 
@@ -34,6 +34,8 @@ enum LustreIngestError {
     Store(#[from] rbh_entry_store::StoreError),
     #[error("Lustre layout read failed: {0}")]
     Layout(#[from] lustre_api::LustreApiError),
+    #[error("Lustre metadata read failed: {0}")]
+    Metadata(#[from] std::io::Error),
     #[error("Lustre metadata worker failed: {0}")]
     Join(#[from] tokio::task::JoinError),
 }
@@ -623,6 +625,9 @@ fn lustre_event(change: &Change) -> anyhow::Result<ChangelogEvent> {
             MetadataChangeKind::Attributes => ChangelogEvent::SetAttr {
                 fid: lustre_fid(*object)?,
             },
+            MetadataChangeKind::AccessTime => ChangelogEvent::ATime {
+                fid: lustre_fid(*object)?,
+            },
             MetadataChangeKind::Xattr => ChangelogEvent::XAttr {
                 fid: lustre_fid(*object)?,
                 xattr_name: Bytes::new(),
@@ -826,6 +831,8 @@ async fn apply_event(
             Ok(touched)
         }
 
+        ChangelogEvent::ATime { fid } => refresh_lustre_atime(store, filesystem, mount, fid).await,
+
         ChangelogEvent::SetAttr { fid } | ChangelogEvent::MTime { fid } | ChangelogEvent::CTime { fid } => {
             restat_entry(store, filesystem, mount, fid, None, Bytes::new()).await
         }
@@ -840,6 +847,21 @@ async fn apply_event(
         ChangelogEvent::Layout { fid } => refresh_lustre_layout(store, filesystem, mount, fid).await,
         ChangelogEvent::XAttr { .. } => Ok(false),
     }
+}
+
+async fn refresh_lustre_atime(
+    store: &EntryStore, filesystem: &FileSystemId, mount: &Path, fid: &lustre_api::LuFid,
+) -> Result<bool, LustreIngestError> {
+    let path = mount.join(".lustre/fid").join(fid.to_string());
+    let metadata = match tokio::task::spawn_blocking(move || std::fs::symlink_metadata(path)).await? {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(store
+        .advance_lustre_atime(filesystem, fid, metadata.atime(), metadata.mtime(), metadata.ctime())
+        .await?)
 }
 
 async fn refresh_lustre_layout(
