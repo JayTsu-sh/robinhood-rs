@@ -382,9 +382,11 @@ pub async fn run() -> anyhow::Result<()> {
     scheduler.register::<rbh_policy::Rev8TickTask>().await;
 
     // Initialize the Rev.8 worker runtime.
+    let (worker_failure, mut worker_failures) = tokio::sync::mpsc::channel(1);
     rbh_policy::init_runtime(Arc::new(rbh_policy::PolicyRuntime {
         policy_store: policy_store.clone(),
         entry_store: entry_store.clone(),
+        worker_failure,
     }));
 
     register_rev8_wakeup(&scheduler)
@@ -476,6 +478,14 @@ pub async fn run() -> anyhow::Result<()> {
         signal = signals::supervise(obs_guard, daemon_cancel.clone(), None, None) => {
             scheduler.shutdown();
             signal.and(scheduler_run.await.context("Rev.8 scheduler shutdown failed"))
+        }
+        Some(error) = worker_failures.recv() => {
+            daemon_cancel.cancel();
+            scheduler.shutdown();
+            if let Err(shutdown_error) = scheduler_run.await {
+                tracing::warn!(%shutdown_error, "Rev.8 scheduler shutdown failed");
+            }
+            Err(error).context("Rev.8 scheduler stopped")
         }
         result = &mut scheduler_run => {
             result

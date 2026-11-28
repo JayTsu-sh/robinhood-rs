@@ -278,8 +278,9 @@ impl PolicyStore {
     pub async fn process_rev8(&self, entries: &EntryStore) -> Result<(), PolicyError> {
         let mut worker = self.pool.begin().await?;
         sqlx::query_scalar::<_, u8>("SELECT id FROM rev8_worker_lock WHERE id = 1 FOR UPDATE")
-            .fetch_one(&mut *worker)
-            .await?;
+            .fetch_optional(&mut *worker)
+            .await?
+            .ok_or(PolicyError::WorkerLockMissing)?;
 
         self.reconcile_operations(entries).await?;
         self.enqueue_due_policies().await?;

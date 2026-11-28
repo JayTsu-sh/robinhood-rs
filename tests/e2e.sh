@@ -9,7 +9,7 @@
 #      rbh report (fs-info / size-profile / top-users / dump), rbh undelete
 #      (list / forget), rejection of the previous policy format, and
 #      /api/metrics.
-#   5. Verifies graceful SIGTERM and nonzero exit on scheduler failure.
+#   5. Verifies graceful SIGTERM and nonzero exit when the run queue is unavailable.
 #
 # Requirements on the host:
 #   * Disposable MariaDB reachable at 127.0.0.1:3306 as root without a password.
@@ -38,7 +38,8 @@ PID=""
 DB_CREATED=0
 LOG=""
 MOUNT=""
-SCHEDULES_RENAMED=0
+WORKER_LOCK_RENAMED=0
+WORKER_LOCK_ROW_REMOVED=0
 
 test_sql() {
     mysql --no-defaults --host=127.0.0.1 --port=3306 --user=root --skip-password "$@"
@@ -58,8 +59,11 @@ cleanup() {
     if [[ -n "$PID" ]]; then
         wait "$PID" 2>/dev/null || true
     fi
-    if [[ "$SCHEDULES_RENAMED" == 1 ]]; then
-        test_sql "$DB" -e 'RENAME TABLE schedules_e2e_fault TO schedules;' || true
+    if [[ "$WORKER_LOCK_RENAMED" == 1 ]]; then
+        test_sql "$DB" -e 'RENAME TABLE rev8_worker_lock_e2e_fault TO rev8_worker_lock;' || true
+    fi
+    if [[ "$WORKER_LOCK_ROW_REMOVED" == 1 ]]; then
+        test_sql "$DB" -e 'INSERT IGNORE INTO rev8_worker_lock (id) VALUES (1);' || true
     fi
     if [[ "$DB_CREATED" == 1 && "${RBH_E2E_KEEP_DB:-0}" != "1" ]]; then
         test_sql -e "DROP DATABASE $DB;" || true
@@ -261,19 +265,32 @@ PID=""
 grep -q "robinhood-rs daemon stopped" "$LOG" \
     || die "daemon log missing 'daemon stopped' line (see $LOG)"
 
-# 6. Simulate a scheduler store error in the disposable schema.
+# 6. Simulate loss of a durable dependency of the Rev.8 run queue.
+assert_queue_failure() {
+    wait_for_daemon_exit "$1"
+    local status=0
+    wait "$PID" || status=$?
+    PID=""
+    [[ "$status" == 1 ]] || die "$1 returned exit status $status (see $LOG)"
+    grep -q "Rev.8 scheduler stopped" "$LOG" || die "daemon log missing scheduler failure (see $LOG)"
+}
+
 start_daemon
-echo "[fault] hiding the scheduler table"
-test_sql "$DB" -e 'RENAME TABLE schedules TO schedules_e2e_fault;'
-SCHEDULES_RENAMED=1
-wait_for_daemon_exit "scheduler store failure"
-status=0
-wait "$PID" || status=$?
-PID=""
-test_sql "$DB" -e 'RENAME TABLE schedules_e2e_fault TO schedules;'
-SCHEDULES_RENAMED=0
-[[ "$status" == 1 ]] || die "scheduler failure returned exit status $status (see $LOG)"
-grep -q "Rev.8 scheduler stopped" "$LOG" || die "daemon log missing scheduler failure (see $LOG)"
+echo "[fault] hiding the run queue lock table"
+test_sql "$DB" -e 'RENAME TABLE rev8_worker_lock TO rev8_worker_lock_e2e_fault;'
+WORKER_LOCK_RENAMED=1
+assert_queue_failure "run queue store failure"
+test_sql "$DB" -e 'RENAME TABLE rev8_worker_lock_e2e_fault TO rev8_worker_lock;'
+WORKER_LOCK_RENAMED=0
+
+start_daemon
+echo "[fault] removing the run queue lock row"
+test_sql "$DB" -e 'DELETE FROM rev8_worker_lock WHERE id = 1;'
+WORKER_LOCK_ROW_REMOVED=1
+assert_queue_failure "missing run queue lock row"
+grep -q "Rev.8 worker lock row is missing" "$LOG" || die "daemon log missing worker lock error (see $LOG)"
+test_sql "$DB" -e 'INSERT INTO rev8_worker_lock (id) VALUES (1);'
+WORKER_LOCK_ROW_REMOVED=0
 
 echo "[done] all assertions passed"
 exit 0

@@ -36,6 +36,8 @@ pub enum PolicyError {
     InvalidPolicy(String),
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+    #[error("Rev.8 worker lock row is missing")]
+    WorkerLockMissing,
     #[error("migration error: {0}")]
     Migration(String),
     #[error("JSON error: {0}")]
