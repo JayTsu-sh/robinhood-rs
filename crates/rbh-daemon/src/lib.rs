@@ -504,6 +504,23 @@ pub async fn run() -> anyhow::Result<()> {
         console_dir.clone(),
     )
     .merge(administration.clone().routes(writers));
+    let app = if trusted_gateway {
+        app.layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                use axum::{
+                    http::{Method, StatusCode},
+                    response::IntoResponse,
+                };
+                if matches!(*request.method(), Method::GET | Method::HEAD) {
+                    next.run(request).await
+                } else {
+                    StatusCode::METHOD_NOT_ALLOWED.into_response()
+                }
+            },
+        ))
+    } else {
+        app
+    };
 
     // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
     let listener = tokio::net::TcpListener::bind(&listen_addr)
@@ -598,6 +615,14 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 async fn bind_gateway_socket(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
+    let directory = path
+        .parent()
+        .context("trusted gateway socket needs a parent directory")?;
+    let metadata = std::fs::metadata(directory).context("inspect trusted gateway socket directory")?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.permissions().mode() & 0o022 == 0,
+        "the trusted gateway socket directory must forbid group and other writes"
+    );
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => match tokio::net::UnixStream::connect(path).await {
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
