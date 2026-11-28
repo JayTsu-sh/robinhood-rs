@@ -191,6 +191,8 @@ test('policies show saved values and distinguish empty, filtered, and failed req
 test('Lustre resource list shows separate cluster and filesystem columns, pool counts and collection failures', async ({ page }) => {
   const send = await controlResourceEvents(page);
   let mountMissing = false;
+  let readOnly = false;
+  let observedAt = Math.floor(Date.now() / 1000);
   let managementFails = false;
   let externalMount = false;
   await page.route('**/api/filesystems/management', (route) => managementFails
@@ -214,17 +216,17 @@ test('Lustre resource list shows separate cluster and filesystem columns, pool c
       mountPath: '/mnt/lab',
       mountStatus: mountMissing ? 'unmounted' : 'mounted',
       collectionStatus: mountMissing ? 'unavailable' : 'partial',
-      observedAt: 1795852800,
-      mount: mountMissing ? null : { source: '10.1.2.3@tcp:/lab', readOnly: false },
-      capacity: { status: 'missing', attemptedAt: 1795852800, sample: null, reason: null },
+      observedAt,
+      mount: mountMissing ? null : { source: '10.1.2.3@tcp:/lab', readOnly },
+      capacity: { status: 'missing', attemptedAt: observedAt, sample: null, reason: null },
       pools: mountMissing ? null : [
         { name: 'cold', eligible: true, ostIndices: [8], reason: null },
         { name: 'empty', eligible: false, ostIndices: [], reason: 'pool_has_no_osts' },
         { name: 'hot', eligible: true, ostIndices: [1, 2], reason: null },
         { name: 'unknown', eligible: false, ostIndices: null, reason: '采集失败' },
       ],
-      tieringAvailable: !mountMissing,
-      reason: mountMissing ? 'not_a_lustre_mount' : null,
+      tieringAvailable: !mountMissing && !readOnly,
+      reason: mountMissing ? 'not_a_lustre_mount' : readOnly ? 'read_only_mount' : null,
     }],
   }));
   await page.goto('/console/#/resources');
@@ -236,11 +238,11 @@ test('Lustre resource list shows separate cluster and filesystem columns, pool c
   await expect(metrics.locator('dt')).toHaveText(['正常集群', '异常集群', '文件系统', '存储池']);
   await expect(metrics.locator('dd')).toHaveText(['1', '0', '1', '2']);
   await expect(page.getByText('本机 Lustre Client · 当前节点', { exact: true })).toHaveCount(0);
-  await expect(page.getByText('共 1 / 1 个资源 · 以文件系统为单位', { exact: true })).toBeVisible();
+  await expect(page.getByText('共 1 / 1 个资源（以文件系统为单位）', { exact: true })).toBeVisible();
   const row = page.getByRole('row').filter({ hasText: '测试集群' });
   const cells = row.getByRole('cell');
   await expect(cells.nth(0)).toHaveText('测试集群');
-  await expect(cells.nth(1)).toHaveText('lablab-a');
+  await expect(cells.nth(1)).toHaveText('lab');
   await expect(cells.nth(2)).toHaveText('/mnt/lab');
   await expect(cells.nth(7)).toHaveText('可用');
   await expect(row.getByRole('link', { name: '详情' })).toHaveAttribute('href', '#/resources/detail?filesystem=lab-a');
@@ -249,15 +251,25 @@ test('Lustre resource list shows separate cluster and filesystem columns, pool c
   await expect(page.getByText('cold', { exact: true })).toBeVisible();
   await expect(page.getByText('hot', { exact: true })).toBeVisible();
   await pools.click();
-  await expect(cells.nth(4)).toContainText('部分采集');
+  await expect(cells.nth(4)).toHaveText('部分采集查看原因');
   await row.getByRole('button', { name: '查看原因' }).click();
   await expect(page.getByText('unknown · 采集失败')).toBeVisible();
   await expect(page.getByRole('button', { name: '刷新资源' })).toHaveCount(0);
+
+  readOnly = true;
+  observedAt -= 301;
+  await send('snapshot', 'lab-a');
+  await expect(cells.nth(3)).toHaveText('已挂载');
+  await expect(cells.nth(4)).toHaveText('部分采集快照已过期查看原因');
+  await expect(cells.nth(7)).toContainText('挂载为只读');
+  await expect(metrics.locator('dd')).toHaveText(['1', '0', '1', '0']);
+
   mountMissing = true;
   await send('snapshot', 'lab-a');
   await expect(row).toContainText('未挂载');
+  await expect(metrics.locator('dd')).toHaveText(['0', '1', '1', '0']);
   await expect(cells.nth(0)).toHaveText('测试集群');
-  await expect(cells.nth(1)).toHaveText('oldlablab-a');
+  await expect(cells.nth(1)).toHaveText('oldlab');
   await expect(cells.nth(5)).toHaveText('—');
   await expect(row).toContainText('配置路径未挂载 Lustre');
   await row.getByRole('button', { name: '挂载异常' }).press('Enter');
@@ -272,6 +284,7 @@ test('Lustre resource list shows separate cluster and filesystem columns, pool c
   externalMount = true;
   await send('disconnect');
   await expect(page.getByText('/mnt/external', { exact: true })).toBeVisible({ timeout: 8_000 });
+  await expect(metrics.locator('dd')).toHaveText(['1', '1', '2', '0']);
   await expect(page.getByRole('alert')).toHaveCount(0);
   expect(collections).toEqual([]);
 });
