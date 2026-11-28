@@ -41,7 +41,6 @@ export RBH_CONSOLE_HTTP_HOST=10.0.0.10
 export RBH_CONSOLE_TRUSTED_CIDR=10.0.0.0/24
 export RBH_LISTEN_ADDR=127.0.0.1:18080
 sudo install -d -m 0700 "$RBH_CONTAINER_CONFIG_DIR"
-sudo sh -c 'umask 077; set -C; openssl rand -hex 32 > "$1/console-gateway.token"' sh "$RBH_CONTAINER_CONFIG_DIR"
 docker compose -f packaging/docker/compose.yml -f packaging/docker/compose.console.yml up -d --build
 curl -fsS --retry 10 --retry-connrefused http://10.0.0.10:8080/api/health
 ```
@@ -213,17 +212,24 @@ For a test filesystem registered as `lustre`, the following commands use
 `curl` and `jq` to create the three resources for `tiering-daemon`. Set
 `RBH_API_URL` to the daemon's loopback HTTP origin and
 `RBH_POLICY_TOKEN_FILE` to the writer token file. For the trusted gateway
-deployment above, use `http://127.0.0.1:18080` and the protected
-`console-gateway.token` file. Use `tiering-local` for the authorization and
-approval selections in the wizard. The system safety policy applies by
-filesystem scope.
+deployment, use the daemon's private Unix socket from the Docker host. Set
+`RBH_CONSOLE_SOCKET` to its host path and run the commands from a root shell.
+Use `tiering-local` for the authorization and approval selections in the wizard.
+The system safety policy applies by filesystem scope.
 
 ```bash
 create_tiering_resource() {
+  local -a transport
+  local api
+  if [[ -n ${RBH_CONSOLE_SOCKET:-} ]]; then
+    transport=(--unix-socket "$RBH_CONSOLE_SOCKET")
+    api=http://localhost
+  else
+    transport=(-H "Authorization: Bearer $(cat "$RBH_POLICY_TOKEN_FILE")")
+    api=${RBH_API_URL:-http://127.0.0.1:8080}
+  fi
   jq -c --arg kind "$2" '{apiVersion:"hsm.storage.io/v1alpha3",kind:$kind,metadata:{name:"tiering-local"},spec:.}' |
-    curl -fsS "${RBH_API_URL:-http://127.0.0.1:8080}/api/$1" \
-      -H "Authorization: Bearer $(cat "$RBH_POLICY_TOKEN_FILE")" \
-      -H 'Content-Type: application/json' --data-binary @-
+    curl -fsS "${transport[@]}" "$api/api/$1" -H 'Content-Type: application/json' --data-binary @-
 }
 
 create_tiering_resource authorization-policies AuthorizationPolicy <<'JSON'
@@ -673,8 +679,7 @@ from the running process environment.
 | `RBH_LUSTRE_MANAGED_ROOT` | Set for daemon-created Lustre mounts. Use an existing canonical directory owned by the daemon account. The daemon also needs host mount privileges. |
 | `RBH_POLICY_WRITERS_FILE` | Enables bearer-token writes. The daemon reads a JSON map of writer names to SHA-256 token digests. |
 | `RBH_TRUSTED_GATEWAY_WRITES` | Defaults to `false`. Set to `true` with a loopback daemon listener and an access-controlled gateway. Leave `RBH_POLICY_WRITERS_FILE` unset in this mode. |
-| `RBH_TRUSTED_GATEWAY_TOKEN_FILE` | In trusted gateway mode, the daemon reads a 64-digit hexadecimal token from this file. The gateway supplies the credential on forwarded requests. |
-| `RBH_TRUSTED_GATEWAY_SOCKET` | In trusted gateway mode, an absolute Unix socket path inside a directory shared exclusively with the gateway. The daemon also keeps its loopback API listener. |
+| `RBH_TRUSTED_GATEWAY_SOCKET` | In trusted gateway mode, an absolute Unix socket path inside a directory shared exclusively with the gateway. The daemon keeps its loopback listener for reads. |
 | `RBH_HSM_PRINCIPAL_FILE` | Set for actual policy execution. The daemon reads a JSON workload identity with a `serviceAccount` authorized for the requested action. |
 | `RBH_HSM_POLL_SECS` | Native HSM state polling interval in seconds for HSM-capable runtimes. Defaults to `0`, which disables the poller. |
 | `RBH_HSM_POLL_BATCH` | Native HSM state polling batch size. Defaults to `200`. |

@@ -67,9 +67,10 @@ and `RBH_CONSOLE_HTTP_HOST` to the hostname or IP operators enter in their
 browsers. Set `RBH_CONSOLE_TRUSTED_CIDR` to the operator network. Every client
 allowed by the gateway can write, and the daemon records those writes under
 `trusted-gateway`. The gateway connects over a Unix socket in a volume shared
-with the daemon and authenticates using the `console-gateway.token` file
-created at deployment. Keep `RBH_LISTEN_ADDR` on loopback and use this listener
-with the same credential for administrative REST calls.
+with the daemon. Keep `RBH_LISTEN_ADDR` on loopback for local reads. Use the
+Unix socket from the Docker host to configure governance resources. Find its
+host path with `docker inspect` by looking up the mount whose destination is
+`/run/rbh-gateway` and appending `daemon.sock` to its source directory.
 
 For a bearer-token deployment behind a separately managed HTTPS reverse proxy,
 forward `/console/` and `/api/` on the same origin to the daemon. Preserve the

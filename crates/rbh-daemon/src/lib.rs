@@ -66,16 +66,7 @@ pub async fn run() -> anyhow::Result<()> {
             writers_file.is_none(),
             "trusted gateway writes and a writer file are mutually exclusive"
         );
-        let path = std::env::var_os("RBH_TRUSTED_GATEWAY_TOKEN_FILE")
-            .context("trusted gateway writes require RBH_TRUSTED_GATEWAY_TOKEN_FILE")?;
-        let token = tokio::fs::read_to_string(path)
-            .await
-            .context("read RBH_TRUSTED_GATEWAY_TOKEN_FILE")?;
-        let writers = rbh_api::PolicyWriters::trusted_gateway(token.trim_end_matches(['\r', '\n']))
-            .map_err(anyhow::Error::msg)
-            .context("parse RBH_TRUSTED_GATEWAY_TOKEN_FILE")?;
-        tracing::info!("policy and filesystem writes use the local gateway's credential");
-        writers
+        rbh_api::PolicyWriters::default()
     } else if let Some(path) = writers_file {
         let json = tokio::fs::read_to_string(path)
             .await
@@ -506,15 +497,24 @@ pub async fn run() -> anyhow::Result<()> {
         std::env::var_os("RBH_LUSTRE_MANAGED_ROOT").map(std::path::PathBuf::from),
     )?;
     administration.restore().await?;
-    let app = rbh_api::router_with_console(state, writers.clone(), console_resources.clone(), console_dir)
-        .merge(administration.routes(writers));
+    let app = rbh_api::router_with_console(
+        state.clone(),
+        writers.clone(),
+        console_resources.clone(),
+        console_dir.clone(),
+    )
+    .merge(administration.clone().routes(writers));
 
     // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
-    let gateway_listener = if let Some(path) = gateway_socket {
-        Some(bind_gateway_socket(&path).await?)
+    let gateway = if let Some(path) = gateway_socket {
+        let writers = rbh_api::PolicyWriters::trusted_gateway();
+        let root = rbh_api::router_with_console(state, writers.clone(), console_resources.clone(), console_dir)
+            .merge(administration.routes(writers))
+            .layer(axum::Extension(rbh_api::ConsoleGateway));
+        Some((bind_gateway_socket(&path).await?, root))
     } else {
         None
     };
@@ -530,15 +530,14 @@ pub async fn run() -> anyhow::Result<()> {
     let shutdown_cancel = daemon_cancel.clone();
     let server_task = tokio::spawn(async move {
         let gateway_cancel = shutdown_cancel.clone();
-        let gateway_app = app.clone().layer(axum::Extension(rbh_api::ConsoleGateway));
         let tcp = async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move { shutdown_cancel.cancelled().await })
                 .await
         };
         let gateway = async move {
-            if let Some(listener) = gateway_listener {
-                axum::serve(listener, gateway_app)
+            if let Some((listener, app)) = gateway {
+                axum::serve(listener, app)
                     .with_graceful_shutdown(async move { gateway_cancel.cancelled().await })
                     .await?;
             }
@@ -614,7 +613,7 @@ async fn bind_gateway_socket(path: &Path) -> anyhow::Result<tokio::net::UnixList
     let listener =
         tokio::net::UnixListener::bind(path).with_context(|| format!("bind gateway socket {}", path.display()))?;
     // The socket's directory is shared exclusively with the gateway container.
-    // The gateway's worker can connect across container UIDs and still needs the writer credential.
+    // Allow the gateway's worker to connect across container UIDs.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).context("set gateway socket permissions")?;
     tracing::info!(socket = %path.display(), "console gateway socket listening");
     Ok(listener)

@@ -3,9 +3,7 @@ services:
     environment:
       RBH_TRUSTED_GATEWAY_WRITES: "true"
       RBH_POLICY_WRITERS_FILE: ""
-      RBH_TRUSTED_GATEWAY_TOKEN_FILE: /run/secrets/console_gateway_token
       RBH_TRUSTED_GATEWAY_SOCKET: /run/rbh-gateway/daemon.sock
-    secrets: [console_gateway_token]
     volumes:
       - console_gateway_run:/run/rbh-gateway
   console-gateway:
@@ -13,30 +11,14 @@ services:
     network_mode: host
     restart: unless-stopped
     depends_on: [rbh-daemon]
-    secrets: [console_gateway_token]
-    entrypoint:
-      - /bin/sh
-      - -ec
-      - |
-        RBH_CONSOLE_GATEWAY_TOKEN=$$(cat /run/secrets/console_gateway_token)
-        case "$$RBH_CONSOLE_GATEWAY_TOKEN" in
-          *[!0-9a-fA-F]*) exit 1 ;;
-        esac
-        test "$${#RBH_CONSOLE_GATEWAY_TOKEN}" -eq 64
-        export RBH_CONSOLE_GATEWAY_TOKEN
-        exec /docker-entrypoint.sh nginx -g 'daemon off;'
     environment:
       RBH_CONSOLE_HTTP_LISTEN: "${RBH_CONSOLE_HTTP_LISTEN:?set the console's private IP and port}"
       RBH_CONSOLE_HTTP_HOST: "${RBH_CONSOLE_HTTP_HOST:?set the console's hostname or IP}"
       RBH_CONSOLE_TRUSTED_CIDR: "${RBH_CONSOLE_TRUSTED_CIDR:?set the operator network CIDR}"
-      NGINX_ENVSUBST_FILTER: '^RBH_CONSOLE_(HTTP_LISTEN|HTTP_HOST|TRUSTED_CIDR|GATEWAY_TOKEN)$$'
+      NGINX_ENVSUBST_FILTER: '^RBH_CONSOLE_(HTTP_LISTEN|HTTP_HOST|TRUSTED_CIDR)$$'
     volumes:
       - ./console.conf.template:/etc/nginx/templates/default.conf.template:ro
       - console_gateway_run:/run/rbh-gateway:ro
 
 volumes:
   console_gateway_run:
-
-secrets:
-  console_gateway_token:
-    file: ${RBH_CONTAINER_CONFIG_DIR:?set the absolute path to the daemon configuration directory}/console-gateway.token

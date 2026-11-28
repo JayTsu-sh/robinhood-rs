@@ -165,12 +165,32 @@ async fn console_registration_is_authorized_and_restored_without_mounting() {
     let view = server.get(endpoint).await.json::<Value>();
     assert_eq!(view["resources"][0]["id"], id.as_str());
     assert_eq!(view["resources"][0]["desiredMounted"], false);
+    assert_eq!(view["resources"][0]["unmountPending"], false);
     assert!(view["resources"][0].get("lastMountError").is_none());
     assert!(next.contains(&id));
     assert_eq!(
         entries.get_filesystem(&id).await.unwrap().unwrap().mount_path,
         mount_path
     );
+
+    sqlx::query(
+        "UPDATE console_lustre_resources SET metadata = JSON_SET(metadata, '$.unmountPending', JSON_EXTRACT('true', '$'))
+         WHERE observer_id = ? AND filesystem_id = ?",
+    )
+    .bind(observer.as_bytes())
+    .bind(id.as_str())
+    .execute(entries.pool())
+    .await
+    .unwrap();
+    let restarted = admin(resources());
+    restarted.restore().await.unwrap();
+    let server = TestServer::builder()
+        .build(restarted.routes(PolicyWriters::default()))
+        .unwrap();
+    let view = server.get(endpoint).await.json::<Value>();
+    assert_eq!(view["resources"][0]["unmountPending"], false);
+    assert_eq!(view["resources"][0]["desiredMounted"], false);
+    assert_eq!(view["resources"][0]["mounted"], false);
 }
 
 #[tokio::test]

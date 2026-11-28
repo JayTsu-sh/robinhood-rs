@@ -17,15 +17,12 @@ pub struct PolicyWriters {
 }
 
 impl PolicyWriters {
-    /// Configure a writer credential shared by the daemon and the trusted gateway.
-    pub fn trusted_gateway(token: &str) -> Result<Self, String> {
-        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err("expected a 64-digit hexadecimal gateway token".into());
-        }
-        Ok(Self {
-            digests: Arc::new(vec![("trusted-gateway".into(), Sha256::digest(token).into())]),
+    /// Allow same-origin writes on the private Unix listener used by the console gateway.
+    pub fn trusted_gateway() -> Self {
+        Self {
             trusted_gateway: true,
-        })
+            ..Self::default()
+        }
     }
 
     /// Parse a principal-to-hex-SHA256 map from trusted server configuration.
@@ -55,8 +52,12 @@ impl PolicyWriters {
     }
 
     pub(crate) fn authorize(&self, headers: &HeaderMap) -> Result<&str, ApiError> {
-        if self.trusted_gateway && !is_same_origin_or_non_browser(headers) {
-            return Err(ApiError::Unauthorized);
+        if self.trusted_gateway {
+            return if is_same_origin_or_non_browser(headers) {
+                Ok("trusted-gateway")
+            } else {
+                Err(ApiError::Unauthorized)
+            };
         }
         let mut values = headers.get_all(AUTHORIZATION).iter();
         let supplied = values.next().and_then(|header| header.to_str().ok());
@@ -113,11 +114,8 @@ mod tests {
 
     #[test]
     fn trusted_gateway_accepts_same_origin_and_non_browser_writes() {
-        let token = "a".repeat(64);
-        let writers = PolicyWriters::trusted_gateway(&token).unwrap();
+        let writers = PolicyWriters::trusted_gateway();
         let mut headers = HeaderMap::new();
-        assert!(writers.authorize(&headers).is_err());
-        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         assert_eq!(writers.authorize(&headers).unwrap(), "trusted-gateway");
         headers.insert(HOST, HeaderValue::from_static("console.local:8080"));
         headers.insert(ORIGIN, HeaderValue::from_static("http://console.local:8080"));

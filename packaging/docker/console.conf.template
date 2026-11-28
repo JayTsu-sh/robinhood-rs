@@ -1,4 +1,4 @@
-# Publish console operations. Use the daemon's loopback listener for the full API.
+# Publish console operations from the daemon's private Unix socket.
 map "$request_method:$uri" $rbh_console_api_allowed {
     default 0;
     ~^(GET|HEAD):/api/(health|filesystems|policies|runs|action-contracts|selectors|execution-profiles|authorization-policies|approval-policies|system-safety-policies)(/|$) 1;
@@ -41,7 +41,6 @@ server {
         if ($rbh_console_api_allowed = 0) { return 405; }
         proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Authorization "Bearer ${RBH_CONSOLE_GATEWAY_TOKEN}";
         proxy_pass http://unix:/run/rbh-gateway/daemon.sock:/api/;
     }
 

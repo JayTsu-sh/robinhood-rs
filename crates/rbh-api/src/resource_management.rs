@@ -114,6 +114,8 @@ struct Registration {
     options: Vec<String>,
     auto_mount: bool,
     desired_mounted: bool,
+    #[serde(default)]
+    unmount_pending: bool,
     removed: bool,
     tiers: BTreeMap<String, Tier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,6 +245,12 @@ impl ResourceAdministration {
                     source,
                 }
             })?;
+            if registration.owner == Owner::Daemon && registration.unmount_pending {
+                if let Err(error) = self.finish_unmount(&mut registration).await {
+                    tracing::warn!(filesystem = %registration.id, ?error, "could not finish pending Lustre unmount");
+                }
+                continue;
+            }
             if registration.owner == Owner::Daemon
                 && registration.auto_mount
                 && registration.desired_mounted
@@ -439,6 +447,46 @@ impl ResourceAdministration {
         Ok(())
     }
 
+    async fn finish_unmount(&self, resource: &mut Registration) -> Result<(), ApiError> {
+        let path = self.registered_mount_path(resource)?;
+        let mut tx = self.app.entry_store.pool().begin().await.map_err(database_error)?;
+        let scans = self.require_idle(&resource.id, false, &mut tx).await?;
+        let mounts = read_mounts()?;
+        let is_mounted = mounted(resource, &mounts);
+        if !is_mounted && mounts.contains_key(&path) {
+            return Err(bad("挂载点来源已变化"));
+        }
+        if is_mounted {
+            let previous = resource.clone();
+            if !resource.unmount_pending {
+                // Commit intent independently of the guard transaction so startup can finish it.
+                resource.desired_mounted = false;
+                resource.unmount_pending = true;
+                self.save(resource).await?;
+            }
+            let mut command = Command::new("/usr/bin/umount");
+            command.args(["--no-canonicalize", "--"]).arg(path);
+            if let Err(error) = execute(command).await
+                && mounted(resource, &read_mounts()?)
+            {
+                // A failed fresh request leaves the previous auto-mount intent in place.
+                if !previous.unmount_pending {
+                    self.save(&previous).await?;
+                    *resource = previous;
+                }
+                return Err(error);
+            }
+        }
+        resource.desired_mounted = false;
+        resource.unmount_pending = false;
+        resource.last_mount_error = None;
+        self.write_registration(resource, &mut *tx).await?;
+        tx.commit().await.map_err(database_error)?;
+        drop(scans);
+        self.observations.management_changed(Some(resource.id.clone()));
+        Ok(())
+    }
+
     async fn require_idle(
         &self, id: &FileSystemId, removing: bool, tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     ) -> Result<MutexGuard<'_, HashMap<String, ScanRecord>>, ApiError> {
@@ -509,6 +557,7 @@ async fn list(State(admin): State<ResourceAdministration>) -> Result<impl IntoRe
                 options: Vec::new(),
                 auto_mount: false,
                 desired_mounted: false,
+                unmount_pending: false,
                 removed: false,
                 tiers: BTreeMap::new(),
                 last_mount_error: None,
@@ -668,6 +717,7 @@ async fn change(
                     options: Vec::new(),
                     auto_mount: false,
                     desired_mounted: false,
+                    unmount_pending: false,
                     removed: false,
                     tiers: BTreeMap::new(),
                     last_mount_error: None,
@@ -697,6 +747,7 @@ async fn change(
         }
         Change::Mount if resource.owner == Owner::Daemon => {
             resource.desired_mounted = true;
+            resource.unmount_pending = false;
             admin.save(&resource).await?;
             admin.mount_and_record(&mut resource).await?;
             admin.start_baseline_if_mounted(&resource).await?;
@@ -704,32 +755,7 @@ async fn change(
         Change::Unmount if resource.owner == Owner::Daemon => {
             tokio::spawn(async move {
                 let _change = change_guard;
-                let path = admin.registered_mount_path(&resource)?;
-                let mut tx = admin.app.entry_store.pool().begin().await.map_err(database_error)?;
-                let scans = admin.require_idle(&resource.id, false, &mut tx).await?;
-                let mounts = read_mounts()?;
-                let is_mounted = mounted(&resource, &mounts);
-                if !is_mounted && mounts.contains_key(&resource.path) {
-                    return Err(bad("挂载点来源已变化"));
-                }
-
-                // Record the operator's intent before changing the mount. A process interruption
-                // after a successful unmount cannot re-arm automatic restoration.
-                let previous = resource.clone();
-                resource.desired_mounted = false;
-                resource.last_mount_error = None;
-                admin.save(&resource).await?;
-                if is_mounted {
-                    let mut command = Command::new("/usr/bin/umount");
-                    command.args(["--no-canonicalize", "--"]).arg(path);
-                    if let Err(error) = execute(command).await {
-                        admin.save(&previous).await?;
-                        return Err(error);
-                    }
-                }
-                tx.commit().await.map_err(database_error)?;
-                drop(scans);
-                admin.observations.management_changed(Some(resource.id.clone()));
+                admin.finish_unmount(&mut resource).await?;
                 admin
                     .observations
                     .refresh(Some(&resource.id))
@@ -878,6 +904,7 @@ async fn registration(
             options,
             auto_mount,
             desired_mounted,
+            unmount_pending: false,
             removed: false,
             tiers: BTreeMap::new(),
             last_mount_error: None,
@@ -924,6 +951,10 @@ fn read_mounts() -> Result<BTreeMap<PathBuf, Option<String>>, ApiError> {
             Some((PathBuf::from(path), source))
         })
         .collect())
+}
+
+pub(crate) fn registered_mount_present(path: &Path, source: &str) -> Result<bool, ApiError> {
+    Ok(read_mounts()?.get(path).and_then(Option::as_deref) == Some(source))
 }
 
 fn mounted(resource: &Registration, mounts: &BTreeMap<PathBuf, Option<String>>) -> bool {

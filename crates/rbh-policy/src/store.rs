@@ -152,7 +152,8 @@ impl PolicyStore {
             .insert(filesystem.clone(), source);
     }
 
-    fn console_mount_source(&self, filesystem: &FileSystemId) -> Option<String> {
+    /// Expected mount source for a registration managed by the console.
+    pub fn console_mount_source(&self, filesystem: &FileSystemId) -> Option<String> {
         self.console_mount_sources
             .read()
             .expect("console mount sources lock")
@@ -160,8 +161,7 @@ impl PolicyStore {
             .cloned()
     }
 
-    /// Check the live mount for a console registration.
-    pub async fn console_mount_matches(&self, config: &FileSystemConfig) -> bool {
+    async fn console_mount_matches(&self, config: &FileSystemConfig) -> bool {
         let Some(source) = self.console_mount_source(&config.id) else {
             return true;
         };
