@@ -271,6 +271,61 @@ async fn operation_history_filters_beyond_one_hundred_rows_and_refreshes_layout_
     let row = response.json::<Value>();
     assert_eq!(row["state"], "finished");
     assert_eq!(row["hasPendingOperations"], true);
+    assert_eq!(row["operationResults"]["matchedCount"], 103);
+    assert_eq!(row["operationResults"]["pendingCount"], 1);
+    assert_eq!(row["operationResults"]["completedLogicalBytes"], "909727124728840293");
+    assert_eq!(
+        row["operationResults"]["byState"],
+        json!({"completed": 101, "failed": 1, "unknown": 1})
+    );
+
+    let response = server.get(&format!("{path}/summary?exceptionsOnly=true&limit=1")).await;
+    response.assert_status_ok();
+    let summary = response.json::<Value>();
+    assert_eq!(summary["matchedCount"], 2);
+    assert_eq!(
+        summary["byReason"],
+        json!([
+            {"reason": "layout_swap_failed", "count": 1, "byState": {"failed": 1}},
+            {"reason": "migration_reconcile_pending", "count": 1, "byState": {"unknown": 1}}
+        ])
+    );
+
+    let report_url = format!("{detail}/reports/run");
+    let response = server.get(&report_url).await;
+    response.assert_status_ok();
+    assert_eq!(
+        response.header("content-disposition"),
+        format!("attachment; filename=\"run-{run}.json\"")
+    );
+    let report = response.json::<Value>();
+    assert_eq!(report["scope"]["coverage"], "all_matching_operations");
+    assert_eq!(report["run"]["policyName"], name);
+    assert_eq!(report["policyRevision"]["revisionExact"], "1");
+    assert_eq!(report["policyRevision"]["definition"]["metadata"]["name"], name);
+    assert_eq!(report["operations"].as_array().unwrap().len(), 103);
+    assert_eq!(report["operations"][100]["completionEvidence"], evidence);
+    assert_eq!(report["operations"][102]["state"], "unknown");
+    assert!(report["operations"][102]["finishedAt"].is_null());
+    assert!(report["operations"][102].get("path").is_none());
+    assert!(report["operations"][102].get("retryCount").is_none());
+
+    let exception_url = format!(
+        "{detail}/reports/exceptions?state=failed&reason=swap&fid=0x200000401%3A0x66%3A0x0&afterId={}&limit=1",
+        u64::MAX
+    );
+    let response = server.get(&exception_url).await;
+    response.assert_status_ok();
+    let report = response.json::<Value>();
+    assert_eq!(
+        report["scope"]["filters"],
+        json!({
+            "state":"failed", "reasonContains":"swap", "fid":"[0x200000401:0x66:0x0]", "exceptionsOnly":true
+        })
+    );
+    assert_eq!(report["operationResults"]["matchedCount"], 1);
+    assert_eq!(report["operations"].as_array().unwrap().len(), 1);
+    assert_eq!(report["operations"][0]["state"], "failed");
     sqlx::query(
         "UPDATE rev8_operations SET state = 'completed', reason = NULL, completion_evidence = ?,
         checked_at = '2026-11-28 06:15:00.000000' WHERE run_id = ? AND state = 'unknown'",
@@ -283,10 +338,83 @@ async fn operation_history_filters_beyond_one_hundred_rows_and_refreshes_layout_
     let response = server.get(&detail).await;
     response.assert_status_ok();
     assert_eq!(response.json::<Value>()["hasPendingOperations"], false);
+    let response = server.get(&format!("{path}/summary?exceptionsOnly=true")).await;
+    response.assert_status_ok();
+    assert_eq!(
+        response.json::<Value>()["byReason"],
+        json!([{"reason": "layout_swap_failed", "count": 1, "byState": {"failed": 1}}])
+    );
+    let response = server.get(&report_url).await;
+    response.assert_status_ok();
+    let report = response.json::<Value>();
+    assert_eq!(report["operationResults"]["pendingCount"], 0);
+    assert_eq!(
+        report["operationResults"]["completedLogicalBytes"],
+        "918734323983581286"
+    );
+    assert_eq!(report["operations"][102]["completionEvidence"], evidence);
+    let response = server.get(&format!("{detail}/reports/exceptions")).await;
+    response.assert_status_ok();
+    assert_eq!(response.json::<Value>()["operations"].as_array().unwrap().len(), 1);
     let response = server.get(&format!("{path}?fid=0x200000401%3A0x67%3A0x0")).await;
     response.assert_status_ok();
     let row = &response.json::<Value>()["items"][0];
     assert_eq!(row["state"], "completed");
     assert_eq!(row["completionEvidence"], evidence);
     assert_eq!(row["lastCheckedAt"], "2026-11-28T06:15:00Z");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MariaDB"]
+async fn exception_report_covers_more_than_one_page_and_combines_the_same_reason_across_states() {
+    let (entries, server, policy, name) = history_fixture("anomalies").await;
+    let run = insert_run(&entries, policy, 1, "finished", None).await;
+    let mut tx = entries.pool().begin().await.unwrap();
+    for oid in 1..=103 {
+        let (state, reason) = match oid {
+            101 => ("deferred", Some("fid_missing")),
+            102 => ("deferred", Some("FID_missing")),
+            103 => ("unknown", None),
+            _ => ("failed", Some("fid_missing")),
+        };
+        sqlx::query(
+            "INSERT INTO rev8_operations (run_id, filesystem, fid, action, state, reason, size)
+             VALUES (?, ?, ?, 'lustre.pool_migrate', ?, ?, 1)",
+        )
+        .bind(run)
+        .bind(&name)
+        .bind(fid_codec::encode(&LuFid::new(0x200000401, oid, 0)).to_vec())
+        .bind(state)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let base = format!("/api/runs/{run}");
+    let response = server
+        .get(&format!(
+            "{base}/operations/summary?exceptionsOnly=true&afterId=100&limit=1"
+        ))
+        .await;
+    response.assert_status_ok();
+    let summary = response.json::<Value>();
+    assert_eq!(summary["matchedCount"], 103);
+    assert_eq!(summary["byState"], json!({"failed": 100, "deferred": 2, "unknown": 1}));
+    assert_eq!(
+        summary["byReason"],
+        json!([
+            {"reason": null, "count": 1, "byState": {"unknown": 1}},
+            {"reason": "FID_missing", "count": 1, "byState": {"deferred": 1}},
+            {"reason": "fid_missing", "count": 101, "byState": {"failed": 100, "deferred": 1}}
+        ])
+    );
+    let response = server.get(&format!("{base}/reports/exceptions")).await;
+    response.assert_status_ok();
+    let report = response.json::<Value>();
+    assert_eq!(report["operationResults"], summary);
+    assert_eq!(report["operations"].as_array().unwrap().len(), 103);
+    assert_eq!(report["operations"][102]["fid"], "[0x200000401:0x67:0x0]");
+    assert!(report["operations"][102]["reason"].is_null());
 }

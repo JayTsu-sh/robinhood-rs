@@ -33,6 +33,12 @@ const columns: ProColumns<RunHistory>[] = [
       <Typography.Text type="secondary">{logicalBytes(row.estimatedBytesExact)}</Typography.Text>
     </Flex>
   ) },
+  { title: '完成 / 异常 / 待核对', width: 160, render: (_, { operationResults }) => {
+    if (!operationResults) return '—';
+    const { byState, pendingCount } = operationResults;
+    const counts = [byState.completed ?? 0, (byState.failed ?? 0) + (byState.deferred ?? 0) + (byState.unknown ?? 0), pendingCount];
+    return counts.map((count) => count.toLocaleString('zh-CN')).join(' / ');
+  } },
 ];
 
 function RunFilterForm({
@@ -106,7 +112,7 @@ export default function RunHistoryTable({ policyId }: { policyId?: string }) {
       <RunFilterForm key={filterKey} filter={filter} policyId={policyId} apply={apply} />
       <CursorResults key={`${filterKey}/${sequence}`} load={load} refreshable>
         {(rows) => <ProTable columns={columns} rowKey="idExact" dataSource={rows} search={false}
-          toolBarRender={false} pagination={false} scroll={{ x: 1065 }}
+          toolBarRender={false} pagination={false} scroll={{ x: 1225 }}
           locale={{ emptyText: <Empty className="console-empty" image={Empty.PRESENTED_IMAGE_SIMPLE}
             description={activeFilter ? '没有符合筛选条件的运行' : '暂无执行记录'} /> }} />}
       </CursorResults>

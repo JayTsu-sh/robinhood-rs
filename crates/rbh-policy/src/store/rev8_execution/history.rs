@@ -3,12 +3,16 @@
 use chrono::{DateTime, Utc};
 use lustre_api::LuFid;
 use rbh_entry_store::fid_codec;
-use serde::{Deserialize, Serialize};
-use sqlx::{MySql, QueryBuilder};
+use serde::{Deserialize, Serialize, de::IntoDeserializer};
+use sqlx::{MySql, MySqlPool, QueryBuilder, Transaction};
 
 use super::{OPERATION_FIELDS, PolicyStore, RUN_FIELDS, Rev8Operation, Rev8Run};
 use crate::PolicyError;
 use crate::store::{REV8_POLICY_FIELDS, Rev8PolicyRow};
+
+mod reports;
+use reports::populate_run_results;
+pub use reports::{OperationResults, OperationSummary, RunReportSnapshot};
 
 const PINNED_RUN: &str = "FROM rev8_runs r JOIN rev8_policy_revisions rev USING (policy_id, revision)";
 const POLICY_NAME: &str = "CAST(JSON_VALUE(definition, '$.metadata.name') AS CHAR CHARACTER SET utf8mb4)";
@@ -60,11 +64,20 @@ pub struct RunHistory {
     pub activation_mode: String,
     pub policy_mode: String,
     pub estimated_bytes_exact: Option<String>,
-    #[sqlx(default)]
+    #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_pending_operations: Option<bool>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_results: Option<OperationResults>,
 }
 
+impl RunHistory {
+    fn record_results(&mut self, results: OperationResults) {
+        self.has_pending_operations = Some(results.pending_count > 0);
+        self.operation_results = Some(results);
+    }
+}
 #[derive(Debug, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
@@ -99,7 +112,7 @@ pub struct HistoryOperation {
     pub last_checked_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
 pub enum OperationState {
@@ -111,14 +124,67 @@ pub enum OperationState {
     Deferred,
 }
 
-#[derive(Debug)]
-pub struct OperationSearch {
+impl OperationState {
+    fn is_exception(self) -> bool {
+        matches!(self, Self::Failed | Self::Deferred | Self::Unknown)
+    }
+}
+
+impl TryFrom<String> for OperationState {
+    type Error = serde::de::value::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::deserialize(value.into_deserializer())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationFilter {
     pub state: Option<OperationState>,
+    #[serde(rename = "reasonContains")]
     pub reason: Option<String>,
     pub exceptions_only: bool,
     pub fid: Option<LuFid>,
+}
+
+impl OperationFilter {
+    fn constrain<'a>(&'a self, query: &mut QueryBuilder<'a, MySql>) {
+        if self.exceptions_only {
+            query.push(" AND o.state IN ('failed','deferred','unknown')");
+        }
+        if let Some(state) = self.state {
+            query.push(" AND o.state = ").push_bind(state);
+        }
+        if let Some(reason) = &self.reason {
+            query.push(" AND LOCATE(").push_bind(reason).push(", o.reason) > 0");
+        }
+        if let Some(fid) = self.fid {
+            query.push(" AND o.fid = ").push_bind(fid_codec::encode(&fid).to_vec());
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct OperationSearch {
+    pub filter: OperationFilter,
     pub after_id: Option<u64>,
     pub limit: u16,
+}
+
+fn operation_rows(run: u64, filter: &OperationFilter, after_id: Option<u64>, limit: u32) -> QueryBuilder<'_, MySql> {
+    let mut query = QueryBuilder::new(format!(
+        "SELECT {OPERATION_FIELDS}, CAST(o.id AS CHAR) AS id_exact, CAST(o.size AS CHAR) AS size_exact,
+            o.finished_at, o.checked_at AS last_checked_at
+         FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id WHERE o.run_id = "
+    ));
+    query.push_bind(run);
+    filter.constrain(&mut query);
+    if let Some(after_id) = after_id {
+        query.push(" AND o.id > ").push_bind(after_id);
+    }
+    query.push(" ORDER BY o.id LIMIT ").push_bind(limit);
+    query
 }
 
 #[derive(Debug, Serialize)]
@@ -216,61 +282,31 @@ impl PolicyStore {
         query
             .push(" ORDER BY r.id DESC LIMIT ")
             .push_bind(u32::from(filter.limit) + 1);
-        let rows = query.build_query_as().fetch_all(&self.pool).await?;
-        Ok(HistoryPage::from_lookahead(rows, filter.limit, |row: &RunHistory| {
-            row.run.id
-        }))
+        let mut tx = read_snapshot(&self.pool).await?;
+        let rows = query.build_query_as().fetch_all(&mut *tx).await?;
+        let mut page = HistoryPage::from_lookahead(rows, filter.limit, |row: &RunHistory| row.run.id);
+        populate_run_results(&mut tx, &mut page.items).await?;
+        tx.commit().await?;
+        Ok(page)
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn rev8_run_detail(&self, id: u64) -> Result<Option<RunHistory>, PolicyError> {
-        Ok(sqlx::query_as(&format!(
-            "SELECT {RUN_FIELDS}, {POLICY_NAME} AS policy_name, {RUN_HISTORY_FIELDS},
-                EXISTS(SELECT 1 FROM rev8_operations o WHERE o.run_id = r.id
-                    AND o.state IN ('submitting','submitted','unknown')) AS has_pending_operations
-             {PINNED_RUN} WHERE r.id = ?"
-        ))
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?)
+        let mut tx = read_snapshot(&self.pool).await?;
+        let mut run = pinned_run(id, &mut *tx).await?;
+        populate_run_results(&mut tx, run.as_mut_slice()).await?;
+        tx.commit().await?;
+        Ok(run)
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn search_rev8_operations(
         &self, run: u64, filter: OperationSearch,
     ) -> Result<Option<HistoryPage<HistoryOperation>>, PolicyError> {
-        let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM rev8_runs WHERE id = ?)")
-            .bind(run)
-            .fetch_one(&self.pool)
-            .await?;
-        if !exists {
+        if !run_exists(run, &self.pool).await? {
             return Ok(None);
         }
-
-        let mut query = QueryBuilder::<MySql>::new(format!(
-            "SELECT {OPERATION_FIELDS}, CAST(o.id AS CHAR) AS id_exact, CAST(o.size AS CHAR) AS size_exact,
-                o.finished_at, o.checked_at AS last_checked_at
-             FROM rev8_operations o JOIN rev8_runs r ON r.id = o.run_id WHERE o.run_id = "
-        ));
-        query.push_bind(run);
-        if filter.exceptions_only {
-            query.push(" AND o.state IN ('failed','deferred','unknown')");
-        }
-        if let Some(state) = filter.state {
-            query.push(" AND o.state = ").push_bind(state);
-        }
-        if let Some(reason) = filter.reason {
-            query.push(" AND LOCATE(").push_bind(reason).push(", o.reason) > 0");
-        }
-        if let Some(fid) = filter.fid {
-            query.push(" AND o.fid = ").push_bind(fid_codec::encode(&fid).to_vec());
-        }
-        if let Some(after_id) = filter.after_id {
-            query.push(" AND o.id > ").push_bind(after_id);
-        }
-        query
-            .push(" ORDER BY o.id LIMIT ")
-            .push_bind(u32::from(filter.limit) + 1);
+        let mut query = operation_rows(run, &filter.filter, filter.after_id, u32::from(filter.limit) + 1);
         let rows = query.build_query_as().fetch_all(&self.pool).await?;
         Ok(Some(HistoryPage::from_lookahead(
             rows,
@@ -278,4 +314,36 @@ impl PolicyStore {
             |row: &HistoryOperation| row.operation.id,
         )))
     }
+}
+
+async fn pinned_run(id: u64, executor: impl sqlx::MySqlExecutor<'_>) -> Result<Option<RunHistory>, PolicyError> {
+    Ok(sqlx::query_as(&format!(
+        "SELECT {RUN_FIELDS}, {POLICY_NAME} AS policy_name, {RUN_HISTORY_FIELDS} {PINNED_RUN} WHERE r.id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(executor)
+    .await?)
+}
+
+async fn run_exists(run: u64, pool: &sqlx::MySqlPool) -> Result<bool, PolicyError> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM rev8_runs WHERE id = ?)")
+            .bind(run)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+async fn read_snapshot(pool: &MySqlPool) -> Result<Transaction<'static, MySql>, PolicyError> {
+    let mut connection = pool.acquire().await?;
+    // A cancelled setup must not leave next-transaction settings on a pooled connection.
+    connection.close_on_drop();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *connection)
+        .await?;
+    Ok(Transaction::begin(
+        connection,
+        Some("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY".into()),
+    )
+    .await?)
 }

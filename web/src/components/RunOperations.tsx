@@ -1,10 +1,13 @@
 import { ProTable, type ProColumns } from '@ant-design/pro-components';
 import { useSearchParams } from '@umijs/max';
 import { Button, Descriptions, Drawer, Empty, Flex, Input, Select, Typography } from 'antd';
-import { useCallback, useMemo, useState } from 'react';
+import { Fragment, useCallback, useMemo, useState } from 'react';
 import CursorResults from '@/components/CursorResults';
 import { ExecutionStatus, executionTime, logicalBytes, operationStateOptions } from '@/components/ExecutionStatus';
-import { executionFilters, listOperations, type FileOperation, type OperationFilters } from '@/services/executions';
+import { FilteredOperationResults, ReportDownload } from '@/components/RunResults';
+import {
+  executionFilters, listOperations, operationFilters, operationStateFilterKey, type FileOperation, type OperationFilters,
+} from '@/services/executions';
 
 function OperationEvidence({ row, close }: { row: FileOperation | undefined; close: () => void }) {
   const evidence = row?.completionEvidence;
@@ -82,11 +85,8 @@ export default function RunOperations({ id, refreshKey, exceptionsOnly }: { id: 
   const [params, setParams] = useSearchParams();
   const [sequence, setSequence] = useState(0);
   const [selected, setSelected] = useState<string>();
-  const fid = params.get('fid') ?? undefined;
-  const stateKey = exceptionsOnly ? 'exceptionState' : 'operationState';
-  const state = params.get(stateKey) ?? undefined;
-  const reason = params.get('reason') ?? undefined;
-  const filter = useMemo<OperationFilters>(() => ({ fid, state, reason, exceptionsOnly }), [fid, state, reason, exceptionsOnly]);
+  const filter = useMemo(() => operationFilters(params, exceptionsOnly), [params, exceptionsOnly]);
+  const { fid, state, reason } = filter;
   const load = useCallback(
     (cursor: string | undefined, signal: AbortSignal) => listOperations(id, filter, cursor, signal),
     [id, filter],
@@ -107,23 +107,30 @@ export default function RunOperations({ id, refreshKey, exceptionsOnly }: { id: 
   ];
 
   function apply(values: OperationFilters) {
-    setParams(executionFilters(params, { fid: values.fid, [stateKey]: values.state, reason: values.reason }));
+    setParams(executionFilters(params, {
+      fid: values.fid, [operationStateFilterKey(exceptionsOnly)]: values.state, reason: values.reason,
+    }));
     setSequence((value) => value + 1);
   }
 
   return (
     <div className="console-table">
       <OperationFilterForm key={filterKey} filter={filter} apply={apply} />
-      <CursorResults key={`${filterKey}/${sequence}`} load={load} refreshKey={refreshKey}>
-        {(rows) => <>
-          <ProTable columns={columns} rowKey="idExact" dataSource={rows} search={false}
-            toolBarRender={false} pagination={false} scroll={{ x: 1083 }}
-            locale={{ emptyText: <Empty className="console-empty" image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description={fid || state || reason ? '没有符合筛选条件的操作' :
-                exceptionsOnly ? '暂无异常操作' : '暂无逐文件操作'} /> }} />
-          <OperationEvidence row={rows.find((row) => row.idExact === selected)} close={() => setSelected(undefined)} />
-        </>}
-      </CursorResults>
+      <Fragment key={`${filterKey}/${sequence}`}>
+        <FilteredOperationResults id={id} filters={filter} refreshKey={refreshKey}
+          title={exceptionsOnly ? '异常原因汇总' : '操作汇总'} showReasons={exceptionsOnly}
+          action={exceptionsOnly && <ReportDownload id={id} filters={filter} />} />
+        <CursorResults load={load} refreshKey={refreshKey}>
+          {(rows) => <>
+            <ProTable columns={columns} rowKey="idExact" dataSource={rows} search={false}
+              toolBarRender={false} pagination={false} scroll={{ x: 1083 }}
+              locale={{ emptyText: <Empty className="console-empty" image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description={fid || state || reason ? '没有符合筛选条件的操作' :
+                  exceptionsOnly ? '暂无异常操作' : '暂无逐文件操作'} /> }} />
+            <OperationEvidence row={rows.find((row) => row.idExact === selected)} close={() => setSelected(undefined)} />
+          </>}
+        </CursorResults>
+      </Fragment>
     </div>
   );
 }

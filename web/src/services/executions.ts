@@ -1,4 +1,5 @@
 import { request } from '@umijs/max';
+import type { DirectoryScopeSummary } from './policyPreview';
 
 export interface LatestRun {
   id: string;
@@ -21,10 +22,23 @@ export interface RunHistory {
   estimatedBytesExact: string | null;
   requestedBy: string | null;
   createdAt: string;
+  operationResults?: OperationResults;
 }
 
 export interface RunDetail extends RunHistory {
   hasPendingOperations: boolean;
+  directoryScope?: DirectoryScopeSummary;
+}
+
+export interface OperationResults {
+  matchedCount: number;
+  pendingCount: number;
+  completedLogicalBytes: string;
+  byState: Record<string, number>;
+}
+
+export interface OperationSummary extends OperationResults {
+  byReason: { reason: string | null; count: number; byState: Record<string, number> }[];
 }
 
 export interface FileOperation {
@@ -78,6 +92,34 @@ export function listOperations(id: string, filters: OperationFilters, afterId: s
   return request<CursorPage<FileOperation>>(`/api/runs/${encodeURIComponent(id)}/operations`, {
     ...readOptions, params: { ...filters, afterId }, signal,
   });
+}
+
+export function summarizeOperations(id: string, filters: OperationFilters, signal: AbortSignal) {
+  return request<OperationSummary>(`/api/runs/${encodeURIComponent(id)}/operations/summary`, {
+    ...readOptions, params: filters, signal,
+  });
+}
+
+export function runReportUrl(id: string, { state, reason, fid, exceptionsOnly }: OperationFilters) {
+  const params = new URLSearchParams();
+  if (state) params.set('state', state);
+  if (reason) params.set('reason', reason);
+  if (fid) params.set('fid', fid);
+  const path = `/api/runs/${encodeURIComponent(id)}/reports/${exceptionsOnly ? 'exceptions' : 'run'}`;
+  return params.size ? `${path}?${params}` : path;
+}
+
+export function operationStateFilterKey(exceptionsOnly?: true) {
+  return exceptionsOnly ? 'exceptionState' : 'operationState';
+}
+
+export function operationFilters(params: URLSearchParams, exceptionsOnly?: true): OperationFilters {
+  return {
+    fid: params.get('fid') ?? undefined,
+    reason: params.get('reason') ?? undefined,
+    state: params.get(operationStateFilterKey(exceptionsOnly)) ?? undefined,
+    exceptionsOnly,
+  };
 }
 
 export const runDetailsPath = (id: string) => `/runs/${id}`;

@@ -125,6 +125,14 @@ test('the daemon and console run an enabled policy and preserve excluded Lustre 
   const run = await readRun(request, manualRun);
   expect(run).toMatchObject({ revisionExact: '2', policyIdExact: policy, policyName: label });
   expect(run.requestedBy).not.toBeNull();
+  expect(run.directoryScope).toMatchObject({
+    excludedByReason: { link_outside_scope: 1, link_in_excluded_subtree: 1 },
+  });
+  const reportResponse = await request.get(`/api/runs/${manualRun}/reports/run`);
+  expect(reportResponse.ok()).toBe(true);
+  const report = await reportResponse.json();
+  expect(report.run.directoryScope).toEqual(run.directoryScope);
+  expect(report.operationResults).toMatchObject({ matchedCount: 4, completedLogicalBytes: '100' });
   const operations = await (await request.get(`/api/runs/${manualRun}/operations`)).json();
   expect(operations.items).toHaveLength(4);
   const byFid = Object.fromEntries(operations.items.map((operation: { fid: string }) => [operation.fid, operation]));

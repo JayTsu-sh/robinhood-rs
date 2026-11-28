@@ -1,29 +1,57 @@
 import { Link, useParams, useSearchParams } from '@umijs/max';
 import { Alert, Card, Descriptions, Flex, Tabs } from 'antd';
-import { useCallback, useState } from 'react';
-import { ExecutionStatus, executionMode, executionTime, executionTrigger, logicalBytes } from '@/components/ExecutionStatus';
+import { useCallback, useMemo, useState } from 'react';
+import { ExecutionStatus, executionMode, executionTime, executionTrigger, logicalBytes, operationStateOptions } from '@/components/ExecutionStatus';
 import InventoryPage from '@/components/InventoryPage';
+import PolicyJson from '@/components/PolicyJson';
 import RunOperations from '@/components/RunOperations';
-import { executionFilters, getRun, runHistoryPath, type RunDetail } from '@/services/executions';
+import { FilteredOperationResults, ReportDownload, RunDirectoryScope, RunResults } from '@/components/RunResults';
+import { executionFilters, getRun, operationFilters, runHistoryPath, type RunDetail } from '@/services/executions';
 import { policyDetailsPath } from '@/services/policies';
 import { useInventory } from '@/services/useInventory';
 
 function RunOverview({ run }: { run: RunDetail }) {
   const mode = run.policyMode === 'one_shot' ? '一次性' : run.policyMode === 'continuous' ? '持续运行' : run.policyMode;
   return (
-    <Card>
-      <Descriptions column={{ xs: 1, md: 2 }} items={[
-        { key: 'reason', label: '调度原因', children: <span className="console-mono">{run.reason ?? '—'}</span> },
-        { key: 'trigger', label: '触发来源', children: executionTrigger(run) },
-        { key: 'actor', label: '请求人', children: run.requestedBy ?? '—' },
-        { key: 'activation', label: '执行模式', children: executionMode(run.activationMode) },
-        { key: 'mode', label: '策略模式', children: mode ?? '—' },
-        { key: 'created', label: '创建时间', children: executionTime(run.createdAt) },
-        { key: 'started', label: '开始时间', children: executionTime(run.startedAt) },
-        { key: 'count', label: '候选数', children: run.candidateCount?.toLocaleString('zh-CN') ?? '—' },
-        { key: 'bytes', label: '估算逻辑量', children: logicalBytes(run.estimatedBytesExact) },
-      ]} />
-    </Card>
+    <Flex gap={12} vertical>
+      <Card>
+        <Descriptions column={{ xs: 1, md: 2 }} items={[
+          { key: 'reason', label: '调度原因', children: <span className="console-mono">{run.reason ?? '—'}</span> },
+          { key: 'trigger', label: '触发来源', children: executionTrigger(run) },
+          { key: 'actor', label: '请求人', children: run.requestedBy ?? '—' },
+          { key: 'activation', label: '执行模式', children: executionMode(run.activationMode) },
+          { key: 'mode', label: '策略模式', children: mode ?? '—' },
+          { key: 'created', label: '创建时间', children: executionTime(run.createdAt) },
+          { key: 'started', label: '开始时间', children: executionTime(run.startedAt) },
+          { key: 'count', label: '候选数', children: run.candidateCount?.toLocaleString('zh-CN') ?? '—' },
+          { key: 'bytes', label: '候选估算逻辑量', children: logicalBytes(run.estimatedBytesExact) },
+        ]} />
+      </Card>
+      <RunResults run={run} />
+    </Flex>
+  );
+}
+
+function RunReport({ run, params, refreshKey }: { run: RunDetail; params: URLSearchParams; refreshKey: number }) {
+  const reports = useMemo(() => [operationFilters(params), operationFilters(params, true)], [params]);
+  return (
+    <Flex gap={12} vertical>
+      {reports.map((filters) => {
+        const { state, reason, fid, exceptionsOnly } = filters;
+        const stateLabel = operationStateOptions.find(({ value }) => value === state)?.label ?? state;
+        const scope = [
+          stateLabel ?? (exceptionsOnly ? '失败、暂缓与结果未知' : '全部操作状态'),
+          reason ? `原因包含「${reason}」` : undefined,
+          fid ? `FID ${fid}` : undefined,
+        ].filter(Boolean).join(' · ');
+        return <FilteredOperationResults key={JSON.stringify(filters)}
+          id={run.idExact} filters={filters} refreshKey={refreshKey} scope={scope}
+          title={exceptionsOnly ? '异常报告' : '运行报告'}
+          action={<ReportDownload id={run.idExact} filters={filters} />} />;
+      })}
+      <RunDirectoryScope run={run} />
+      <PolicyJson id={run.policyIdExact} revision={run.revisionExact} />
+    </Flex>
   );
 }
 
@@ -31,7 +59,7 @@ function RunDetailsPage({ id }: { id: string }) {
   const [params, setParams] = useSearchParams();
   const [refreshKey, setRefreshKey] = useState(0);
   const selectedTab = params.get('tab');
-  const tab = selectedTab === 'operations' || selectedTab === 'exceptions' ? selectedTab : 'overview';
+  const tab = selectedTab === 'operations' || selectedTab === 'exceptions' || selectedTab === 'report' ? selectedTab : 'overview';
   const load = useCallback((signal: AbortSignal) => getRun(id, signal), [id]);
   const { state, refresh, refreshing } = useInventory(load, load, { keepPrevious: true });
   const run = state.status === 'ready' ? state.data : undefined;
@@ -61,7 +89,11 @@ function RunDetailsPage({ id }: { id: string }) {
         }} items={[
           { key: 'overview', label: '执行总览', children: <RunOverview run={run} /> },
           { key: 'operations', label: '逐文件明细', children: <RunOperations id={id} refreshKey={refreshKey} /> },
-          { key: 'exceptions', label: '异常明细', children: <RunOperations id={id} refreshKey={refreshKey} exceptionsOnly /> },
+          { key: 'exceptions', label: '异常明细', children: <Flex vertical gap={12}>
+            <RunDirectoryScope run={run} />
+            <RunOperations id={id} refreshKey={refreshKey} exceptionsOnly />
+          </Flex> },
+          { key: 'report', label: '报告', children: <RunReport run={run} params={params} refreshKey={refreshKey} /> },
         ]} />
       </Flex>}
     </InventoryPage>

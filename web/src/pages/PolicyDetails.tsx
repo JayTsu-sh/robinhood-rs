@@ -1,10 +1,11 @@
 import { Link, useParams, useSearchParams } from '@umijs/max';
-import { Alert, Button, Card, Descriptions, Flex, Tabs, Tag, Typography } from 'antd';
+import { Alert, Button, Card, Descriptions, Flex, Tabs, Tag } from 'antd';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
 import { LatestRunLink } from '@/components/ExecutionStatus';
 import { PolicyBindings, PolicyConfiguration } from '@/components/PolicyConfiguration';
 import PolicyExecutionActions from '@/components/PolicyExecutionActions';
+import PolicyJson from '@/components/PolicyJson';
 import RunHistoryTable from '@/components/RunHistoryTable';
 import { policyPoolPair, readEditablePolicy } from '@/domain/tieringPolicy';
 import { executionFilters, runHistoryPath } from '@/services/executions';
@@ -12,23 +13,6 @@ import { readPolicyDraft } from '@/services/policyDrafts';
 import { getPolicy, getPolicyDefinition, policyDetailsPath, policyEditPath, type PolicyRevision } from '@/services/policies';
 import { filesystemDetailsPath } from '@/services/tiering';
 import { requestError, useInventory } from '@/services/useInventory';
-
-function PolicyJson({ id, revision }: { id: string; revision: string }) {
-  const read = useCallback((signal: AbortSignal) => getPolicyDefinition(id, revision, signal), [id, revision]);
-  const { state, refresh } = useInventory(read);
-  if (state.status === 'error') {
-    return <Alert showIcon type="error" message="读取定义失败" description={state.message}
-      action={<Button onClick={refresh}>重试</Button>} />;
-  }
-  if (state.status === 'loading') return <Typography.Text role="status">正在读取 Rev.8 原文</Typography.Text>;
-  return (
-    <Card size="small" title="Rev.8 原文">
-      <pre className="console-mono" style={{ maxHeight: 500, overflow: 'auto', whiteSpace: 'pre-wrap', margin: 0 }}>
-        {state.data}
-      </pre>
-    </Card>
-  );
-}
 
 function Details({ row, historical, refresh }: { row: PolicyRevision; historical: boolean; refresh: () => void }) {
   const { definition, idExact: id, revisionExact: revision } = row;

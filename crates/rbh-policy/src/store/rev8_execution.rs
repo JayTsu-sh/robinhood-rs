@@ -26,7 +26,7 @@ use super::PolicyStore;
 use crate::{
     PolicyError,
     rev8::{
-        self, ActionKind, BudgetLimits, CompiledPolicy, DB_EPOCH_MICROS, Invocation,
+        self, ActionKind, BudgetLimits, CompiledPolicy, DB_EPOCH_MICROS, Invocation, ScopeSummary,
         execution::{Admission, Generation, Profile},
         heat::{self, HeatProfile},
         invalid, push_expression,
@@ -37,7 +37,7 @@ use crate::{
 const BATCH_SIZE: usize = 64;
 const RUN_FIELDS: &str =
     "id, policy_id, revision, state, reason, candidate_count, estimated_bytes, requested_by, created_at, started_at,
-     heat_deferred_by_reason";
+     heat_deferred_by_reason, directory_scope";
 const OPERATION_FIELDS: &str =
     "o.id, o.run_id, r.policy_id, r.revision, o.filesystem, o.fid, o.action, o.archive_id, o.state,
      o.reason, o.attempted, o.generation, o.principal, o.size, o.accepted_at, o.completion_evidence, o.migration_plan,
@@ -58,6 +58,8 @@ pub struct Rev8Run {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heat_deferred_by_reason: Option<Json<BTreeMap<String, u64>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_scope: Option<Json<ScopeSummary>>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -399,7 +401,7 @@ impl PolicyStore {
             };
             sqlx::query(
                 "UPDATE rev8_runs SET state = ?, reason = ?, candidate_count = ?, estimated_bytes = ?, started_at = ?,
-                 heat_deferred_by_reason = ? WHERE id = ?",
+                 heat_deferred_by_reason = ?, directory_scope = ? WHERE id = ?",
             )
             .bind(state)
             .bind(reason)
@@ -407,6 +409,7 @@ impl PolicyStore {
             .bind(preview.estimated_bytes)
             .bind(now)
             .bind(preview.read_heat.map(|heat| Json(heat.deferred_by_reason)))
+            .bind(preview.directory_scope.map(Json))
             .bind(run.id)
             .execute(&mut *tx)
             .await?;

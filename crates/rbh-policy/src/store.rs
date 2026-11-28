@@ -22,7 +22,8 @@ mod rev8_execution;
 mod rev8_heat;
 mod rev8_resources;
 pub use rev8_execution::history::{
-    HistoryOperation, HistoryPage, LatestRun, OperationSearch, OperationState, RunHistory, RunSearch, RunState,
+    HistoryOperation, HistoryPage, LatestRun, OperationFilter, OperationResults, OperationSearch, OperationState,
+    OperationSummary, RunHistory, RunReportSnapshot, RunSearch, RunState,
 };
 pub use rev8_execution::{Rev8Operation, Rev8Run};
 pub use rev8_heat::HeatSampler;
@@ -364,13 +365,19 @@ impl PolicyStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn get_rev8_revision(&self, id: u64, revision: u64) -> Result<Rev8PolicyRow, PolicyError> {
+        Self::read_rev8_revision(id, revision, &self.pool).await
+    }
+
+    async fn read_rev8_revision(
+        id: u64, revision: u64, executor: impl sqlx::MySqlExecutor<'_>,
+    ) -> Result<Rev8PolicyRow, PolicyError> {
         sqlx::query_as(&format!(
             "SELECT {REV8_POLICY_FIELDS}
              FROM rev8_policy_revisions r WHERE policy_id = ? AND revision = ?"
         ))
         .bind(id)
         .bind(revision)
-        .fetch_optional(&self.pool)
+        .fetch_optional(executor)
         .await?
         .ok_or(PolicyError::NotFound(id))
     }

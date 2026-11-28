@@ -69,20 +69,20 @@ pub(super) enum ScopeDecision {
     Deferred(DeferralReason),
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExclusionReason {
     LinkInExcludedSubtree,
     LinkOutsideScope,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeferralReason {
     IncompleteLinkEvidence,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScopeSummary {
     pub excluded_by_reason: BTreeMap<ExclusionReason, u64>,

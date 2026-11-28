@@ -8,16 +8,18 @@ export interface PreviewScope {
   excludedSubtrees?: string[];
 }
 
+export interface DirectoryScopeSummary {
+  excludedByReason: Record<string, number>;
+  deferredByReason: Record<string, number>;
+}
+
 export interface PolicyPreview {
   revision: number | null;
   candidateCount: number;
   estimatedBytes: number;
   estimatedBytesExact?: string;
   resourceBindings: { kind: string; name: string; revision: number }[];
-  directoryScope?: {
-    excludedByReason: Record<string, number>;
-    deferredByReason: Record<string, number>;
-  };
+  directoryScope?: DirectoryScopeSummary;
 }
 
 export function previewPolicyDocument(document: object, signal: AbortSignal) {

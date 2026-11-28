@@ -239,10 +239,26 @@ Use the profile and policy admission windows to restrict submission times.
 - `GET /api/runs/{id}` includes the run's pinned revision and
   `hasPendingOperations`. A `finished` run may still have operations in
   `submitting`, `submitted`, or `unknown`.
+- Run list and detail responses include `operationResults` for all recorded
+  operations in each run. `completedLogicalBytes` is an exact decimal string
+  summed from completed operations. `estimatedBytesExact` is the candidate
+  estimate. `directoryScope`, when present, contains the directory exclusion
+  and deferral counts from the initial candidate evaluation.
 - `GET /api/runs/{id}/operations` lists recorded operations oldest first.
   Filter by `state`, `reason` (a literal substring), or full Lustre
   `fid`. Use `exceptionsOnly=true` for failed, deferred, and unknown
   operations. Migration plans and observed layout evidence are separate fields.
+- `GET /api/runs/{id}/operations/summary` applies the operation filters to the
+  full run and returns totals and exception counts by recorded state and reason.
+- `GET /api/runs/{id}/reports/run` and `GET /api/runs/{id}/reports/exceptions`
+  download versioned JSON with the effective filters, the pinned policy
+  revision, totals, and every matching operation. These routes use the same
+  operation filters and ignore page cursors and limits. Exception reports
+  include failed, deferred, and unknown operations. Each download uses one
+  read snapshot for its run, totals, and operations. The server prepares up to
+  two reports concurrently and returns HTTP 503 when both slots are in use.
+  It ends the stream at the five-minute deadline or when buffered output
+  waits 30 seconds for the client.
 - Each list returns `{items, nextCursor}`. Use the cursor as `beforeId`
   for runs or `afterId` for operations with the same filters. A null
   cursor means the last page. The default `limit` is 25 and the maximum

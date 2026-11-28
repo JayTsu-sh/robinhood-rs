@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
 
 const run = {
@@ -19,6 +20,12 @@ test('execution history opens a pinned run and refreshes operations after dispat
   let reconciled = false;
   let failMetadata = false;
   let runQueries = 0;
+  const results = () => ({
+    matchedCount: 2,
+    pendingCount: reconciled ? 0 : 1,
+    completedLogicalBytes: reconciled ? file.sizeExact : '0',
+    byState: { failed: 1, [reconciled ? 'completed' : 'unknown']: 1 },
+  });
   await page.route(/\/api\/runs(?:\?|$)/, (route) => {
     const filters = new URL(route.request().url()).searchParams;
     if (filters.has('beforeId')) {
@@ -33,8 +40,11 @@ test('execution history opens a pinned run and refreshes operations after dispat
   await page.route(`**/api/runs/${run.idExact}`, (route) => {
     runQueries++;
     if (failMetadata) return route.fulfill({ status: 503, json: { error: '暂时无法读取运行' } });
-    return route.fulfill({ json: { ...run, hasPendingOperations: !reconciled } });
+    return route.fulfill({ json: { ...run, hasPendingOperations: !reconciled, operationResults: results() } });
   });
+  await page.route((url) => url.pathname === `/api/runs/${run.idExact}/operations/summary`, (route) =>
+    route.fulfill({ json: { ...results(), byReason: [] } }),
+  );
   await page.route((url) => url.pathname === `/api/runs/${run.idExact}/operations`, (route) => {
     const filters = new URL(route.request().url()).searchParams;
     if (filters.has('fid')) {
@@ -123,15 +133,46 @@ test('the built console reads a recorded run and file evidence from the daemon',
   await page.getByRole('button', { name: '重置筛选' }).click();
   await page.getByRole('row').filter({ hasText: '[0x200000401:0x1:0x0]' })
     .getByRole('button', { name: '查看证据' }).click();
-  const evidence = page.getByRole('dialog', { name: '逐文件证据' });
-  await expect(evidence).toContainText('计划源池');
-  await expect(evidence).toContainText('hot');
-  await expect(evidence).toContainText('8、9');
-  await evidence.press('Escape');
+  const drawer = page.getByRole('dialog', { name: '逐文件证据' });
+  await expect(drawer).toContainText('计划源池');
+  await expect(drawer).toContainText('hot');
+  await expect(drawer).toContainText('8、9');
+  await drawer.press('Escape');
 
   await page.getByRole('tab', { name: '异常明细' }).click();
   await expect(page.getByRole('row').filter({ hasText: '[0x200000401:0x66:0x0]' })).toContainText('失败');
   await expect(page.getByRole('row').filter({ hasText: '[0x200000401:0x1:0x0]' })).toHaveCount(0);
+  const reason = page.getByRole('row').filter({ hasText: 'layout_swap_failed' }).filter({ hasNotText: 'lustre.pool_migrate' });
+  await expect(reason).toContainText('1');
+  await page.getByLabel('原因包含').fill('layout_swap');
+  await page.getByRole('button', { name: '查询', exact: true }).click();
+  const anomalyDownload = page.waitForEvent('download');
+  await page.getByRole('link', { name: '导出异常报告' }).click();
+  const anomalies = await anomalyDownload;
+  expect(anomalies.suggestedFilename()).toBe(`run-${record.idExact}-exceptions.json`);
+  const anomalyReport = JSON.parse(await readFile(await anomalies.path(), 'utf8'));
+  expect(anomalyReport.scope.filters).toMatchObject({ exceptionsOnly: true, reasonContains: 'layout_swap' });
+  expect(anomalyReport.operations).toHaveLength(1);
+  expect(anomalyReport.operations[0]).toMatchObject({ fid: '[0x200000401:0x66:0x0]', state: 'failed', finishedAt: null });
+  await page.getByRole('tab', { name: '报告', exact: true }).click();
+  await expect(page.getByText('原因包含「layout_swap」')).toHaveCount(2);
+  await expect(page.getByRole('link', { name: '导出运行报告' }))
+    .toHaveAttribute('href', `/api/runs/${record.idExact}/reports/run?reason=layout_swap`);
+  await expect(page.getByRole('cell', { name: '操作记录数 : 1', exact: true })).toHaveCount(2);
+  await page.getByRole('tab', { name: '异常明细' }).click();
+  await page.getByRole('button', { name: '重置筛选' }).click();
+
+  await page.getByRole('tab', { name: '报告', exact: true }).click();
+  await expect(page.getByText('918,734,323,983,581,286 B')).toBeVisible();
+  const fullDownload = page.waitForEvent('download');
+  await page.getByRole('link', { name: '导出运行报告' }).click();
+  const full = await fullDownload;
+  expect(full.suggestedFilename()).toBe(`run-${record.idExact}.json`);
+  const report = JSON.parse(await readFile(await full.path(), 'utf8'));
+  expect(report.operationResults).toMatchObject({ matchedCount: 103, pendingCount: 0, completedLogicalBytes: '918734323983581286' });
+  expect(report.policyRevision.definition.metadata.name).toBe(record.policyName);
+  expect(report.operations).toHaveLength(103);
+  expect(report.operations.at(-1).completionEvidence).toEqual(evidence);
   await revisionLink.click();
   await expect(page.getByRole('heading', { name: record.policyName, exact: true })).toBeVisible();
   await page.getByRole('link', { name: '查看当前修订' }).click();
