@@ -62,6 +62,7 @@ export interface FilesystemResource {
   capacity: Capacity;
   pools: PoolResource[] | null;
   tieringAvailable: boolean;
+  previewAvailable: boolean;
   reason: string | null;
 }
 

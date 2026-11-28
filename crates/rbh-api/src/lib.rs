@@ -5,6 +5,7 @@
 //! * `GET /api/policies` — list policies, optionally with `?configuredOnly=true`
 //! * `GET /api/policies/:id` — get policy by id
 //! * `PUT /api/policies/:id` — update policy
+//! * `POST /api/policies/preview` — evaluate an unsaved Rev.8 document
 //! * `POST /api/policies/:id/preview` — evaluate Rev.8 candidates
 //! * `DELETE /api/policies/:id` — delete policy
 //! * `GET /api/entries/count` — entry catalog count
@@ -27,6 +28,8 @@ mod rev8_execution_tests;
 mod rev8_handlers;
 #[cfg(test)]
 mod rev8_heat_tests;
+#[cfg(test)]
+mod rev8_preview_tests;
 pub mod state;
 
 pub use rev8_auth::Rev8Writers;

@@ -1,4 +1,4 @@
-use lustre_api::{LustreApi, migration::valid_pool_name};
+use lustre_api::{LuFid, migration::valid_pool_name, pools::PoolMount};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -97,15 +97,27 @@ impl PoolMigration {
 
     #[tracing::instrument(skip(self), fields(mount = %mount.display(), source_pool = %self.source_pool, target_pool = %self.target_pool))]
     pub(crate) async fn validate_pools(&self, mount: &std::path::Path) -> Result<(), PolicyError> {
-        let mount = mount.to_owned();
+        self.inspect_mount(mount, false).await.map(|_| ())
+    }
+
+    pub(super) async fn preview_root(&self, mount: &std::path::Path) -> Result<LuFid, PolicyError> {
+        self.inspect_mount(mount, true)
+            .await?
+            .ok_or_else(|| invalid("spec.target.directoryScope requires a Lustre root FID"))
+    }
+
+    async fn inspect_mount(&self, mount: &std::path::Path, require_root: bool) -> Result<Option<LuFid>, PolicyError> {
+        let path = mount.to_owned();
         let migration = self.clone();
         tokio::task::spawn_blocking(move || {
+            let mount = PoolMount::open(&path)
+                .map_err(|error| invalid(format!("lustre.pool_migrate mount {}: {error}", path.display())))?;
             for (field, pool) in [
-                ("sourcePool", migration.source_pool),
-                ("targetPool", migration.target_pool),
+                ("sourcePool", &migration.source_pool),
+                ("targetPool", &migration.target_pool),
             ] {
-                let members = LustreApi
-                    .pool_members(&mount, &pool)
+                let members = mount
+                    .pool_members(pool)
                     .map_err(|error| invalid(format!("lustre.pool_migrate {field} {pool}: {error}")))?;
                 if members.is_empty() {
                     return Err(invalid(format!("lustre.pool_migrate {field} {pool} has no OSTs")));
@@ -120,7 +132,13 @@ impl PoolMigration {
                     ));
                 }
             }
-            Ok(())
+            require_root
+                .then(|| {
+                    mount
+                        .directory_fid()
+                        .map_err(|error| invalid(format!("spec.target.directoryScope root FID: {error}")))
+                })
+                .transpose()
         })
         .await
         .map_err(|error| PolicyError::Store(error.to_string()))?

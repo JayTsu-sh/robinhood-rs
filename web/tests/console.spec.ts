@@ -180,3 +180,86 @@ test('resources show eligible pools, failures and fresh results independently of
   await expect(row).toContainText('无法确认可选池');
   await expect(row).toContainText('配置路径未挂载 Lustre');
 });
+
+test('an unsaved tiering preview uses the selected pool pair and invalidates old results', async ({ page }) => {
+  const pools = ['hot', 'cold', 'empty'].map((name) => ({ name, eligible: name !== 'empty' }));
+  await page.route('**/api/filesystems', (route) => route.fulfill({
+    json: [
+      { id: 'lab-a', pools, tieringAvailable: true, previewAvailable: true },
+      { id: 'lab-b', pools, tieringAvailable: false, previewAvailable: true },
+      { id: 'lab-offline', pools: null, tieringAvailable: false, previewAvailable: false },
+    ],
+  }));
+  let fail = false;
+  await page.route('**/api/policies/preview', async (route) => {
+    expect(route.request().method()).toBe('POST');
+    const { spec } = route.request().postDataJSON();
+    expect(spec.enabled).toBe(false);
+    expect(spec.target).toMatchObject({
+      filesystem: 'lab-a',
+      directoryScope: { root: '/team', excludedSubtrees: ['/team/archive'] },
+    });
+    expect(spec.rules.entries[0].action.params).toMatchObject({ sourcePool: 'hot', targetPool: 'cold' });
+    if (fail) {
+      await route.fulfill({ status: 400, json: { error: 'targetPool 不可用' } });
+      return;
+    }
+    await route.fulfill({
+      json: {
+        revision: null,
+        candidateCount: 2,
+        estimatedBytes: 9007199254740992,
+        estimatedBytesExact: "9007199254740993",
+        resourceBindings: [{ kind: 'ExecutionProfile', name: 'builtin-preview', revision: 3 }],
+        directoryScope: {
+          excludedByReason: { link_outside_scope: 4, link_in_excluded_subtree: 5 },
+          deferredByReason: { incomplete_link_evidence: 6 },
+        },
+      },
+    });
+  });
+
+  async function openChoices(name: string) {
+    const select = page.getByRole('combobox', { name, exact: true });
+    await select.press('ArrowDown');
+    const listId = await select.getAttribute('aria-controls');
+    return page.locator(`[id="${listId}"]`);
+  }
+
+  await page.goto('/console/#/policies');
+  await page.getByRole('link', { name: '预览迁移' }).click();
+  await expect(page.getByRole('heading', { name: '预览池迁移' })).toBeVisible();
+  const filesystemChoices = await openChoices('Lustre 文件系统');
+  await expect(filesystemChoices.getByRole('option', { name: 'lab-offline' })).toHaveCount(0);
+  await filesystemChoices.getByRole('option', { name: 'lab-a' }).click();
+  const sourceChoices = await openChoices('源池');
+  await expect(sourceChoices.getByRole('option', { name: 'empty' })).toHaveCount(0);
+  await sourceChoices.getByRole('option', { name: 'hot' }).click();
+  const targetChoices = await openChoices('目标池');
+  await expect(targetChoices.getByRole('option', { name: 'hot' })).toHaveCount(0);
+  await targetChoices.getByRole('option', { name: 'cold' }).click();
+  await page.getByLabel('起始目录').fill('/team');
+  await page.getByRole('button', { name: '添加排除目录' }).click();
+  await page.getByRole('textbox', { name: '排除子目录 1', exact: true }).fill('/team/archive');
+  await page.getByRole('button', { name: '计算预览' }).click();
+
+  const result = page.getByRole('region', { name: '预览结果' });
+  await expect(result).toContainText('9,007,199,254,740,993');
+  await expect(result).toContainText('链接位于范围外');
+  await expect(result).toContainText('链接位于排除子树');
+  await expect(result).toContainText('链接证据不完整');
+  await expect(result).toContainText('builtin-preview');
+  await page.getByLabel('起始目录').fill('/team-new');
+  await expect(result).toHaveCount(0);
+
+  fail = true;
+  await page.getByLabel('起始目录').fill('/team');
+  await page.getByRole('button', { name: '计算预览' }).click();
+  await expect(page.getByRole('alert')).toContainText('targetPool 不可用');
+  await expect(page.getByRole('textbox', { name: '排除子目录 1', exact: true })).toHaveValue('/team/archive');
+
+  await (await openChoices('Lustre 文件系统')).getByRole('option', { name: 'lab-b' }).click();
+  await expect(page.getByText('预览失败')).toHaveCount(0);
+  await expect(page.getByText('选择源池', { exact: true })).toBeVisible();
+  await expect(page.getByText('选择目标池', { exact: true })).toBeVisible();
+});

@@ -17,7 +17,7 @@ pub use crate::store::HeatSampler;
 pub mod agent;
 use agent::{AgentConfig, HeatFailure, MAX_BATCH_SIZE, SampleRequest, SampleResult, sample_mount};
 
-use super::{CompiledPolicy, PreviewResult, invalid, push_expression, resources::ResourceBinding, valid_name};
+use super::{CompiledPolicy, PreviewResult, invalid, resources::ResourceBinding, valid_name};
 use crate::PolicyError;
 
 const MISSING: &str = "heat_sample_missing";
@@ -95,7 +95,7 @@ pub struct PreviewHeat {
 
 #[derive(sqlx::FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClientObservation {
+pub(super) struct ClientObservation {
     client_id: String,
     observed_at: Option<DateTime<Utc>>,
     read_samples: Option<u64>,
@@ -224,15 +224,7 @@ impl HeatProfile {
     }
 }
 
-fn push_matches(query: &mut QueryBuilder<MySql>, policy: &CompiledPolicy, database_time_micros: Option<i64>) {
-    query.push("((");
-    policy.push_scope(query, database_time_micros);
-    query.push(") AND ((");
-    push_expression(query, &policy.decision, &policy.decision_params);
-    query.push(") > 0))");
-}
-
-const UNKNOWN_SCORES: &str =
+pub(super) const UNKNOWN_SCORES: &str =
     " JOIN (SELECT NULL AS read_samples, NULL AS read_bytes, NULL AS heat_status) AS read_heat ";
 
 async fn batch_fids(
@@ -246,7 +238,7 @@ async fn batch_fids(
         .push(" AND object_kind = 0 AND object_id > ")
         .push_bind(after.to_vec())
         .push(" AND ");
-    push_matches(&mut query, policy, None);
+    policy.push_match(&mut query, None);
     query
         .push(" IS NULL ORDER BY object_id LIMIT ")
         .push_bind(i64::from(limit));
@@ -451,20 +443,22 @@ struct PreviewTotals {
     bytes: u64,
 }
 
-pub(crate) async fn preview(
-    entries: &EntryStore, policy: &CompiledPolicy, profile: Option<&HeatProfile>, revision: u64,
+pub(super) fn missing_reason(profile: Option<&HeatProfile>) -> &'static str {
+    if profile.is_some() { MISSING } else { NOT_CONFIGURED }
+}
+
+pub(super) async fn preview<Revision>(
+    entries: &EntryStore, policy: &CompiledPolicy, profile: Option<&HeatProfile>, revision: Revision,
     resource_bindings: Vec<ResourceBinding>, fid: Option<LuFid>,
-) -> Result<PreviewResult, PolicyError> {
-    let filesystem = super::validate_filesystem(entries, &policy.filesystem).await?;
-    policy.validate_capabilities(&filesystem)?;
+) -> Result<PreviewResult<Revision>, PolicyError> {
     // Establish the read view before taking the freshness reference, so the
     // preview cannot see samples committed after the reference time.
     let mut tx = entries
         .pool()
-        .begin_with("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        .begin_with("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
         .await?;
     let now = Utc::now();
-    let missing = if profile.is_some() { MISSING } else { NOT_CONFIGURED };
+    let missing = missing_reason(profile);
     // Compute candidate sums and deferred counts from the same snapshot.
     let mut query = QueryBuilder::new(format!(
         "SELECT CASE WHEN matched IS NULL THEN COALESCE(heat_status, '{missing}') END AS deferred_reason,
@@ -473,7 +467,7 @@ pub(crate) async fn preview(
          CAST(SUM(IF(matched IS TRUE, size, 0)) AS UNSIGNED) AS bytes
          FROM (SELECT size, heat_status, "
     ));
-    push_matches(&mut query, policy, None);
+    policy.push_match(&mut query, None);
     query.push(" AS matched FROM scoped_entries AS entries ");
     if let Some(profile) = profile {
         push_scores(&mut query, profile, now, None);
@@ -490,25 +484,37 @@ pub(crate) async fn preview(
         _ => None,
     };
     tx.commit().await?;
-    let heat = PreviewHeat {
+    let heat = heat_summary(
+        profile,
+        rows.iter()
+            .filter_map(|row| Some((row.deferred_reason.clone()?, row.row_count)))
+            .collect(),
+        observations,
+    );
+    Ok(PreviewResult {
+        revision,
+        candidate_count: rows.iter().map(|row| row.candidate_count).sum(),
+        estimated_bytes: rows.iter().map(|row| row.bytes).sum(),
+        estimated_bytes_exact: None,
+        resource_bindings,
+        read_heat: Some(heat),
+        directory_scope: None,
+    })
+}
+
+pub(super) fn heat_summary(
+    profile: Option<&HeatProfile>, deferred_by_reason: BTreeMap<String, u64>,
+    observations: Option<Vec<ClientObservation>>,
+) -> PreviewHeat {
+    PreviewHeat {
         clients: profile
             .map(|profile| profile.config.clients.keys().cloned().collect())
             .unwrap_or_default(),
         decay: profile.map(|profile| profile.config.decay),
         max_age_seconds: profile.map(|profile| profile.config.max_age_seconds),
-        deferred_by_reason: rows
-            .iter()
-            .filter_map(|row| Some((row.deferred_reason.clone()?, row.row_count)))
-            .collect(),
+        deferred_by_reason,
         observations,
-    };
-    Ok(PreviewResult {
-        revision,
-        candidate_count: rows.iter().map(|row| row.candidate_count).sum(),
-        estimated_bytes: rows.iter().map(|row| row.bytes).sum(),
-        resource_bindings,
-        read_heat: Some(heat),
-    })
+    }
 }
 
 pub(crate) fn push_scores(
@@ -591,12 +597,12 @@ pub(crate) async fn dispatch_deferrals(
         query.push(" AND entries.object_id <= ").push_bind(through.to_vec());
     }
     query.push(" AND ");
-    push_matches(&mut query, policy, database_time_micros);
+    policy.push_match(&mut query, database_time_micros);
     query.push(" IS NULL GROUP BY reason");
     Ok(query.build_query_as().fetch_all(&mut **tx).await?.into_iter().collect())
 }
 
-async fn observations(
+pub(super) async fn observations(
     tx: &mut sqlx::Transaction<'_, MySql>, profile: &HeatProfile, now: DateTime<Utc>, fid: LuFid,
 ) -> Result<Vec<ClientObservation>, PolicyError> {
     let mut rows: BTreeMap<String, ClientObservation> = sqlx::query_as::<_, ClientObservation>(

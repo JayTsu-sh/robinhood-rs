@@ -50,6 +50,7 @@ export default function Policies() {
       status={state.status}
       error={state.status === 'error' ? state.message : undefined}
       refresh={refresh}
+      action={<Link to="/policies/preview">预览迁移</Link>}
     >
       <div className="console-table">
         <div className="console-controls">

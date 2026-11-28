@@ -7,7 +7,7 @@ use std::{
 };
 
 use sqlx::mysql::MySqlPoolOptions;
-use sqlx::{MySql, Pool, Row};
+use sqlx::{MySql, Pool, Row, Transaction};
 use tracing::{debug, info};
 
 use lustre_api::LuFid;
@@ -18,6 +18,23 @@ use crate::model::{
     BaselineState, EntryKey, EntryKind, EntryRow, FileSystemConfig, FileSystemId, FilesystemBaseline, ObjectId,
     ScopedEntryRow, ScopedNamespaceEdge,
 };
+
+/// Live Lustre link count used when applying an indexed namespace change.
+#[derive(Clone, Copy, Debug)]
+pub enum LustreLinkState {
+    Present(u32),
+    Missing,
+    Unavailable,
+}
+
+impl LustreLinkState {
+    fn catalog_count(self) -> u32 {
+        match self {
+            Self::Present(count) => count,
+            Self::Missing | Self::Unavailable => 0,
+        }
+    }
+}
 
 /// A bind parameter for `legacy_lustre_query_where`. Avoids circular dependency on `rbh-predicate`.
 #[derive(Debug, Clone)]
@@ -386,24 +403,12 @@ impl EntryStore {
     pub async fn apply_scoped_unlink(
         &self, key: &EntryKey, parent: ObjectId, name: &[u8], observed_at: i64, directory: bool,
     ) -> Result<()> {
-        let (parent_kind, parent_id) = encode_object_id(parent);
-        let (object_kind, object_id) = encode_object_id(*key.object());
         let mut tx = self.pool.begin().await?;
-        let deleted = sqlx::query(
-            "DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND parent_kind = ? AND parent_id = ? AND name = ? AND object_kind = ? AND object_id = ?",
-        )
-        .bind(key.filesystem().as_str())
-        .bind(parent_kind)
-        .bind(parent_id.as_slice())
-        .bind(name)
-        .bind(object_kind)
-        .bind(object_id.as_slice())
-        .execute(&mut *tx)
-        .await?;
-        if deleted.rows_affected() == 0 {
+        if !delete_namespace_link_tx(&mut tx, key, parent, name).await? {
             tx.commit().await?;
             return Ok(());
         }
+        let (object_kind, object_id) = encode_object_id(*key.object());
         let row = sqlx::query(
             "SELECT entry_data, atime FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
         )
@@ -1150,17 +1155,7 @@ impl EntryStore {
         if entries.is_empty() {
             return Ok(());
         }
-        let config = self
-            .get_filesystem(filesystem)
-            .await?
-            .ok_or_else(|| StoreError::UnknownFilesystem(filesystem.clone()))?;
-        if config.backend != crate::model::BackendKind::Lustre {
-            return Err(StoreError::BackendMismatch {
-                filesystem: filesystem.clone(),
-                configured: config.backend,
-                object: crate::model::BackendKind::Lustre,
-            });
-        }
+        self.ensure_lustre_catalog(filesystem).await?;
         let mut entries: Vec<_> = entries.iter().collect();
         entries.sort_by_key(|entry| (entry.fid.seq, entry.fid.oid, entry.fid.ver));
         let mut attempt = 0;
@@ -1178,51 +1173,25 @@ impl EntryStore {
         }
     }
 
+    async fn ensure_lustre_catalog(&self, filesystem: &FileSystemId) -> Result<()> {
+        let config = self
+            .get_filesystem(filesystem)
+            .await?
+            .ok_or_else(|| StoreError::UnknownFilesystem(filesystem.clone()))?;
+        if config.backend != crate::model::BackendKind::Lustre {
+            return Err(StoreError::BackendMismatch {
+                filesystem: filesystem.clone(),
+                configured: config.backend,
+                object: crate::model::BackendKind::Lustre,
+            });
+        }
+        Ok(())
+    }
+
     async fn write_lustre_entries(&self, filesystem: &FileSystemId, entries: &[&EntryRow]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for entry in entries {
-            let fid_bin = fid_codec::encode(&entry.fid);
-            let mut scoped = ScopedEntryRow::from_lustre(filesystem.clone(), entry);
-            let mut observation = entry.layout_observed_at;
-            let mut replace_stripes = true;
-            if let Some((existing, previous_observation)) = lock_scoped_entry(&mut tx, &scoped.key).await? {
-                if scoped.kind == EntryKind::File
-                    && existing.kind == EntryKind::File
-                    && (scoped.size, scoped.mtime, scoped.ctime) == (existing.size, existing.mtime, existing.ctime)
-                {
-                    // A buffered scan can predate an atime observation
-                    // that has already committed for this generation.
-                    scoped.atime = scoped.atime.max(existing.atime);
-                }
-                scoped.sm_status = existing.sm_status;
-                replace_stripes = observation > previous_observation;
-                if !replace_stripes {
-                    scoped.stripe_count = existing.stripe_count;
-                    scoped.stripe_size = existing.stripe_size;
-                    scoped.pool_name = existing.pool_name;
-                    scoped.stripe_items = existing.stripe_items;
-                    observation = None;
-                }
-            }
-            upsert_scoped_entry_tx(&mut tx, &scoped, observation).await?;
-            if replace_stripes {
-                replace_lustre_stripes(&mut tx, filesystem, &fid_bin, &scoped.stripe_items).await?;
-            }
-            if let Some(parent) = entry.parent_fid {
-                let parent_id = fid_codec::encode(&parent);
-                sqlx::query(
-                    r"INSERT INTO scoped_namespace_edges
-                        (filesystem_id, parent_kind, parent_id, name, object_kind, object_id)
-                      VALUES (?, 0, ?, ?, 0, ?)
-                      ON DUPLICATE KEY UPDATE object_kind = VALUES(object_kind), object_id = VALUES(object_id)",
-                )
-                .bind(filesystem.as_str())
-                .bind(parent_id.as_slice())
-                .bind(entry.name.as_ref())
-                .bind(fid_bin.as_slice())
-                .execute(&mut *tx)
-                .await?;
-            }
+            upsert_lustre_entry_tx(&mut tx, filesystem, entry).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1331,71 +1300,125 @@ impl EntryStore {
         let Some((entry, _)) = lock_scoped_entry(&mut tx, &key).await? else {
             return Ok(());
         };
-        let (object_kind, object_id) = encode_object_id(*key.object());
-        sqlx::query("DELETE FROM scoped_stripe_items WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
-            .bind(filesystem.as_str())
-            .bind(object_kind)
-            .bind(object_id.as_slice())
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            r"INSERT INTO scoped_removed_entries (filesystem_id, object_kind, object_id, entry_data, rm_time)
-              VALUES (?, ?, ?, ?, ?)
-              ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data), rm_time = VALUES(rm_time)",
-        )
-        .bind(filesystem.as_str())
-        .bind(object_kind)
-        .bind(object_id.as_slice())
-        .bind(serde_json::to_string(&entry)?)
-        .bind(rm_time)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
-            .bind(filesystem.as_str())
-            .bind(object_kind)
-            .bind(object_id.as_slice())
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
-            .bind(filesystem.as_str())
-            .bind(object_kind)
-            .bind(object_id.as_slice())
-            .execute(&mut *tx)
-            .await?;
+        remove_lustre_entry_tx(&mut tx, &entry, rm_time).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Apply a Lustre rename inside the selected filesystem.
-    #[tracing::instrument(name = "store.rename_lustre_entry", skip(self, entry), fields(filesystem = %filesystem, fid = %entry.fid))]
-    pub async fn rename_lustre_entry(&self, filesystem: &FileSystemId, entry: &EntryRow, rm_time: i64) -> Result<()> {
-        let displaced = if let Some(parent) = entry.parent_fid {
+    /// Add a Lustre name using the observed count. A later occupant of the
+    /// pathname can already be indexed when a changelog batch is replayed.
+    #[tracing::instrument(skip(self, name), fields(%filesystem, %fid))]
+    pub async fn link_lustre_name(
+        &self, filesystem: &FileSystemId, fid: &LuFid, parent: LuFid, name: &[u8], state: LustreLinkState,
+        observed_at: i64,
+    ) -> Result<()> {
+        if matches!(state, LustreLinkState::Missing) {
+            return Ok(());
+        }
+        let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
+        let mut tx = self.pool.begin().await?;
+        if let Some((mut entry, _)) = lock_scoped_entry(&mut tx, &key).await? {
             let parent_id = fid_codec::encode(&parent);
-            let row = sqlx::query(
-                r"SELECT object_id FROM scoped_namespace_edges
-                  WHERE filesystem_id = ? AND parent_kind = 0 AND parent_id = ? AND name = ?
-                    AND NOT (object_kind = 0 AND object_id = ?) LIMIT 1",
+            let fid_id = fid_codec::encode(fid);
+            let occupied: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT object_id FROM scoped_namespace_edges
+                 WHERE filesystem_id = ? AND parent_kind = 0 AND parent_id = ? AND name = ?
+                 FOR UPDATE",
             )
             .bind(filesystem.as_str())
             .bind(parent_id.as_slice())
-            .bind(entry.name.as_ref())
-            .bind(fid_codec::encode(&entry.fid).as_slice())
-            .fetch_optional(&self.pool)
+            .bind(name)
+            .fetch_optional(&mut *tx)
             .await?;
-            row.and_then(|row| fid_codec::decode(&row.try_get::<Vec<u8>, _>("object_id").ok()?))
-        } else {
-            None
-        };
-        if let Some(fid) = displaced {
-            self.remove_lustre_entry(filesystem, &fid, rm_time).await?;
+            if occupied.is_none() {
+                upsert_lustre_link_tx(&mut tx, filesystem, fid, &parent, name).await?;
+            }
+            let owns_name = occupied.as_deref().is_none_or(|current| current == fid_id);
+            if owns_name && entry.parent.is_none() {
+                entry.parent = Some(EntryKey::new(filesystem.clone(), ObjectId::Lustre(parent)));
+                entry.name = bytes::Bytes::copy_from_slice(name);
+            }
+            entry.nlink = state.catalog_count();
+            entry.last_seen = observed_at;
+            upsert_scoped_entry_tx(&mut tx, &entry, None).await?;
         }
-        let object_id = fid_codec::encode(&entry.fid);
-        sqlx::query("DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?")
-            .bind(filesystem.as_str())
-            .bind(object_id.as_slice())
-            .execute(&self.pool)
-            .await?;
-        self.upsert_lustre_entry(filesystem, entry).await
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove an observed non-final Lustre link without changing unrelated names.
+    #[tracing::instrument(skip(self, name), fields(%filesystem, %fid))]
+    pub async fn unlink_lustre_name(
+        &self, filesystem: &FileSystemId, fid: &LuFid, parent: LuFid, name: &[u8], state: LustreLinkState,
+        observed_at: i64,
+    ) -> Result<()> {
+        let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(*fid));
+        let mut tx = self.pool.begin().await?;
+        let entry = lock_scoped_entry(&mut tx, &key).await?;
+        let deleted = delete_namespace_link_tx(&mut tx, &key, ObjectId::Lustre(parent), name).await?;
+        if (deleted || matches!(state, LustreLinkState::Present(_)))
+            && let Some((entry, _)) = entry
+        {
+            update_lustre_after_unlink(&mut tx, entry, parent, name, state, observed_at).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Move one Lustre namespace edge, preserving the object's other links.
+    #[tracing::instrument(skip(self, entry, source), fields(%filesystem, fid = %entry.fid))]
+    pub async fn rename_lustre_entry(
+        &self, filesystem: &FileSystemId, entry: &EntryRow, source: (LuFid, &[u8]), rm_time: i64,
+        displaced_state: Option<(LuFid, LustreLinkState)>,
+    ) -> Result<()> {
+        self.ensure_lustre_catalog(filesystem).await?;
+        let parent = entry.parent_fid.ok_or(StoreError::InvalidObjectIdentity(
+            "Lustre rename has no destination parent",
+        ))?;
+        let key = EntryKey::new(filesystem.clone(), ObjectId::Lustre(entry.fid));
+        let mut tx = self.pool.begin().await?;
+        let renamed = lock_scoped_entry(&mut tx, &key).await?;
+        let displaced: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT object_id FROM scoped_namespace_edges
+             WHERE filesystem_id = ? AND parent_kind = 0 AND parent_id = ? AND name = ?
+               AND object_kind = 0 AND object_id <> ? FOR UPDATE",
+        )
+        .bind(filesystem.as_str())
+        .bind(fid_codec::encode(&parent).as_slice())
+        .bind(entry.name.as_ref())
+        .bind(fid_codec::encode(&entry.fid).as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(displaced) = displaced {
+            let fid =
+                fid_codec::decode(&displaced).ok_or(StoreError::InvalidObjectIdentity("invalid displaced FID"))?;
+            let displaced = EntryKey::new(filesystem.clone(), ObjectId::Lustre(fid));
+            if let Some((old, _)) = lock_scoped_entry(&mut tx, &displaced).await? {
+                let state = displaced_state
+                    .filter(|(observed, _)| *observed == fid)
+                    .map_or(LustreLinkState::Unavailable, |(_, state)| state);
+                if matches!(state, LustreLinkState::Missing) {
+                    remove_lustre_entry_tx(&mut tx, &old, rm_time).await?;
+                } else {
+                    delete_namespace_link_tx(&mut tx, &displaced, ObjectId::Lustre(parent), &entry.name).await?;
+                    update_lustre_after_unlink(&mut tx, old, parent, &entry.name, state, rm_time).await?;
+                }
+            }
+        }
+        if source != (parent, entry.name.as_ref()) {
+            delete_namespace_link_tx(&mut tx, &key, ObjectId::Lustre(source.0), source.1).await?;
+        }
+        if let Some((mut renamed, _)) = renamed {
+            renamed.parent = Some(EntryKey::new(filesystem.clone(), ObjectId::Lustre(parent)));
+            renamed.name = entry.name.clone();
+            renamed.last_seen = entry.last_seen;
+            upsert_scoped_entry_tx(&mut tx, &renamed, None).await?;
+            upsert_lustre_link_tx(&mut tx, filesystem, &entry.fid, &parent, &entry.name).await?;
+        } else {
+            upsert_lustre_entry_tx(&mut tx, filesystem, entry).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Look up an entry by (parent_fid, name). Returns the FID if found.
@@ -1898,6 +1921,152 @@ async fn lock_scoped_entry(
         Ok((decode_scoped_entry(row, key)?, layout_observed_at))
     })
     .transpose()
+}
+
+async fn delete_namespace_link_tx(
+    tx: &mut Transaction<'_, MySql>, key: &EntryKey, parent: ObjectId, name: &[u8],
+) -> Result<bool> {
+    let (parent_kind, parent_id) = encode_object_id(parent);
+    let (object_kind, object_id) = encode_object_id(*key.object());
+    let deleted = sqlx::query(
+        "DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND parent_kind = ? AND parent_id = ? AND name = ? AND object_kind = ? AND object_id = ?",
+    )
+    .bind(key.filesystem().as_str())
+    .bind(parent_kind)
+    .bind(parent_id.as_slice())
+    .bind(name)
+    .bind(object_kind)
+    .bind(object_id.as_slice())
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(deleted.rows_affected() != 0)
+}
+
+async fn update_lustre_after_unlink(
+    tx: &mut Transaction<'_, MySql>, mut entry: ScopedEntryRow, parent: LuFid, name: &[u8], state: LustreLinkState,
+    observed_at: i64,
+) -> Result<()> {
+    entry.nlink = state.catalog_count();
+    entry.last_seen = observed_at;
+    if entry.name == name
+        && entry
+            .parent
+            .as_ref()
+            .is_some_and(|key| *key.object() == ObjectId::Lustre(parent))
+    {
+        let (_, fid) = encode_object_id(*entry.key.object());
+        let replacement: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT parent_id, name FROM scoped_namespace_edges
+             WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ? AND parent_kind = 0
+             ORDER BY parent_id, name LIMIT 1",
+        )
+        .bind(entry.key.filesystem().as_str())
+        .bind(fid.as_slice())
+        .fetch_optional(&mut **tx)
+        .await?;
+        entry.parent = None;
+        entry.name = bytes::Bytes::new();
+        if let Some((parent_id, name)) = replacement {
+            let parent =
+                fid_codec::decode(&parent_id).ok_or(StoreError::InvalidObjectIdentity("invalid Lustre parent FID"))?;
+            entry.parent = Some(EntryKey::new(entry.key.filesystem().clone(), ObjectId::Lustre(parent)));
+            entry.name = name.into();
+        }
+    }
+    upsert_scoped_entry_tx(tx, &entry, None).await
+}
+
+async fn remove_lustre_entry_tx(tx: &mut Transaction<'_, MySql>, entry: &ScopedEntryRow, rm_time: i64) -> Result<()> {
+    let key = &entry.key;
+    let filesystem = key.filesystem();
+    let (object_kind, object_id) = encode_object_id(*key.object());
+    sqlx::query("DELETE FROM scoped_stripe_items WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
+        .bind(filesystem.as_str())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        r"INSERT INTO scoped_removed_entries (filesystem_id, object_kind, object_id, entry_data, rm_time)
+          VALUES (?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE entry_data = VALUES(entry_data), rm_time = VALUES(rm_time)",
+    )
+    .bind(filesystem.as_str())
+    .bind(object_kind)
+    .bind(object_id.as_slice())
+    .bind(serde_json::to_string(entry)?)
+    .bind(rm_time)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM scoped_namespace_edges WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
+        .bind(filesystem.as_str())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?")
+        .bind(filesystem.as_str())
+        .bind(object_kind)
+        .bind(object_id.as_slice())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn upsert_lustre_entry_tx(
+    tx: &mut Transaction<'_, MySql>, filesystem: &FileSystemId, entry: &EntryRow,
+) -> Result<()> {
+    let fid_bin = fid_codec::encode(&entry.fid);
+    let mut scoped = ScopedEntryRow::from_lustre(filesystem.clone(), entry);
+    let mut observation = entry.layout_observed_at;
+    let mut replace_stripes = true;
+    if let Some((existing, previous_observation)) = lock_scoped_entry(tx, &scoped.key).await? {
+        if scoped.kind == EntryKind::File
+            && existing.kind == EntryKind::File
+            && (scoped.size, scoped.mtime, scoped.ctime) == (existing.size, existing.mtime, existing.ctime)
+        {
+            // A buffered scan can predate an atime observation
+            // that has already committed for this generation.
+            scoped.atime = scoped.atime.max(existing.atime);
+        }
+        scoped.sm_status = existing.sm_status;
+        replace_stripes = observation > previous_observation;
+        if !replace_stripes {
+            scoped.stripe_count = existing.stripe_count;
+            scoped.stripe_size = existing.stripe_size;
+            scoped.pool_name = existing.pool_name;
+            scoped.stripe_items = existing.stripe_items;
+            observation = None;
+        }
+    }
+    upsert_scoped_entry_tx(tx, &scoped, observation).await?;
+    if replace_stripes {
+        replace_lustre_stripes(tx, filesystem, &fid_bin, &scoped.stripe_items).await?;
+    }
+    if let Some(parent) = entry.parent_fid {
+        upsert_lustre_link_tx(tx, filesystem, &entry.fid, &parent, &entry.name).await?;
+    }
+    Ok(())
+}
+
+async fn upsert_lustre_link_tx(
+    tx: &mut Transaction<'_, MySql>, filesystem: &FileSystemId, fid: &LuFid, parent: &LuFid, name: &[u8],
+) -> Result<()> {
+    let parent_id = fid_codec::encode(parent);
+    sqlx::query(
+        r"INSERT INTO scoped_namespace_edges
+            (filesystem_id, parent_kind, parent_id, name, object_kind, object_id)
+          VALUES (?, 0, ?, ?, 0, ?)
+          ON DUPLICATE KEY UPDATE object_kind = VALUES(object_kind), object_id = VALUES(object_id)",
+    )
+    .bind(filesystem.as_str())
+    .bind(parent_id.as_slice())
+    .bind(name)
+    .bind(fid_codec::encode(fid).as_slice())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn replace_lustre_stripes(

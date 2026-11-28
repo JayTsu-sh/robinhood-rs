@@ -42,6 +42,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/policies/{id}/runs", get(list_rev8_runs))
         .route("/policies/{id}/breaker/reset", post(reset_rev8_breaker))
         .route("/policies/{id}/runs/{run}/operations", get(list_rev8_operations))
+        .route("/policies/preview", post(preview_policy_document))
         .route("/policies/{id}/preview", post(preview_policy))
         .route("/policies/{id}/revisions/{revision}", get(get_policy_revision))
         .route("/entries/count", get(entry_count))
@@ -166,6 +167,18 @@ async fn update_policy(
 #[serde(rename_all = "camelCase")]
 struct PreviewQuery {
     heat_fid: Option<lustre_api::LuFid>,
+}
+
+#[tracing::instrument(skip_all)]
+async fn preview_policy_document(
+    State(state): State<AppState>, Json(document): Json<serde_json::Value>,
+) -> Result<Json<rev8::PreviewResult<()>>, ApiError> {
+    Ok(Json(
+        state
+            .policy_store
+            .preview_rev8_document(&state.entry_store, &document)
+            .await?,
+    ))
 }
 
 #[tracing::instrument(skip(state))]

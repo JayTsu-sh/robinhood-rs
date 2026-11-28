@@ -32,6 +32,30 @@ pub struct ResourceSnapshot {
     pub(crate) inventory: FilesystemInventory,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceView {
+    #[serde(flatten)]
+    snapshot: ResourceSnapshot,
+    preview_available: bool,
+}
+
+impl ResourceView {
+    pub(crate) fn new(snapshot: ResourceSnapshot, config: &FileSystemConfig) -> Self {
+        let preview_available = config.supports_lustre_pool_migration()
+            && snapshot.inventory.mount.is_some()
+            && snapshot
+                .inventory
+                .pools
+                .as_ref()
+                .is_some_and(|pools| pools.iter().filter(|pool| pool.eligible).take(2).count() == 2);
+        Self {
+            snapshot,
+            preview_available,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FilesystemInventory {

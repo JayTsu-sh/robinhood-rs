@@ -13,6 +13,7 @@ export default defineConfig({
   routes: [
     { path: '/', redirect: '/policies' },
     { path: '/policies', component: '@/pages/Policies' },
+    { path: '/policies/preview', component: '@/pages/PolicyPreview' },
     { path: '/resources', component: '@/pages/Resources' },
     { path: '/resources/detail', component: '@/pages/ResourceDetails' },
   ],

@@ -5,7 +5,7 @@ type Inventory<T> =
   | { status: 'ready'; data: T }
   | { status: 'error'; message: string };
 
-function requestError(error: unknown): string {
+export function requestError(error: unknown): string {
   const response = (error as { response?: { data?: { error?: unknown }; status?: number } } | null)?.response;
   if (typeof response?.data?.error === 'string') return response.data.error;
   if (response?.status) return `HTTP ${response.status}`;

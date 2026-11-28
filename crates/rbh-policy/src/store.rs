@@ -113,6 +113,11 @@ impl PolicyStore {
         &self, entries: &EntryStore, id: Option<u64>, document: &serde_json::Value, actor: &str,
     ) -> Result<u64, PolicyError> {
         let input = rev8::parse(document)?;
+        if input.enables_directory_scope() {
+            return Err(rev8::invalid(
+                "spec.enabled must be false for spec.target.directoryScope until live link checks are available",
+            ));
+        }
         self.ensure_configured(input.filesystem())?;
         let config = rev8::validate_filesystem(entries, input.filesystem()).await?;
         let activation = if input.enforced_and_enabled() {
@@ -270,23 +275,35 @@ impl PolicyStore {
             .await
     }
 
-    async fn preview_compiled(
-        &self, entries: &EntryStore, policy: &CompiledPolicy, revision: u64, bindings: Vec<ResourceBinding>,
-        fid: Option<lustre_api::LuFid>,
-    ) -> Result<PreviewResult, PolicyError> {
-        if policy.uses_read_heat {
-            rev8::heat::preview(
-                entries,
-                policy,
-                self.read_heat.get(&policy.filesystem),
-                revision,
-                bindings,
-                fid,
-            )
-            .await
-        } else {
-            policy.preview(entries, revision, bindings).await
+    /// Compile an unsaved document against a read-only view of the current Rev.8 resources.
+    #[tracing::instrument(skip_all, fields(filesystem))]
+    pub async fn preview_rev8_document(
+        &self, entries: &EntryStore, document: &serde_json::Value,
+    ) -> Result<PreviewResult<()>, PolicyError> {
+        let input = rev8::parse(document)?;
+        tracing::Span::current().record("filesystem", tracing::field::display(input.filesystem()));
+        self.ensure_configured(input.filesystem())?;
+        let mut tx = self.pool.begin_with("START TRANSACTION READ ONLY").await?;
+        let (policy, bindings) = Self::bind_policy(&mut tx, input).await?;
+        tx.commit().await?;
+        let migration = policy
+            .pool_migration()
+            .ok_or_else(|| rev8::invalid("draft tiering preview requires lustre.pool_migrate"))?;
+        if !policy.has_directory_scope() {
+            let config = rev8::validate_filesystem(entries, &policy.filesystem).await?;
+            policy.validate_capabilities(&config)?;
+            migration.validate_pools(&config.mount_path).await?;
         }
+        self.preview_compiled(entries, &policy, (), bindings, None).await
+    }
+
+    async fn preview_compiled<Revision>(
+        &self, entries: &EntryStore, policy: &CompiledPolicy, revision: Revision, bindings: Vec<ResourceBinding>,
+        fid: Option<lustre_api::LuFid>,
+    ) -> Result<PreviewResult<Revision>, PolicyError> {
+        policy
+            .preview_with_heat(entries, revision, bindings, self.read_heat.get(&policy.filesystem), fid)
+            .await
     }
 }
 

@@ -189,6 +189,7 @@ fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
 
     let api = LustreApi;
     let fid = api.path_to_fid(&path).unwrap();
+    assert_eq!(api.link_count_by_fid(mount, fid).unwrap(), Some(2));
     let stripe = api.migration_source_layout(mount, &fid).unwrap();
     assert_eq!(stripe.pool.as_deref(), Some("hot"));
     let plan = MigrationPlan {

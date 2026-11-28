@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    LustreApi, LustreApiError, Result,
+    LuFid, LustreApi, LustreApiError, Result,
     mdt::{SpaceUsage, read_ost_usage},
     mount::{LustreMount, client_instance, lustre_mount, open_directory},
     sys,
@@ -84,6 +84,17 @@ impl PoolMount {
         })
     }
 
+    /// Resolve the directory FID on the same pinned mount as pool membership.
+    pub fn directory_fid(&self) -> Result<LuFid> {
+        // Older liblustreapi versions issue an ioctl on this descriptor.
+        let directory = self.open_pinned_directory()?;
+        let mut fid = LuFid::ZERO.into_raw();
+        // SAFETY: the pinned directory is live and fid is writable for the call.
+        let rc = unsafe { sys::llapi_fd2fid(directory.as_raw_fd(), &mut fid) };
+        crate::error::check_rc(rc, "llapi_fd2fid")?;
+        Ok(LuFid::from_raw(fid))
+    }
+
     pub fn read_only(&self) -> bool {
         self.mount.read_only
     }
@@ -153,8 +164,13 @@ impl PoolMount {
 
     /// Open the pinned mount for per-OST capacity measurement.
     pub fn ost_space_reader(&self) -> Result<OstSpaceReader> {
-        let directory = open_directory(Path::new(&format!("/proc/self/fd/{}", self.descriptor.as_raw_fd())))?;
-        Ok(OstSpaceReader { directory })
+        Ok(OstSpaceReader {
+            directory: self.open_pinned_directory()?,
+        })
+    }
+
+    fn open_pinned_directory(&self) -> io::Result<File> {
+        open_directory(Path::new(&format!("/proc/self/fd/{}", self.descriptor.as_raw_fd())))
     }
 
     fn pool_location(&self) -> Result<(PathBuf, String)> {
@@ -186,7 +202,7 @@ impl PoolMount {
             .collect()
     }
 
-    pub(crate) fn pool_members(&self, pool: &str) -> Result<BTreeSet<u32>> {
+    pub fn pool_members(&self, pool: &str) -> Result<BTreeSet<u32>> {
         if !valid_pool_name(pool) {
             return Err(LustreApiError::RecordParse("invalid Lustre pool name"));
         }

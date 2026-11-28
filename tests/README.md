@@ -72,6 +72,41 @@ RBH_INTEGRATION=1 RBH_TEST_CHANGELOG_USER=cl3 \
 RBH_INTEGRATION=1 cargo test -p lustre-api --test integration -- --test-threads=1
 ```
 
+### Rev.8 directory scope preview
+
+Run the REST scenario with a fresh MariaDB database and a Lustre
+mount with non-empty `hot` and `cold` pools. The scenario seeds indexed
+namespace evidence in MariaDB and reads the mount and pool membership.
+
+```sh
+RBH_TEST_DATABASE_URL=mysql://root@127.0.0.1/rbh_preview_test \
+  RBH_TEST_LUSTRE_MOUNT=/mnt/lustre \
+  cargo test --locked -p rbh-api scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_run -- --ignored
+```
+
+The draft endpoint is `POST /api/policies/preview` and accepts a Rev.8 Policy
+pool migration document. `spec.target.directoryScope` accepts a root
+path such as `/team` and optional `excludedSubtrees` such as
+`["/team/archive"]`. Paths are relative to the registered Lustre root and
+begin with `/`. The response returns a null policy revision, the resolved
+resource revisions, and FID counts and logical bytes. The scoped result
+also includes the exact decimal text as `estimatedBytesExact`. Directory reason
+counts cover objects that match the indexed pool and Rev.8 rules or are
+pending a heat observation. The candidate estimate covers the catalog's
+indexed files before execution budgets and live admission checks. Saved
+policies use `POST /api/policies/{id}/preview` with their pinned resource
+bindings. Policies with a directory scope require `spec.enabled: false`
+until live link checks are available. Preview also works with a read-only
+Lustre mount.
+
+The namespace replay regression uses the same isolated database and needs
+no live mount.
+
+```sh
+RBH_TEST_DATABASE_URL=mysql://root@127.0.0.1/rbh_preview_test \
+  cargo test --locked -p rbh-daemon lustre_link_events_keep_all_surviving_paths_on_replay -- --ignored
+```
+
 ### What's covered where
 
 | Layer | File |

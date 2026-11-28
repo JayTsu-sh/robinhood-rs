@@ -1,21 +1,25 @@
 import { ReloadOutlined } from '@ant-design/icons';
-import { Alert, Button, Spin, Typography } from 'antd';
+import { Alert, Button, Flex, Spin, Typography } from 'antd';
 import type { ReactNode } from 'react';
 
 interface Props {
   title: string;
   status: 'loading' | 'ready' | 'error';
   error?: string;
-  refresh: () => void;
+  refresh?: () => void;
   children: ReactNode;
+  action?: ReactNode;
 }
 
-export default function InventoryPage({ title, status, error, refresh, children }: Props) {
+export default function InventoryPage({ title, status, error, refresh, children, action }: Props) {
   return (
     <section>
       <div className="console-title">
         <Typography.Title level={1}>{title}</Typography.Title>
-        <Button icon={<ReloadOutlined />} loading={status === 'loading'} onClick={refresh}>刷新</Button>
+        <Flex gap={12} align="center">
+          {action}
+          {refresh && <Button icon={<ReloadOutlined />} loading={status === 'loading'} onClick={refresh}>刷新</Button>}
+        </Flex>
       </div>
       {status === 'error' && (
         <Alert
@@ -23,7 +27,7 @@ export default function InventoryPage({ title, status, error, refresh, children 
           showIcon
           message="读取失败"
           description={error}
-          action={<Button onClick={refresh}>重试</Button>}
+          action={refresh && <Button onClick={refresh}>重试</Button>}
         />
       )}
       {status === 'loading' && (

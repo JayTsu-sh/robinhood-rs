@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, watch};
 use crate::{
     capacity::CapacityHistory,
     collector::FilesystemProbe,
-    observation::ResourceSnapshot,
+    observation::{ResourceSnapshot, ResourceView},
     repository::{Observation, SnapshotRepository},
 };
 
@@ -27,6 +27,15 @@ struct RegisteredResource {
     config: Arc<FileSystemConfig>,
     probe: FilesystemProbe,
     refresh: Mutex<Option<RefreshResult>>,
+}
+
+impl RegisteredResource {
+    fn view(&self, saved: Option<Observation>) -> ResourceView {
+        let snapshot = saved
+            .filter(|saved| saved.config == *self.config)
+            .map_or_else(|| ResourceSnapshot::pending(&self.config), |saved| saved.resource);
+        ResourceView::new(snapshot, &self.config)
+    }
 }
 
 impl ResourceObservations {
@@ -71,24 +80,16 @@ impl ResourceObservations {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn get(&self, id: &FileSystemId) -> Result<Option<ResourceSnapshot>, sqlx::Error> {
+    pub async fn get(&self, id: &FileSystemId) -> Result<Option<ResourceView>, sqlx::Error> {
         let Some(probe) = self.probe(id) else {
             return Ok(None);
         };
-        let saved = self
-            .snapshots
-            .load(id)
-            .await?
-            .map(|(_, saved)| saved)
-            .filter(|saved| saved.config == *probe.config);
-        Ok(Some(saved.map_or_else(
-            || ResourceSnapshot::pending(&probe.config),
-            |saved| saved.resource,
-        )))
+        let saved = self.snapshots.load(id).await?.map(|(_, saved)| saved);
+        Ok(Some(probe.view(saved)))
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn list(&self) -> Result<Vec<ResourceSnapshot>, sqlx::Error> {
+    pub async fn list(&self) -> Result<Vec<ResourceView>, sqlx::Error> {
         if self.is_empty() {
             return Ok(Vec::new());
         }
@@ -97,12 +98,7 @@ impl ResourceObservations {
         Ok(self
             .probes
             .iter()
-            .map(|probe| {
-                saved
-                    .remove(&probe.config.id)
-                    .filter(|saved| saved.config == *probe.config)
-                    .map_or_else(|| ResourceSnapshot::pending(&probe.config), |saved| saved.resource)
-            })
+            .map(|probe| probe.view(saved.remove(&probe.config.id)))
             .collect())
     }
 
