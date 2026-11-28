@@ -126,8 +126,9 @@ test('opens a resource directly, refreshes that resource and follows an associat
   const labRow = page.getByRole('row').filter({ hasText: 'lab-a' });
   await expect(labRow).toContainText('1 KiB');
   await page.getByRole('combobox', { name: '分层可用性' }).press('Enter');
-  await page.getByRole('option', { name: '暂不可用于分层', exact: true }).click();
+  await page.getByRole('option', { name: '分层不可用', exact: true }).click();
   await expect(labRow).toHaveCount(0);
-  await page.getByRole('row').filter({ hasText: 'lab-b' }).getByRole('cell', { name: '/mnt/lab' }).click();
+  await expect(page.getByText('共 1 / 2 个资源 · 以文件系统为接入单位')).toBeVisible();
+  await page.getByRole('row').filter({ hasText: 'lab-b' }).getByRole('link', { name: '详情' }).click();
   await expect(page.getByRole('heading', { name: 'lab-b', exact: true })).toBeVisible();
 });

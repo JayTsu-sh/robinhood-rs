@@ -11,7 +11,7 @@ import {
 } from '@/components/ResourceStatus';
 import { getFilesystem, listTieringPolicies, refreshFilesystem, type FilesystemResource, type PoolResource } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
-import { poolTiers, type ResourceRegistration } from '@/services/resourceManagement';
+import { poolTiers, resourceOwnerLabels, type ResourceRegistration } from '@/services/resourceManagement';
 import './resource-details.css';
 
 function RelatedPolicies({ filesystem }: { filesystem: string }) {
@@ -117,7 +117,7 @@ function MountInformation({ resource, registration }: { resource: FilesystemReso
     { key: 'source', label: '挂载来源', children: <span className="console-mono">{mount?.source ?? '未取得'}</span> },
     { key: 'mode', label: '访问模式', children: mount === null ? '未取得' : mount.readOnly ? '只读挂载' : '读写挂载' },
     ...(registration ? [
-      { key: 'owner', label: '挂载所有权', children: { deployment: '部署管理', external: '外部管理', daemon: 'daemon 管理' }[registration.owner] },
+      { key: 'owner', label: '挂载所有权', children: resourceOwnerLabels[registration.owner] },
       { key: 'options', label: '挂载参数', children: registration.options.join(', ') || '默认' },
       { key: 'auto', label: 'daemon 重启后恢复挂载', children: registration.owner === 'daemon' ?
         registration.autoMount ? '开启' : '关闭' : '由外部负责' },
