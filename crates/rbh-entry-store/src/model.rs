@@ -291,6 +291,7 @@ impl ScopedEntryRow {
             stripe_count: self.stripe_count,
             stripe_size: self.stripe_size,
             stripe_items: self.stripe_items.clone(),
+            layout_observed_at: None,
             pool_name: self.pool_name.clone(),
             sm_status: self.sm_status.clone(),
             last_seen: self.last_seen,
@@ -351,6 +352,9 @@ pub struct EntryRow {
     /// OST indices in stripe order. Empty when layout metadata is unavailable.
     #[serde(default)]
     pub stripe_items: Vec<u32>,
+    /// Epoch microseconds at the start of a successful live layout read.
+    #[serde(skip)]
+    pub layout_observed_at: Option<i64>,
     pub pool_name: Option<String>,
     pub sm_status: serde_json::Value,
     pub last_seen: i64,
@@ -432,6 +436,7 @@ mod tests {
             stripe_count: Some(2),
             stripe_size: Some(4 * 1024 * 1024),
             stripe_items: vec![0, 1],
+            layout_observed_at: None,
             pool_name: Some("pool1".into()),
             sm_status: serde_json::json!({"hsm_state": "archived"}),
             last_seen: 4,

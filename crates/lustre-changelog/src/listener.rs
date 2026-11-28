@@ -71,7 +71,6 @@ impl Default for ListenerConfig {
                 ChangelogEventType::Mark,
                 ChangelogEventType::Open,
                 ChangelogEventType::NoOpen,
-                ChangelogEventType::ATime,
             ]
             .into_iter()
             .collect(),

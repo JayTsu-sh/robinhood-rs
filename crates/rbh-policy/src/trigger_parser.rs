@@ -108,7 +108,6 @@ fn try_parse_threshold(s: &str) -> Result<Option<TriggerSpec>, TriggerParseError
                 high_pct: pct,
                 low_pct: 0,
                 post_trigger_wait_secs: 0,
-                target: crate::model::ThresholdTarget::Fs,
             }))
         }
         "count" => {
@@ -121,7 +120,6 @@ fn try_parse_threshold(s: &str) -> Result<Option<TriggerSpec>, TriggerParseError
                 high_count: n,
                 low_count: 0,
                 post_trigger_wait_secs: 0,
-                target: crate::model::ThresholdTarget::Fs,
             }))
         }
         "volume" => {
@@ -131,7 +129,6 @@ fn try_parse_threshold(s: &str) -> Result<Option<TriggerSpec>, TriggerParseError
                 high_bytes: bytes,
                 low_bytes: 0,
                 post_trigger_wait_secs: 0,
-                target: crate::model::ThresholdTarget::Fs,
             }))
         }
         _ => Ok(None),

@@ -34,7 +34,7 @@ impl From<ClassifierRow> for ClassifierResponse {
 
 fn policy_err(e: PolicyError) -> (StatusCode, String) {
     match &e {
-        PolicyError::NotFound(_) | PolicyError::NotFoundByName(_) => (StatusCode::NOT_FOUND, e.to_string()),
+        PolicyError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
         PolicyError::InvalidTrigger(_) => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }

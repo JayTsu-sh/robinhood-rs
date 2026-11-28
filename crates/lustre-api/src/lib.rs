@@ -26,13 +26,16 @@
 // Remove this allow once Stage D lands and the whole crate is in use.
 #![allow(dead_code)]
 
+mod mount;
 mod sys;
 
 pub mod changelog;
 pub mod error;
 pub mod fid;
+pub mod heat;
 pub mod hsm;
 pub mod mdt;
+pub mod migration;
 pub mod path;
 pub mod rec;
 pub mod stripe;

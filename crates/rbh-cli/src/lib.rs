@@ -41,21 +41,15 @@ pub enum Command {
         id: u64,
     },
 
-    /// Manually trigger a one-shot run of a policy, optionally narrowed.
+    /// Queue a manual run of the saved Rev.8 policy.
     #[command(name = "policy-run")]
     PolicyRun {
         /// Policy ID.
         id: u64,
-        /// Restrict to files striped on OST N.
-        #[arg(long = "target-ost")]
-        target_ost: Option<u32>,
-        /// Restrict to files in Lustre pool NAME.
-        #[arg(long = "target-pool")]
-        target_pool: Option<String>,
-        /// Restrict to files owned by UID.
-        #[arg(long = "target-user")]
-        target_user: Option<u32>,
-        /// Evaluate rules and log candidates but skip the executor.
+        /// File containing an authenticated Rev.8 writer's bearer token.
+        #[arg(long, env = "RBH_REV8_TOKEN_FILE", required_unless_present = "dry_run")]
+        token_file: Option<std::path::PathBuf>,
+        /// Evaluate candidates immediately without submitting actions.
         #[arg(long)]
         dry_run: bool,
     },
@@ -283,32 +277,21 @@ pub async fn run() -> Result<()> {
         }
         Command::PolicyRun {
             id,
-            target_ost,
-            target_pool,
-            target_user,
+            token_file,
             dry_run,
         } => {
-            // Build target JSON matching rbh_policy::TargetFilter enum.
-            let target = if let Some(o) = target_ost {
-                Some(serde_json::json!({"kind": "ost", "osts": [o]}))
-            } else if let Some(p) = target_pool {
-                Some(serde_json::json!({"kind": "pool", "name": p}))
-            } else {
-                target_user.map(|u| serde_json::json!({"kind": "user", "uid": u}))
-            };
-            let mut body = serde_json::Map::new();
-            if let Some(t) = target {
-                body.insert("target".into(), t);
+            let action = if dry_run { "preview" } else { "run" };
+            let mut request = client.post(format!("{}/api/policies/{id}/{action}", cli.api_url));
+            if let Some(path) = token_file.filter(|_| !dry_run) {
+                let token = tokio::fs::read_to_string(&path).await.map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("read Rev.8 writer token file {}: {error}", path.display()),
+                    )
+                })?;
+                request = request.bearer_auth(token.trim());
             }
-            if dry_run {
-                body.insert("dry_run".into(), serde_json::json!(true));
-            }
-            let body = serde_json::Value::Object(body);
-            let resp = client
-                .post(format!("{}/api/policies/{}/run", cli.api_url, id))
-                .json(&body)
-                .send()
-                .await?;
+            let resp = request.send().await?;
             let status = resp.status();
             let out: serde_json::Value = resp.json().await.unwrap_or_default();
             if !status.is_success() {

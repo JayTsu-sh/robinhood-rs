@@ -145,9 +145,13 @@ fn hsm_state_get_on_plain_file() {
         return;
     }
     let api = LustreApi::new();
-    let (path, _cleanup) = make_test_file("rbh_hsm", b"hsm test");
+    let mount = std::env::var_os("RBH_TEST_LUSTRE_MOUNT").map_or_else(|| PathBuf::from(LUSTRE_MOUNT), PathBuf::from);
+    let path = mount.join(unique_name("rbh_hsm"));
+    let _cleanup = Cleanup(path.clone());
+    fs::write(&path, b"hsm test").expect("write test file");
 
-    let state = api.hsm_state_get(&path).expect("hsm_state_get");
+    let state = api.hsm_state_and_action(&path).expect("authoritative HSM state");
+    assert!(!state.has_active_action(), "{state:?}");
     println!("{} hsm state: {state:?}", path.display());
     // A brand-new file that HSM has never touched should have either empty
     // flags or HS_EXISTS only.
@@ -156,4 +160,131 @@ fn hsm_state_get_on_plain_file() {
         "unexpected HSM state on fresh file: {:?}",
         state.states,
     );
+}
+
+#[test]
+fn pool_migration_preserves_the_fid_hard_link_and_sparse_data() {
+    use lustre_api::migration::{FileVersion, MigrationLimits, MigrationOwnership, MigrationPlacement, MigrationPlan};
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::time::{Duration, Instant};
+
+    let Some(root) = std::env::var_os("RBH_TEST_MIGRATION_HOT_DIR") else {
+        return;
+    };
+    let mount = std::env::var_os("RBH_TEST_LUSTRE_MOUNT").expect("set the Lustre mount");
+    let mount = Path::new(&mount);
+    let path = Path::new(&root).join(unique_name("rbh_sparse"));
+    let file = fs::File::create_new(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    file.write_all_at(b"hot", 0).unwrap();
+    file.write_all_at(b"cold", 2 * 1024 * 1024).unwrap();
+    file.set_len(6 * 1024 * 1024).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let link = path.with_extension("link");
+    fs::hard_link(&path, &link).unwrap();
+    let _cleanup_link = Cleanup(link.clone());
+    let bytes = fs::read(&path).unwrap();
+    let metadata = fs::metadata(&path).unwrap();
+
+    let api = LustreApi;
+    let fid = api.path_to_fid(&path).unwrap();
+    let stripe = api.migration_source_layout(mount, &fid).unwrap();
+    assert_eq!(stripe.pool.as_deref(), Some("hot"));
+    let plan = MigrationPlan {
+        source_pool: "hot".into(),
+        target_pool: "cold".into(),
+        stripe_count: 1,
+        stripe_size: 1024 * 1024,
+    };
+    let generation = FileVersion::from(&metadata);
+    assert!(matches!(
+        api.migrate_pool(mount, &fid, &plan, generation, Instant::now()),
+        Err(lustre_api::migration::MigrationError::Deferred(
+            "migration_deadline_elapsed"
+        ))
+    ));
+    assert_eq!(api.migration_source_layout(mount, &fid).unwrap(), stripe);
+    let fsname = api.hsm_filesystem(mount).unwrap();
+    let limits = MigrationLimits {
+        deadline: Instant::now() + Duration::from_secs(15),
+        expected_access: None,
+        before_swap: || false,
+    };
+    assert!(matches!(
+        api.migrate_reserved_pool(
+            mount,
+            &fid,
+            &plan,
+            generation,
+            limits,
+            MigrationOwnership::acquire(&fsname).unwrap()
+        ),
+        Err(lustre_api::migration::MigrationError::Deferred(
+            "admission_window_closed"
+        ))
+    ));
+    assert_eq!(api.migration_source_layout(mount, &fid).unwrap(), stripe);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let entered = std::cell::Cell::new(false);
+    let limits = MigrationLimits {
+        deadline,
+        expected_access: None,
+        before_swap: || {
+            entered.set(true);
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            true
+        },
+    };
+    assert!(matches!(
+        api.migrate_reserved_pool(
+            mount,
+            &fid,
+            &plan,
+            generation,
+            limits,
+            MigrationOwnership::acquire(&fsname).unwrap()
+        ),
+        Err(lustre_api::migration::MigrationError::Deferred(
+            "migration_deadline_elapsed"
+        ))
+    ));
+    assert!(entered.get(), "the final check must have crossed the deadline");
+    assert_eq!(api.migration_source_layout(mount, &fid).unwrap(), stripe);
+
+    let target = api
+        .migrate_pool(mount, &fid, &plan, generation, Instant::now() + Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(target.layout.pool_name.as_deref(), Some("cold"));
+    assert_eq!(target.layout.stripe_items.len(), 1);
+    assert!(
+        api.pool_members(mount, "cold")
+            .unwrap()
+            .contains(&target.layout.stripe_items[0])
+    );
+    assert!(matches!(
+        api.reconcile_pool_migration(mount, &fid, &plan, generation, &fsname)
+            .unwrap(),
+        MigrationPlacement::Target(_)
+    ));
+    assert_eq!(api.path_to_fid(&link).unwrap(), fid);
+    assert_eq!(api.path_to_fid(&path).unwrap(), fid);
+    assert_eq!(fs::read(&link).unwrap(), bytes);
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(metadata.ino(), after.ino());
+    assert_eq!(after.nlink(), 2);
+    assert_eq!(metadata.mtime_nsec(), after.mtime_nsec());
+    assert!(after.blocks() * 512 < after.size() / 2);
+
+    let modified = fs::OpenOptions::new().write(true).open(&link).unwrap();
+    modified.write_all_at(b"changed after migration", 0).unwrap();
+    modified.set_len(metadata.size() + 1).unwrap();
+    modified.sync_all().unwrap();
+    assert_ne!(FileVersion::from(&modified.metadata().unwrap()), generation);
+    assert!(matches!(
+        api.reconcile_pool_migration(mount, &fid, &plan, generation, &fsname)
+            .unwrap(),
+        MigrationPlacement::Target(_)
+    ));
 }

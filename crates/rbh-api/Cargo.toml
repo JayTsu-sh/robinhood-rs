@@ -14,14 +14,16 @@ rbh-predicate = { path = "../rbh-predicate" }
 rbh-observability = { path = "../rbh-observability" }
 rbh-namespace = { path = "../rbh-namespace" }
 lustre-api = { path = "../lustre-api" }
-scheduler-rs = { git = "ssh://git@github.com/JayTsu-sh/scheduler-rs.git", features = ["sqlx-mysql"] }
 
 axum = { version = "0.8", features = ["json"] }
 futures-util = { workspace = true }
+hex = "0.4"
 nix = { version = "0.29", features = ["user"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 sqlx = { workspace = true }
+subtle = "2"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tower-http = { version = "0.6", features = ["trace", "request-id", "util"] }
@@ -33,3 +35,4 @@ axum-test = "17"
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tempfile = "3"
+async-trait = { workspace = true }

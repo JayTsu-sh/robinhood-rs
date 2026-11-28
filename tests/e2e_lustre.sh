@@ -6,7 +6,7 @@
 #      Lustre → listener → DB.
 #   2. Initial `rbh scan` populates the catalog; orphan sweep trims stale rows.
 #   3. Catalog dump/restore round-trip preserves entries.
-#   4. Manual policy run (--dry-run and live) with threshold triggers.
+#   4. Legacy policy rejection. See the Rev.8 acceptance report for native runs.
 #
 # Not covered (would need lhsmtool_cmd running):
 #   * HSM archive / release state transitions
@@ -230,39 +230,18 @@ assert_ge "$AFTER" "$BEFORE" "restore filled rows back in"
 note "  -> dump=$LINES lines, restore ok ($BEFORE → $AFTER)"
 rm -f "$DUMP"
 
-# ---- 6. policy: dry-run then live ----
-note "scenario 8: policy dry-run and manual run"
-# Install a trivial purge policy scoped to our test dir. The scope uses a
-# name-LIKE that matches our scan-* files; max_count=2 keeps the blast radius
-# tiny and deterministic.
-POLICY_JSON=$(cat <<JSON
-{
-  "name": "e2e_purge",
-  "kind": "purge",
-  "match_tags": {},
-  "trigger": "1h",
-  "action": {"max_count": 2, "nb_threads": 1},
-  "enabled": true
-}
-JSON
-)
-PID_RESP=$(curl -sf -X POST "$API/api/policies" -H 'content-type: application/json' -d "$POLICY_JSON")
-POLICY_ID=$(echo "$PID_RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
-note "  -> policy id=$POLICY_ID"
-
-# Dry-run: no filesystem mutations.
-BEFORE_CNT=$(ls "$TEST_DIR" 2>/dev/null | wc -l)
-curl -sf -X POST "$API/api/policies/$POLICY_ID/run" -H 'content-type: application/json' \
-    -d '{"dry_run":true}' >/dev/null
-sleep 3
-AFTER_DRY=$(ls "$TEST_DIR" 2>/dev/null | wc -l)
-assert_eq "$AFTER_DRY" "$BEFORE_CNT" "dry-run did not remove files"
-note "  -> dry-run left $AFTER_DRY files untouched"
+# ---- 6. policy format ----
+note "scenario 8: legacy policy rejection"
+LEGACY_ERROR=$(curl -sS -X POST "$API/api/policies" -H 'Content-Type: application/json' \
+    -d '{"name":"e2e_purge","kind":"purge","filesystem":"lustre","trigger":"1h"}' \
+    -w '\n%{http_code}')
+assert_eq "${LEGACY_ERROR##*$'\n'}" "400" "legacy policy rejected"
+assert_contains "$LEGACY_ERROR" "hsm.storage.io/v1alpha3" "policy format error identifies Rev.8"
 
 # ---- 7. metrics + health ----
 note "scenario 9: /api/metrics exposes families"
 METRICS=$(curl -sf "$API/api/metrics")
-for m in rbh_catalog_entries rbh_policy_runs_total rbh_changelog_events_total; do
+for m in rbh_catalog_entries rbh_changelog_events_total; do
     assert_contains "$METRICS" "$m" "metric $m registered"
 done
 note "  -> metrics ok"

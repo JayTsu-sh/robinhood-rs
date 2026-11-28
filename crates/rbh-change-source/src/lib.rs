@@ -89,6 +89,7 @@ pub enum ContentChangeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataChangeKind {
     Attributes,
+    AccessTime,
     Xattr,
 }
 
@@ -121,6 +122,10 @@ impl Change {
             Self::Removed { directory: true, .. } => "RMDIR",
             Self::Removed { .. } => "UNLNK",
             Self::Renamed { .. } => "RENME",
+            Self::MetadataChanged {
+                kind: MetadataChangeKind::AccessTime,
+                ..
+            } => "ATIME",
             Self::MetadataChanged {
                 kind: MetadataChangeKind::Xattr,
                 ..
@@ -351,6 +356,11 @@ fn normalize_lustre(event: ChangelogEvent, time: i64) -> Change {
             parent: None,
             name: Bytes::new(),
             kind: ContentChangeKind::Truncate,
+            time,
+        },
+        ChangelogEvent::ATime { fid } => Change::MetadataChanged {
+            object: lustre(fid),
+            kind: MetadataChangeKind::AccessTime,
             time,
         },
         ChangelogEvent::SetAttr { fid } | ChangelogEvent::MTime { fid } | ChangelogEvent::CTime { fid } => {

@@ -21,20 +21,11 @@ pub fn enrich_lustre(lustre: &LustreApi, entry: &PosixEntry) -> Result<EntryRow,
         .as_ref()
         .map(|parent| lustre.path_to_fid(parent))
         .transpose()?;
-    let (stripe_count, stripe_size, stripe_items, pool_name) = if entry.kind == EntryKind::File {
-        lustre
-            .get_stripe_info(&entry.path)
-            .map(|layout| {
-                (
-                    Some(layout.count as u16),
-                    Some(layout.size as u32),
-                    layout.ost_indices,
-                    layout.pool,
-                )
-            })
-            .unwrap_or((None, None, Vec::new(), None))
+    let observed_at = now_secs();
+    let layout = if entry.kind == EntryKind::File {
+        lustre.get_ost_layout(&entry.path).unwrap_or_default()
     } else {
-        (None, None, Vec::new(), None)
+        Default::default()
     };
     Ok(EntryRow {
         fid,
@@ -51,15 +42,13 @@ pub fn enrich_lustre(lustre: &LustreApi, entry: &PosixEntry) -> Result<EntryRow,
         atime: entry.atime,
         mtime: entry.mtime,
         ctime: entry.ctime,
-        stripe_count,
-        stripe_size,
-        stripe_items,
-        pool_name,
+        stripe_count: layout.stripe_count,
+        stripe_size: layout.stripe_size,
+        stripe_items: layout.stripe_items,
+        layout_observed_at: layout.observed_at,
+        pool_name: layout.pool_name,
         sm_status: serde_json::json!({}),
-        last_seen: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
+        last_seen: observed_at,
         depth: entry.depth,
     })
 }
@@ -92,24 +81,12 @@ pub fn build_entry(
     let fid = lustre.path_to_fid(path)?;
 
     // 3. Stripe info (files only)
-    let (stripe_count, stripe_size, stripe_items, pool_name) = if kind == EntryKind::File {
-        match lustre.get_stripe_info(path) {
-            Ok(info) => (
-                Some(info.count as u16),
-                Some(info.size as u32),
-                info.ost_indices,
-                info.pool,
-            ),
-            Err(_) => (None, None, Vec::new(), None),
-        }
+    let observed_at = now_secs();
+    let layout = if kind == EntryKind::File {
+        lustre.get_ost_layout(path).unwrap_or_default()
     } else {
-        (None, None, Vec::new(), None)
+        Default::default()
     };
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
 
     Ok(EntryRow {
         fid,
@@ -126,14 +103,22 @@ pub fn build_entry(
         atime: meta.atime(),
         mtime: meta.mtime(),
         ctime: meta.ctime(),
-        stripe_count,
-        stripe_size,
-        stripe_items,
-        pool_name,
+        stripe_count: layout.stripe_count,
+        stripe_size: layout.stripe_size,
+        stripe_items: layout.stripe_items,
+        layout_observed_at: layout.observed_at,
+        pool_name: layout.pool_name,
         sm_status: serde_json::json!({}),
-        last_seen: now,
+        last_seen: observed_at,
         depth,
     })
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn metadata_to_kind(meta: &std::fs::Metadata) -> EntryKind {

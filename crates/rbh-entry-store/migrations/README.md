@@ -41,3 +41,11 @@ NNN_short_description.sql
 | `008_scope_catalog_consumers.sql` | queryable filesystem-scoped metadata, removed entries, and stripe relationships |
 | `009_scope_policies.sql` | bind legacy policy definitions explicitly to the `lustre` filesystem |
 | `010_scope_changelog_cursor.sql` | scope Lustre changelog cursors by filesystem and MDT |
+| `011_rev8_policy_revisions.sql` | immutable Rev.8 policy definitions |
+| `012_lustre_layout_observed_at.sql` | Lustre layout observation timestamp |
+| `013_rev8_resources.sql` | versioned Rev.8 resources and policy bindings |
+| `014_rev8_execution.sql` | durable run queue, per-FID operation journal, and breaker resets |
+| `015_rev8_pool_migration.sql` | persistent pool migration plan and one pending migration per filesystem |
+| `016_rev8_read_heat.sql` | business-client heat observations and sampling policy index |
+| `017_rev8_pool_residence.sql` | pool residence clock and run heat deferral counts |
+| `018_retire_legacy_policies.sql` | retire unversioned policy heads and restrict heat sampling to tiering policies |

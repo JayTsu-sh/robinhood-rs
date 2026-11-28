@@ -49,7 +49,10 @@ fn main() {
              (expected at /usr/include/lustre/ and /usr/include/linux/lustre/)",
         );
 
-    bindings
-        .write_to_file(&bindings_path)
-        .expect("failed to write bindings.rs to OUT_DIR");
+    let bindings = bindings.to_string();
+    println!("cargo:rustc-check-cfg=cfg(lustre_heat_abi)");
+    if bindings.contains("pub struct lu_heat {") && bindings.contains("obd_heat_type_OBD_HEAT_COUNT") {
+        println!("cargo:rustc-cfg=lustre_heat_abi");
+    }
+    std::fs::write(bindings_path, bindings).expect("failed to write bindings.rs to OUT_DIR");
 }

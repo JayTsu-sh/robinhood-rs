@@ -1,39 +1,41 @@
-# Multi-stage build for the robinhood-rs daemon.
-#
-# The daemon links against liblustreapi via FFI; the dev image bundles
-# the Lustre client libs from rockylinux to satisfy the dynamic linker
-# even when no MDT is reachable. The listener is off by default in the
-# compose stack so no Lustre mount is required at runtime.
-
-FROM rust:1.82-bookworm AS build
+# Debian trixie can load the Ubuntu 24.04 Lustre userspace libraries.
+FROM rust:trixie AS build
 WORKDIR /src
 
-# Build deps. lustre-client is Red Hat only; on Debian we fake
-# liblustreapi with a stub so the dev container links. The stub panics
-# if called — which is fine because RBH_CHANGELOG_USER is unset in the
-# compose stack (the FS-scan path uses different ffi).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev clang llvm-dev libclang-dev \
+        libclang-dev libssl-dev pkg-config libnl-genl-3-200 libreadline8t64 libyaml-0-2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Stub liblustreapi so bindgen + linker are happy.
-RUN mkdir -p /usr/local/include/lustre && \
-    echo 'int llapi_fid2path_at(){return -1;}\nint llapi_get_fsname(){return -1;}\nint llapi_fd2fid(){return -1;}\nint llapi_path2fid(){return -1;}\nint llapi_search_mounts(){return -1;}\nint llapi_obd_statfs(){return -1;}\nint llapi_get_obd_count(){return -1;}\nint llapi_getstripe(){return -1;}\nint llapi_hsm_state_get(){return -1;}\nint llapi_hsm_state_set(){return -1;}\nint llapi_hsm_request(){return -1;}\nint llapi_changelog_start(){return -1;}\nint llapi_changelog_fini(){return -1;}\nint llapi_changelog_recv(){return -1;}\nint llapi_changelog_free(){return -1;}\nint llapi_changelog_clear(){return -1;}\n' > /tmp/stub.c && \
-    gcc -shared -fPIC -o /usr/local/lib/liblustreapi.so /tmp/stub.c && \
-    ln -s liblustreapi.so /usr/local/lib/liblustreapi.so.1 && \
-    ldconfig
+# Whamcloud ships the UAPI headers separately in the client modules package.
+# Extract only its headers. Neither stage installs any Lustre kernel modules.
+ADD --checksum=sha256:1c03caac981736f25440968269e7f324ab1851ac1fa910e3beb0df3ff38b790e https://downloads.whamcloud.com/public/lustre/lustre-2.16.1/ubuntu2404/client/lustre-client-utils_2.16.1-1_amd64.deb /tmp/lustre-client-utils.deb
+ADD --checksum=sha256:aabbf9c9bfdc1505f3b630c10f565f8e35832cee95fba341330fc96bd01b286a https://downloads.whamcloud.com/public/lustre/lustre-2.16.1/ubuntu2404/client/lustre-dev_2.16.1-1_amd64.deb /tmp/lustre-dev.deb
+ADD --checksum=sha256:2c851e0107d7e38f63dd0158d16a974e557959be77ed436e48af7589b497e5a9 https://downloads.whamcloud.com/public/lustre/lustre-2.16.1/ubuntu2404/client/lustre-client-modules-6.8.0-31-generic_2.16.1-1_amd64.deb /tmp/lustre-headers.deb
+RUN dpkg-deb -x /tmp/lustre-client-utils.deb / \
+    && dpkg-deb -x /tmp/lustre-dev.deb / \
+    && dpkg-deb --fsys-tarfile /tmp/lustre-headers.deb | tar -x -C / ./usr/include \
+    && ldconfig
 
-COPY . /src
-RUN cargo build --release -p robinhood-rs -p rbh-cli
+# Cargo.lock pins this public git dependency. HTTPS works without SSH credentials.
+RUN git config --system url."https://github.com/JayTsu-sh/scheduler-rs.git".insteadOf \
+        "ssh://git@github.com/JayTsu-sh/scheduler-rs.git" \
+    && git config --system http."https://github.com/JayTsu-sh/scheduler-rs.git".version HTTP/1.1
 
-FROM debian:bookworm-slim
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY src src
+RUN CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --locked --release -p robinhood-rs -p rbh-cli
+
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates libssl3t64 libnl-genl-3-200 libreadline8t64 libyaml-0-2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /tmp/fake-mount
 COPY --from=build /src/target/release/robinhood /usr/sbin/robinhood
 COPY --from=build /src/target/release/rbh /usr/bin/rbh
-COPY --from=build /usr/local/lib/liblustreapi.so /usr/local/lib/liblustreapi.so
-RUN ln -s /usr/local/lib/liblustreapi.so /usr/local/lib/liblustreapi.so.1 && ldconfig
+COPY --from=build /usr/lib/liblustreapi.so.1.0.0 /usr/local/lib/liblustreapi.so.1
+COPY --from=build /usr/lib/liblnetconfig.so.4.0.0 /usr/local/lib/liblnetconfig.so.4
+RUN ldconfig
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/sbin/robinhood"]

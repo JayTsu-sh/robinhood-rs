@@ -41,6 +41,23 @@ systemctl daemon-reload
 systemctl enable --now rbh-daemon
 ```
 
+## Enable pool migration under systemd
+
+Add a drop-in with `systemctl edit rbh-daemon.service` before enabling an
+enforced pool migration policy. List the executor mount for each Lustre
+filesystem whose policies migrate files. The unit's mount namespace must
+allow the daemon to create volatile files at these mount roots.
+
+```ini
+[Service]
+ReadWritePaths=/mnt/lustre
+```
+
+Use the actual paths from `RBH_FILESYSTEMS_JSON` or `RBH_LUSTRE_MOUNT`.
+For an instance unit, edit `rbh-daemon@INSTANCE.service`. The service
+credentials must allow opening the source files for write and setting
+the source owner and group on each temporary copy.
+
 ## Signals
 
 | Signal   | Effect                                                        |

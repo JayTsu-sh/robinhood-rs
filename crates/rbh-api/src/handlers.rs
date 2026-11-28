@@ -1,15 +1,15 @@
 //! HTTP request handlers for the robinhood-rs REST API.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 
 use rbh_entry_store::model::{EntryKind, EntryRow, FileSystemId, ObjectId, ScopedEntryRow};
 use rbh_entry_store::store::{AggregateKey, AggregateSort, QueryParam};
-use rbh_policy::{PolicyDef, PolicyError};
+use rbh_policy::{PolicyError, rev8, store::Rev8PolicyRow};
 use rbh_predicate::{Predicate, SortKey, SqlParam, to_sql};
 
 use crate::{
@@ -39,8 +39,14 @@ pub fn api_routes() -> Router<AppState> {
             get(get_policy).put(update_policy).delete(delete_policy),
         )
         .route("/policies/{id}/run", post(run_policy_now))
+        .route("/policies/{id}/runs", get(list_rev8_runs))
+        .route("/policies/{id}/breaker/reset", post(reset_rev8_breaker))
+        .route("/policies/{id}/runs/{run}/operations", get(list_rev8_operations))
+        .route("/policies/{id}/preview", post(preview_policy))
+        .route("/policies/{id}/revisions/{revision}", get(get_policy_revision))
         .route("/entries/count", get(entry_count))
         .route("/entries/query", post(query_entries))
+        .route("/entries/{object_id}", get(get_entry))
         .route("/reports/aggregate", post(report_aggregate))
         .route("/reports/top-size", get(top_size))
         .route("/reports/oldest", get(oldest_entries))
@@ -95,164 +101,141 @@ async fn metrics_endpoint(State(state): State<AppState>) -> axum::response::Resp
 // Policies
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-struct PolicyResponse {
-    id: u64,
-    name: String,
-    kind: String,
-    enabled: bool,
-    definition: PolicyDef,
-}
-
-impl From<rbh_policy::PolicyRow> for PolicyResponse {
-    fn from(row: rbh_policy::PolicyRow) -> Self {
-        let kind = row.kind().as_str().to_string();
-        Self {
-            id: row.id,
-            name: row.name,
-            kind,
-            enabled: row.enabled,
-            definition: row.definition,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CreatePolicyRequest {
-    #[serde(flatten)]
-    definition: PolicyDef,
-}
-
-#[tracing::instrument(skip(state, body))]
+#[tracing::instrument(skip_all)]
 async fn create_policy(
-    State(state): State<AppState>, Json(body): Json<CreatePolicyRequest>,
+    State(state): State<AppState>, Extension(writers): Extension<crate::Rev8Writers>, headers: HeaderMap,
+    Json(document): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    validate_policy_request(&state, &body.definition).await?;
-    let id = state.policy_store.create(&body.definition).await?;
-    // Reconcile triggers → scheduler-rs schedules.
-    if let Some(ref scheduler) = state.scheduler
-        && let Err(e) =
-            rbh_policy::reconcile_triggers(scheduler, id, &body.definition.trigger, body.definition.enabled).await
-    {
-        tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
-    }
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
+    rev8::validate_policy_version(&document)?;
+    let actor = writers.authorize(&headers)?;
+    let id = state
+        .policy_store
+        .save_rev8(&state.entry_store, None, &document, actor)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "revision": 1 })),
+    ))
 }
 
 #[tracing::instrument(skip(state))]
-async fn list_policies(State(state): State<AppState>) -> Result<Json<Vec<PolicyResponse>>, ApiError> {
-    let rows = state.policy_store.list().await?;
-    Ok(Json(rows.into_iter().map(PolicyResponse::from).collect()))
+async fn list_policies(State(state): State<AppState>) -> Result<Json<Vec<Rev8PolicyRow>>, ApiError> {
+    Ok(Json(state.policy_store.list_rev8().await?))
 }
 
 #[tracing::instrument(skip(state))]
-async fn get_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Result<Json<PolicyResponse>, ApiError> {
-    let row = state.policy_store.get(id).await?;
-    Ok(Json(PolicyResponse::from(row)))
+async fn get_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Result<Json<Rev8PolicyRow>, ApiError> {
+    Ok(Json(
+        state
+            .policy_store
+            .get_rev8(id)
+            .await?
+            .ok_or(PolicyError::NotFound(id))?,
+    ))
 }
 
-#[tracing::instrument(skip(state, body))]
+#[tracing::instrument(skip_all, fields(id))]
 async fn update_policy(
-    State(state): State<AppState>, Path(id): Path<u64>, Json(body): Json<CreatePolicyRequest>,
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    headers: HeaderMap, Json(document): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    validate_policy_request(&state, &body.definition).await?;
-    state.policy_store.update(id, &body.definition).await?;
-    if let Some(ref scheduler) = state.scheduler
-        && let Err(e) =
-            rbh_policy::reconcile_triggers(scheduler, id, &body.definition.trigger, body.definition.enabled).await
-    {
-        tracing::error!(policy_id = id, error = %e, "trigger reconciliation failed");
-    }
+    rev8::validate_policy_version(&document)?;
+    let actor = writers.authorize(&headers)?;
+    state
+        .policy_store
+        .save_rev8(&state.entry_store, Some(id), &document, actor)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct RunRequest {
-    /// Optional run narrowing. Identical JSON shape to
-    /// `rbh_policy::TargetFilter`. When absent, runs against the whole FS.
-    #[serde(default)]
-    pub target: Option<rbh_policy::TargetFilter>,
-    /// Skip executor; log what would happen. Useful for validating a
-    /// new policy before pulling the trigger.
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-/// Fire a one-shot policy run via an `ImmediateTrigger` schedule. The
-/// response returns the generated schedule id so operators can cancel
-/// or observe it. Requires the scheduler to be present in `AppState`.
-#[tracing::instrument(skip(state, req))]
-async fn run_policy_now(
-    State(state): State<AppState>, Path(id): Path<u64>, Json(req): Json<RunRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    use scheduler_rs::prelude::{MisfirePolicy, ScheduleConfig, Task};
-    use scheduler_rs::trigger::ImmediateTrigger;
-
-    // Verify the policy exists first (returns 404 if not).
-    let row = state.policy_store.get(id).await?;
-    let config = validate_policy_request(&state, &row.definition).await?;
-
-    let target = req.target.unwrap_or(rbh_policy::TargetFilter::Fs);
-    rbh_policy::validate_target_for_filesystem(&target, &config)?;
-
-    let scheduler = state
-        .scheduler
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("scheduler not configured".into()))?;
-
-    let task = rbh_policy::PolicyRunTask {
-        policy_id: id,
-        trigger_idx: u32::MAX, // sentinel: manual run, no trigger bound
-        target,
-        dry_run: req.dry_run,
-    };
-    let task_data = serde_json::to_value(&task).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let config = ScheduleConfig {
-        misfire_policy: MisfirePolicy::Coalesce,
-        max_instances: 1,
-        ..Default::default()
-    };
-    // Use a UUID suffix so same-second manual runs don't collide on
-    // the unique-name constraint (scheduler-rs keys on the UUID id but
-    // the name is what shows up in logs and DB queries).
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let short = &suffix[..8];
-    let name = format!("rbh.policy.{id}.manual.{short}");
-    let schedule_id = scheduler
-        .add_raw(
-            rbh_policy::PolicyRunTask::TYPE_NAME.to_string(),
-            task_data,
-            Box::new(ImmediateTrigger::new()),
-            config,
-            Some(name.clone()),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("scheduler add_raw: {e}")))?;
-    Ok(Json(serde_json::json!({
-        "schedule_id": schedule_id.0.to_string(),
-        "name": name,
-    })))
-}
-
-async fn validate_policy_request(
-    state: &AppState, definition: &PolicyDef,
-) -> Result<rbh_entry_store::FileSystemConfig, ApiError> {
-    let config = state
-        .entry_store
-        .get_filesystem(&definition.filesystem)
-        .await
-        .map_err(|error| ApiError::Internal(error.to_string()))?
-        .ok_or_else(|| ApiError::BadRequest(format!("unknown filesystem: {}", definition.filesystem)))?;
-    rbh_policy::validate_policy_for_filesystem(definition, &config)?;
-    Ok(config)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewQuery {
+    heat_fid: Option<lustre_api::LuFid>,
 }
 
 #[tracing::instrument(skip(state))]
-async fn delete_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Result<StatusCode, ApiError> {
-    if let Some(ref scheduler) = state.scheduler {
-        let _ = rbh_policy::reconcile::remove_policy_schedule(scheduler, id).await;
+async fn preview_policy(
+    State(state): State<AppState>, Path(id): Path<u64>, axum::extract::Query(query): axum::extract::Query<PreviewQuery>,
+) -> Result<Json<rev8::PreviewResult>, ApiError> {
+    Ok(Json(
+        state
+            .policy_store
+            .preview_rev8_with_heat(&state.entry_store, id, query.heat_fid)
+            .await?,
+    ))
+}
+
+#[tracing::instrument(skip(state))]
+async fn get_policy_revision(
+    State(state): State<AppState>, Path((id, revision)): Path<(u64, u64)>,
+) -> Result<Json<Rev8PolicyRow>, ApiError> {
+    Ok(Json(state.policy_store.get_rev8_revision(id, revision).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunRequest {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunPage {
+    #[serde(default)]
+    after_id: u64,
+}
+
+async fn reset_rev8_breaker(
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let actor = writers.authorize(&headers)?;
+    state.policy_store.reset_rev8_breaker(id, actor).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_rev8_runs(
+    State(state): State<AppState>, Path(id): Path<u64>, axum::extract::Query(page): axum::extract::Query<RunPage>,
+) -> Result<Json<Vec<rbh_policy::store::Rev8Run>>, ApiError> {
+    Ok(Json(state.policy_store.list_rev8_runs(id, page.after_id).await?))
+}
+
+async fn list_rev8_operations(
+    State(state): State<AppState>, Path((id, run)): Path<(u64, u64)>,
+    axum::extract::Query(page): axum::extract::Query<RunPage>,
+) -> Result<Json<Vec<rbh_policy::store::Rev8Operation>>, ApiError> {
+    Ok(Json(
+        state.policy_store.list_rev8_operations(id, run, page.after_id).await?,
+    ))
+}
+
+/// Queue a run bound to the current persisted policy revision.
+#[tracing::instrument(skip_all, fields(id))]
+async fn run_policy_now(
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    headers: HeaderMap, body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let actor = writers.authorize(&headers)?;
+    if !body.is_empty() {
+        let request: RunRequest = serde_json::from_slice(&body)
+            .map_err(|error| ApiError::BadRequest(format!("invalid Rev.8 run request: {error}")))?;
+        if request.dry_run {
+            return Ok(Json(state.policy_store.preview_rev8(&state.entry_store, id).await?).into_response());
+        }
     }
-    state.policy_store.delete(id).await?;
+    let run = state.policy_store.request_rev8_run(id, actor).await?;
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"runId": run}))).into_response())
+}
+
+#[tracing::instrument(skip_all, fields(id))]
+async fn delete_policy(
+    State(state): State<AppState>, Path(id): Path<u64>, Extension(writers): Extension<crate::Rev8Writers>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    writers.authorize(&headers)?;
+    state.policy_store.delete_rev8(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -281,6 +264,21 @@ async fn entry_count(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(serde_json::json!({ "filesystem": q.filesystem, "count": count })))
+}
+
+#[tracing::instrument(skip(state))]
+async fn get_entry(
+    State(state): State<AppState>, Path(object_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<FilesystemQuery>,
+) -> Result<Json<EntryDto>, ApiError> {
+    let key = scoped_key_from_text(&state, q.filesystem, &object_id).await?;
+    let entry = state
+        .entry_store
+        .get_scoped_entry(&key)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("entry not found: {object_id}")))?;
+    Ok(Json(entry.into()))
 }
 
 // ---- /api/entries/query ----
@@ -343,6 +341,7 @@ pub struct EntryDto {
     pub ctime: i64,
     pub stripe_count: Option<u16>,
     pub stripe_size: Option<u32>,
+    pub stripe_items: Vec<u32>,
     pub pool_name: Option<String>,
     pub sm_status: serde_json::Value,
     pub last_seen: i64,
@@ -368,6 +367,7 @@ impl From<ScopedEntryRow> for EntryDto {
             ctime: r.ctime,
             stripe_count: r.stripe_count,
             stripe_size: r.stripe_size,
+            stripe_items: r.stripe_items,
             pool_name: r.pool_name,
             sm_status: r.sm_status,
             last_seen: r.last_seen,
@@ -1109,9 +1109,11 @@ async fn admin_sweep_orphans(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-enum ApiError {
+pub(crate) enum ApiError {
     Policy(PolicyError),
+    Unauthorized,
     BadRequest(String),
+    NotFound(String),
     Internal(String),
 }
 
@@ -1127,14 +1129,21 @@ impl IntoResponse for ApiError {
             ApiError::Policy(PolicyError::NotFound(id)) => {
                 (StatusCode::NOT_FOUND, format!("policy not found: id={id}"))
             }
-            ApiError::Policy(PolicyError::NotFoundByName(name)) => {
-                (StatusCode::NOT_FOUND, format!("policy not found: name={name}"))
-            }
             ApiError::Policy(PolicyError::InvalidTrigger(msg)) => (StatusCode::BAD_REQUEST, msg.clone()),
-            ApiError::Policy(
-                error @ (PolicyError::FilesystemMismatch { .. } | PolicyError::UnsupportedCapability { .. }),
-            ) => (StatusCode::BAD_REQUEST, error.to_string()),
+            ApiError::Policy(PolicyError::InvalidPolicy(msg)) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::Policy(error @ PolicyError::NameConflict(_)) => (StatusCode::CONFLICT, error.to_string()),
+            ApiError::Policy(error @ PolicyError::ResourceInUse(_)) => (StatusCode::CONFLICT, error.to_string()),
+            ApiError::Policy(error @ PolicyError::ResourceNotFound(_)) => (StatusCode::NOT_FOUND, error.to_string()),
+            ApiError::Unauthorized => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+                    Json(serde_json::json!({"error": "Rev.8 configuration requires an authenticated writer"})),
+                )
+                    .into_response();
+            }
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::Policy(e) => {
                 tracing::error!(error = %e, "policy error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
@@ -1149,7 +1158,7 @@ impl IntoResponse for ApiError {
 }
 
 #[cfg(test)]
-mod scoped_api_tests {
+pub(crate) mod scoped_api_tests {
     use super::*;
     use axum_test::TestServer;
     use bytes::Bytes;
@@ -1160,7 +1169,7 @@ mod scoped_api_tests {
     use std::sync::Arc;
     use tokio::sync::{Mutex, RwLock};
 
-    fn state_without_database_connection() -> AppState {
+    pub(crate) fn state_without_database_connection() -> AppState {
         let pool = MySqlPoolOptions::new()
             .connect_lazy("mysql://root@127.0.0.1/rbh_entries_test")
             .unwrap();
@@ -1169,13 +1178,565 @@ mod scoped_api_tests {
             classifier_store: rbh_policy::ClassifierStore::new(pool.clone()),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: rbh_entry_store::EntryStore::with_pool(pool),
-            scheduler: None,
             scans: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    fn integration_enabled() -> bool {
+    pub(crate) fn integration_enabled() -> bool {
         matches!(std::env::var("RBH_INTEGRATION"), Ok(value) if !value.is_empty() && value != "0")
+    }
+
+    pub(crate) fn rev8_test_server(state: AppState) -> TestServer {
+        use sha2::{Digest, Sha256};
+
+        const TOKEN: &str = "rev8-rest-test-writer";
+        let digest = hex::encode(Sha256::digest(TOKEN));
+        let writers =
+            crate::Rev8Writers::from_digest_json(&serde_json::json!({"config-operator": digest}).to_string()).unwrap();
+        let mut server = TestServer::new(crate::router_with_writers(state, writers)).unwrap();
+        server.add_header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        server
+    }
+
+    pub(crate) fn resource_document(kind: &str, name: &str, spec: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "hsm.storage.io/v1alpha3", "kind": kind, "metadata": {"name": name}, "spec": spec
+        })
+    }
+
+    pub(crate) fn rev8_archive_policy(filesystem: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "hsm.storage.io/v1alpha3",
+            "kind": "Policy",
+            "metadata": {"name": name},
+            "spec": {
+                "target": {"filesystem": filesystem, "objectType": "file"},
+                "trigger": {"type": "periodic", "interval": "1h"},
+                "objective": {"type": "exhaust"},
+                "rules": {
+                    "entries": [
+                        {
+                            "match": {"field": "object.size", "op": "gte", "value": 64},
+                            "decision": "execute",
+                            "action": {"type": "lustre.hsm.archive", "params": {"archiveId": 1}}
+                        }
+                    ]
+                },
+                "execution": {
+                    "profileRef": "builtin-preview",
+                    "activation": {"mode": "preview"},
+                    "budget": {"run": {
+                        "maxOperations": 10, "maxSubmitAttempts": 10, "maxObjectLogicalBytes": "1GiB"
+                    }}
+                },
+                "governance": {"authorizationRef": "builtin-preview", "approvalPolicyRef": "builtin-preview"}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn rev8_policy_reports_unsupported_version_before_accessing_storage() {
+        let server = rev8_test_server(state_without_database_connection());
+        let mut document = rev8_archive_policy("lustre", "archive-preview");
+        document["apiVersion"] = "hsm.storage.io/v1alpha2".into();
+        let response = server.post("/api/policies").json(&document).await;
+        response.assert_status_bad_request();
+        let body: serde_json::Value = response.json();
+        assert!(body["error"].as_str().unwrap().contains("apiVersion"));
+    }
+
+    #[tokio::test]
+    async fn legacy_policy_submissions_require_a_rev8_document() {
+        let server = rev8_test_server(state_without_database_connection());
+        let legacy = serde_json::json!({
+            "name": "old-archive", "filesystem": "lustre", "kind": "hsm_archive",
+            "enabled": true, "trigger": "1h", "action": {"hsm": {"archive_id": 1}}
+        });
+        for request in [server.post("/api/policies"), server.put("/api/policies/123")] {
+            let response = request.json(&legacy).await;
+            response.assert_status_bad_request();
+            let body = response.json::<serde_json::Value>();
+            assert!(body["error"].as_str().unwrap().contains("hsm.storage.io/v1alpha3"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rev8_manual_run_rejects_a_legacy_target_even_without_a_json_content_type() {
+        let server = rev8_test_server(state_without_database_connection());
+        let response = server
+            .post("/api/policies/123/run")
+            .text(r#"{"target":{"kind":"ost","osts":[7]}}"#)
+            .await;
+        response.assert_status_bad_request();
+        assert!(
+            response.json::<serde_json::Value>()["error"]
+                .as_str()
+                .unwrap()
+                .contains("target")
+        );
+    }
+
+    #[tokio::test]
+    async fn rev8_resource_write_requires_an_authenticated_identity() {
+        let server = TestServer::new(crate::router(state_without_database_connection())).unwrap();
+        let document = serde_json::json!({
+            "apiVersion": "hsm.storage.io/v1alpha3", "kind": "Selector",
+            "metadata": {"name": "all-files"}, "spec": {"where": true}
+        });
+        server
+            .post("/api/selectors")
+            .add_header("x-rbh-principal", "administrator")
+            .json(&document)
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rev8_action_contract_is_registered_and_read_only() {
+        let server = rev8_test_server(state_without_database_connection());
+        let response = server.get("/api/action-contracts").await;
+        response.assert_status_ok();
+        let contracts = response.json::<Vec<serde_json::Value>>();
+        assert_eq!(contracts.len(), 4);
+        let migration = server.get("/api/action-contracts/lustre.pool_migrate").await;
+        migration.assert_status_ok();
+        let migration = migration.json::<serde_json::Value>();
+        assert_eq!(
+            migration["parametersSchema"]["required"],
+            serde_json::json!(["sourcePool", "targetPool", "maxFileBytes"])
+        );
+        assert_eq!(migration["revision"], 2);
+        assert_eq!(
+            migration["parametersSchema"]["properties"]["minResidence"]["type"],
+            "string"
+        );
+        let previous_migration = server
+            .get("/api/action-contracts/lustre.pool_migrate/revisions/1")
+            .await;
+        previous_migration.assert_status_ok();
+        assert!(
+            previous_migration.json::<serde_json::Value>()["parametersSchema"]["properties"]
+                .get("minResidence")
+                .is_none()
+        );
+        assert_eq!(
+            migration["definition"]["spec"]["completionGuarantees"][0]["evidence"],
+            "verified_lustre_layout"
+        );
+        let url = "/api/action-contracts/lustre.hsm.archive";
+        let entry = server.get(url).await;
+        entry.assert_status_ok();
+        assert_eq!(entry.json::<serde_json::Value>(), contracts[0]);
+        assert_eq!(contracts[0]["definition"]["spec"]["effect"]["category"], "data_copy");
+        let historical = server.get(&format!("{url}/revisions/1")).await;
+        historical.assert_status_ok();
+        assert_eq!(historical.json::<serde_json::Value>()["revision"], 1);
+        assert_eq!(contracts[0]["revision"], 2);
+        server
+            .put(url)
+            .json(&contracts[0])
+            .await
+            .assert_status(StatusCode::METHOD_NOT_ALLOWED);
+        server.delete(url).await.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn rev8_policy_reports_invalid_configuration_at_its_field() {
+        let server = rev8_test_server(state_without_database_connection());
+        for (field, value, error_field) in [
+            ("/spec/execution/activation/mode", "unknown".into(), "activation.mode"),
+            ("/spec/trigger/interval", "0h".into(), "trigger.interval"),
+        ] {
+            let mut document = rev8_archive_policy("lustre", "archive-preview");
+            *document.pointer_mut(field).unwrap() = value;
+            let response = server.post("/api/policies").json(&document).await;
+            response.assert_status_bad_request();
+            let body: serde_json::Value = response.json();
+            let message = body["error"].as_str().unwrap();
+            assert!(message.contains(error_field), "{field}: {message}");
+        }
+
+        let mut document = rev8_archive_policy("lustre", "archive-preview");
+        document["spec"]["execution"]["concurrency"] = 1.into();
+        let response = server.post("/api/policies").json(&document).await;
+        response.assert_status_bad_request();
+        let body: serde_json::Value = response.json();
+        assert!(body["error"].as_str().unwrap().contains("unknown field `concurrency`"));
+    }
+
+    #[tokio::test]
+    async fn rev8_policy_previews_scoped_candidates_and_preserves_the_latest_revision() {
+        if !integration_enabled() {
+            return;
+        }
+        let database_url =
+            std::env::var("RBH_TEST_DATABASE_URL").unwrap_or_else(|_| "mysql://root@localhost/rbh_entries_test".into());
+        let store = rbh_entry_store::EntryStore::connect(&database_url).await.unwrap();
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..12];
+        let first = FileSystemId::new(format!("preview-a-{suffix}")).unwrap();
+        let second = FileSystemId::new(format!("preview-b-{suffix}")).unwrap();
+        for filesystem in [&first, &second] {
+            store
+                .register_filesystem(&rbh_entry_store::FileSystemConfig {
+                    id: filesystem.clone(),
+                    backend: rbh_entry_store::BackendKind::Lustre,
+                    mount_path: format!("/mnt/{filesystem}").into(),
+                    capabilities: rbh_entry_store::BackendCapabilities {
+                        hsm: true,
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (fs, oid, kind, size) in [
+            (&first, 1, EntryKind::File, 64),
+            (&first, 2, EntryKind::File, 128),
+            (&first, 3, EntryKind::File, 32),
+            (&first, 4, EntryKind::Directory, 4096),
+            (&second, 1, EntryKind::File, 512),
+        ] {
+            store
+                .upsert_scoped_entry(&ScopedEntryRow {
+                    key: EntryKey::new(
+                        fs.clone(),
+                        ObjectId::Lustre(lustre_api::LuFid::new(0x200000401, oid, 0)),
+                    ),
+                    parent: None,
+                    name: Bytes::from(format!("entry-{oid}")),
+                    kind,
+                    size,
+                    blocks: 1,
+                    uid: 1,
+                    gid: 1,
+                    projid: 0,
+                    mode: 0o644,
+                    nlink: 1,
+                    atime: if oid == 2 { now } else { 0 },
+                    mtime: 0,
+                    ctime: 0,
+                    stripe_count: None,
+                    stripe_size: None,
+                    stripe_items: Vec::new(),
+                    pool_name: None,
+                    sm_status: serde_json::json!({}),
+                    last_seen: 0,
+                    depth: 1,
+                })
+                .await
+                .unwrap();
+        }
+        let build_server = |entry_store: rbh_entry_store::EntryStore| {
+            let mut state = state_without_database_connection();
+            state.policy_store = rbh_policy::PolicyStore::new(entry_store.pool().clone());
+            state.classifier_store = rbh_policy::ClassifierStore::new(entry_store.pool().clone());
+            state.entry_store = entry_store;
+            rev8_test_server(state)
+        };
+        let server = build_server(store);
+        let mut document = rev8_archive_policy(first.as_str(), &format!("archive-preview-{suffix}"));
+        for (field, value, error_field) in [
+            ("/spec/execution/profileRef", "unknown".into(), "profileRef"),
+            ("/spec/rules/entries/0/match/field", "object.fizz".into(), "match.field"),
+            ("/spec/rules/entries/0/match/op", "less".into(), "match.op"),
+            (
+                "/spec/rules/entries/0/match",
+                serde_json::json!({"all": [true, {"field": "object.size", "op": "less", "value": 4}]}),
+                "match.all[1].op",
+            ),
+        ] {
+            let mut invalid = document.clone();
+            *invalid.pointer_mut(field).unwrap() = value;
+            let response = server.post("/api/policies").json(&invalid).await;
+            response.assert_status_bad_request();
+            let body = response.json::<serde_json::Value>();
+            let message = body["error"].as_str().unwrap();
+            assert!(message.contains(error_field), "{field}: {message}");
+        }
+        let created = server.post("/api/policies").json(&document).await;
+        created.assert_status(StatusCode::CREATED);
+        let result: serde_json::Value = created.json();
+        let id = result["id"].as_u64().unwrap();
+        let policy_url = format!("/api/policies/{id}");
+        let preview_url = format!("{policy_url}/preview");
+        let preview = server.post(&preview_url).await;
+        preview.assert_status_ok();
+        let preview = preview.json::<serde_json::Value>();
+        assert_eq!(preview["revision"], 1);
+        assert_eq!(preview["candidateCount"], 2);
+        assert_eq!(preview["estimatedBytes"], 192);
+
+        let mut by_access = document.clone();
+        by_access["metadata"]["name"] = format!("last-access-preview-{suffix}").into();
+        by_access["spec"]["target"]["where"] =
+            serde_json::json!({"field": "object.last_access", "op": "older_than", "value": "2m"});
+        let created = server.post("/api/policies").json(&by_access).await;
+        created.assert_status(StatusCode::CREATED);
+        let access_id = created.json::<serde_json::Value>()["id"].as_u64().unwrap();
+        let access_url = format!("/api/policies/{access_id}");
+        let preview = server.post(&format!("{access_url}/preview")).await;
+        preview.assert_status_ok();
+        let preview = preview.json::<serde_json::Value>();
+        assert_eq!(preview["candidateCount"], 1);
+        assert_eq!(preview["estimatedBytes"], 64);
+        server.delete(&access_url).await.assert_status(StatusCode::NO_CONTENT);
+
+        let rules = document["spec"]["rules"]["entries"].as_array_mut().unwrap();
+        rules.push(serde_json::json!({
+            "priority": 10,
+            "match": {"field": "object.size", "op": "gt", "value": 64},
+            "decision": "skip"
+        }));
+        server
+            .put(&policy_url)
+            .json(&document)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        drop(server);
+        let reopened = rbh_entry_store::EntryStore::connect(&database_url).await.unwrap();
+        let server = build_server(reopened);
+        let current = server.get(&policy_url).await;
+        current.assert_status_ok();
+        let current: serde_json::Value = current.json();
+        assert_eq!(current["revision"], 2);
+        assert_eq!(current["definition"], document);
+        let list = server.get("/api/policies").await;
+        list.assert_status_ok();
+        assert!(list.json::<Vec<serde_json::Value>>().contains(&current));
+        let preview = server.post(&preview_url).await;
+        preview.assert_status_ok();
+        let preview = preview.json::<serde_json::Value>();
+        assert_eq!(preview["revision"], 2);
+        assert_eq!(preview["candidateCount"], 1);
+        assert_eq!(preview["estimatedBytes"], 64);
+
+        check_resource_bindings(&server, &first, suffix, &policy_url, &preview_url, document).await;
+        server.delete(&policy_url).await.assert_status(StatusCode::NO_CONTENT);
+        server.get(&policy_url).await.assert_status_not_found();
+        server
+            .get(&format!("{policy_url}/revisions/1"))
+            .await
+            .assert_status_ok();
+    }
+
+    async fn check_resource_bindings(
+        server: &TestServer, filesystem: &FileSystemId, suffix: &str, policy_url: &str, preview_url: &str,
+        mut policy: serde_json::Value,
+    ) {
+        use serde_json::{Value, json};
+
+        let name = format!("config-{suffix}");
+        let alias = format!("alias-{suffix}");
+        let resources = [
+            (
+                "selectors",
+                "Selector",
+                json!({"where": {"field": "object.size", "op": "gte", "value": 64}}),
+            ),
+            (
+                "execution-profiles",
+                "ExecutionProfile",
+                json!({
+                    "concurrency": {"global": 1},
+                    "retry": {"maxAttempts": 1, "backoff": "fixed", "initialDelay": "1s", "maxDelay": "1s", "retryableErrors": ["transient_io"]},
+                    "workerLease": {"ttl": "1m", "renewEvery": "10s", "onLeaseLost": "stop_and_reconcile"},
+                    "circuitBreaker": {"scopes": [{"domain": {"key": "policy"}, "errorClasses": ["transient_io"], "evaluation": "any",
+                        "conditions": [{"type": "consecutive_failures", "threshold": 1}], "onOpen": "suspend_submissions", "resetMode": "manual"}]}
+                }),
+            ),
+            (
+                "authorization-policies",
+                "AuthorizationPolicy",
+                json!({
+                    "defaultDecision": "deny", "statements": [{"id": "archive", "decision": "allow",
+                        "subjects": {"roles": ["archive-admin"]}, "actions": ["lustre.hsm.archive"], "scope": {"filesystems": [filesystem]}}]
+                }),
+            ),
+            (
+                "approval-policies",
+                "ApprovalPolicy",
+                json!({"defaultDecision": "deny", "requirements": [
+                    {"id": "archive", "actions": ["lustre.hsm.archive"], "mode": "not_required"}
+                ]}),
+            ),
+            (
+                "system-safety-policies",
+                "SystemSafetyPolicy",
+                json!({
+                    "scope": {"filesystems": [filesystem]}, "limits": {"maxOperations": 10}
+                }),
+            ),
+        ];
+        for (collection, kind, spec) in resources {
+            let base = format!("/api/{collection}");
+            let url = format!("{base}/{name}");
+            let mut document = resource_document(kind, &name, spec);
+            let response = server
+                .post(&base)
+                .add_header("x-rbh-principal", "spoofed")
+                .json(&document)
+                .await;
+            response.assert_status(StatusCode::CREATED);
+            let created = response.json::<Value>();
+            assert_eq!(created["modifiedBy"], "config-operator");
+            assert_eq!(created["revision"], 1);
+            let list = server.get(&base).await;
+            list.assert_status_ok();
+            assert!(list.json::<Vec<Value>>().contains(&created));
+            document["metadata"]["description"] = "revision two".into();
+            let response = server.put(&url).json(&document).await;
+            response.assert_status_ok();
+            assert_eq!(response.json::<Value>()["revision"], 2);
+            let history = server.get(&format!("{url}/revisions/1")).await;
+            history.assert_status_ok();
+            assert_eq!(history.json::<Value>(), created);
+        }
+        let auto_rebound = server.get(policy_url).await;
+        auto_rebound.assert_status_ok();
+        assert!(
+            auto_rebound.json::<Value>()["resourceBindings"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"kind": "SystemSafetyPolicy", "name": name, "revision": 2}))
+        );
+        let nested = resource_document("Selector", &alias, json!({"where": {"selectorRef": name}}));
+        server
+            .post("/api/selectors")
+            .json(&nested)
+            .await
+            .assert_status(StatusCode::CREATED);
+        let selector_url = format!("/api/selectors/{name}");
+        let cycle = resource_document("Selector", &name, json!({"where": {"selectorRef": alias}}));
+        let response = server.put(&selector_url).json(&cycle).await;
+        response.assert_status_bad_request();
+        assert!(response.json::<Value>()["error"].as_str().unwrap().contains("cycle"));
+        let invalid = resource_document(
+            "ApprovalPolicy",
+            &name,
+            json!({"defaultDecision": "deny", "requirements": [
+                {"id": "archive", "actions": ["lustre.hsm.archive"], "mode": "not_required", "ttl": "1h"}
+            ]}),
+        );
+        server
+            .put(&format!("/api/approval-policies/{name}"))
+            .json(&invalid)
+            .await
+            .assert_status_bad_request();
+
+        policy["spec"]["target"]["where"] = json!({"selectorRef": alias});
+        policy["spec"]["execution"]["profileRef"] = name.clone().into();
+        policy["spec"]["governance"]["authorizationRef"] = name.clone().into();
+        policy["spec"]["governance"]["approvalPolicyRef"] = name.clone().into();
+        server
+            .put(policy_url)
+            .json(&policy)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let linked_preview = server.post(preview_url).await;
+        linked_preview.assert_status_ok();
+        let linked_preview = linked_preview.json::<Value>();
+        assert_eq!(linked_preview["candidateCount"], 1);
+        let bindings = linked_preview["resourceBindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 7);
+        assert!(bindings.contains(&json!({"kind": "Selector", "name": name, "revision": 2})));
+        assert!(bindings.contains(&json!({"kind": "SystemSafetyPolicy", "name": name, "revision": 2})));
+        let contract = bindings
+            .iter()
+            .find(|binding| binding["kind"] == "ActionContract")
+            .unwrap();
+        assert_eq!(contract["name"], "lustre.hsm.archive");
+        assert_eq!(contract["revision"], 2);
+        assert_eq!(contract["serverDefinition"]["metadata"]["name"], "lustre.hsm.archive");
+
+        let human_floor = resource_document(
+            "SystemSafetyPolicy",
+            &name,
+            json!({
+                "scope": {"filesystems": [filesystem]}, "effectRules": [{
+                    "effect": "data_copy", "minimumApproval": "human", "allowAutoBreakerReset": false
+                }]
+            }),
+        );
+        let safety_url = format!("/api/system-safety-policies/{name}");
+        let incompatible = server.put(&safety_url).json(&human_floor).await;
+        incompatible.assert_status_bad_request();
+        assert!(
+            incompatible.json::<Value>()["error"]
+                .as_str()
+                .unwrap()
+                .contains("APPROVAL_FLOOR_UNSATISFIABLE")
+        );
+        assert_eq!(server.get(&safety_url).await.json::<Value>()["revision"], 2);
+
+        let changed = resource_document(
+            "Selector",
+            &name,
+            json!({"where": {"field": "object.size", "op": "gt", "value": 64}}),
+        );
+        server.put(&selector_url).json(&changed).await.assert_status_ok();
+        let pinned = server.post(preview_url).await;
+        pinned.assert_status_ok();
+        assert_eq!(pinned.json::<Value>(), linked_preview);
+        server
+            .put(policy_url)
+            .json(&policy)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let rebound = server.post(preview_url).await;
+        rebound.assert_status_ok();
+        assert_eq!(rebound.json::<Value>()["candidateCount"], 0);
+        let linked_revision = linked_preview["revision"].as_u64().unwrap();
+        let old = server.get(&format!("{policy_url}/revisions/{linked_revision}")).await;
+        old.assert_status_ok();
+        assert_eq!(
+            old.json::<Value>()["resourceBindings"],
+            linked_preview["resourceBindings"]
+        );
+
+        let profile_url = format!("/api/execution-profiles/{name}");
+        server.delete(&profile_url).await.assert_status(StatusCode::CONFLICT);
+        server
+            .delete(&format!("{profile_url}%20"))
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        server.delete(&selector_url).await.assert_status(StatusCode::CONFLICT);
+        policy["spec"]["enabled"] = false.into();
+        server
+            .put(policy_url)
+            .json(&policy)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        for collection in [
+            "execution-profiles",
+            "authorization-policies",
+            "approval-policies",
+            "system-safety-policies",
+        ] {
+            let url = format!("/api/{collection}/{name}");
+            server.delete(&url).await.assert_status(StatusCode::NO_CONTENT);
+            server.get(&url).await.assert_status(StatusCode::NOT_FOUND);
+            let tombstone = server.get(&format!("{url}/revisions/3")).await;
+            tombstone.assert_status_ok();
+            let tombstone = tombstone.json::<Value>();
+            assert_eq!(tombstone["modifiedBy"], "config-operator");
+            assert!(tombstone["definition"].is_null());
+        }
+        server
+            .delete(&format!("/api/selectors/{alias}"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        server.delete(&selector_url).await.assert_status(StatusCode::NO_CONTENT);
+        server
+            .get(&format!("{selector_url}/revisions/1"))
+            .await
+            .assert_status_ok();
+        let historical = server.post(preview_url).await;
+        historical.assert_status_ok();
+        assert_eq!(historical.json::<Value>()["candidateCount"], 0);
     }
 
     #[tokio::test]
@@ -1282,7 +1843,6 @@ mod scoped_api_tests {
             classifier_store: rbh_policy::ClassifierStore::new(pool),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: store,
-            scheduler: None,
             scans: Arc::new(Mutex::new(HashMap::new())),
         };
         let server = TestServer::new(crate::router(state)).unwrap();
@@ -1394,7 +1954,6 @@ mod scoped_api_tests {
             classifier_store: rbh_policy::ClassifierStore::new(pool),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: store,
-            scheduler: None,
             scans: Arc::new(Mutex::new(HashMap::new())),
         }))
         .unwrap();
@@ -1413,7 +1972,7 @@ mod scoped_api_tests {
     }
 
     #[tokio::test]
-    async fn create_policy_rejects_juicefs_hsm_before_persisting_or_scheduling() {
+    async fn rev8_rejects_hsm_on_juicefs() {
         if !integration_enabled() {
             return;
         }
@@ -1434,27 +1993,17 @@ mod scoped_api_tests {
             .await
             .unwrap();
         let pool = store.pool().clone();
-        let server = TestServer::new(crate::router(AppState {
+        let server = rev8_test_server(AppState {
             policy_store: rbh_policy::PolicyStore::new(pool.clone()),
             classifier_store: rbh_policy::ClassifierStore::new(pool),
             classifier_cache: Arc::new(RwLock::new(Vec::new())),
             entry_store: store,
-            scheduler: None,
             scans: Arc::new(Mutex::new(HashMap::new())),
-        }))
-        .unwrap();
-        let response = server
-            .post("/api/policies")
-            .json(&serde_json::json!({
-                "name": format!("invalid-hsm-{}", std::process::id()),
-                "filesystem": filesystem,
-                "kind": "hsm_archive",
-                "trigger": "1h",
-                "action": {"hsm": {"archive_id": 1}}
-            }))
-            .await;
+        });
+        let document = rev8_archive_policy(filesystem.as_str(), "invalid-hsm");
+        let response = server.post("/api/policies").json(&document).await;
         response.assert_status_bad_request();
         let body: serde_json::Value = response.json();
-        assert!(body["error"].as_str().unwrap().contains("hsm"));
+        assert!(body["error"].as_str().unwrap().contains("Lustre HSM"));
     }
 }

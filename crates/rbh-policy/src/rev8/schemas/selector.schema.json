@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hsm.storage.io/v1alpha3/selector.schema.json",
+  "title": "LHPS Selector (hsm.storage.io/v1alpha3)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "hsm.storage.io/v1alpha3" },
+    "kind": { "const": "Selector" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", "minLength": 1, "maxLength": 253 },
+        "description": { "type": "string" }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["where"],
+      "properties": {
+        "where": { "$ref": "#/$defs/conditionExpr" },
+        "roots": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^/" } },
+        "maxDepth": { "type": "integer", "minimum": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "conditionExpr": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "object", "additionalProperties": false, "required": ["selectorRef"], "properties": { "selectorRef": { "type": "string" } } },
+        { "type": "object", "additionalProperties": false, "required": ["all"], "properties": { "all": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/conditionExpr" } } } },
+        { "type": "object", "additionalProperties": false, "required": ["any"], "properties": { "any": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/conditionExpr" } } } },
+        { "type": "object", "additionalProperties": false, "required": ["not"], "properties": { "not": { "$ref": "#/$defs/conditionExpr" } } },
+        { "$ref": "#/$defs/fieldExpr" }
+      ]
+    },
+    "fieldExpr": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "op"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "op": { "enum": ["eq", "ne", "gt", "gte", "lt", "lte", "in", "not_in", "between", "exists", "is_null", "glob", "regex", "older_than", "newer_than", "has_all", "has_any", "has_none"] },
+        "value": {}
+      }
+    }
+  }
+}

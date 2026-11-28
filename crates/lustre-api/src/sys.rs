@@ -130,6 +130,21 @@ unsafe extern "C" {
 
     pub(crate) fn llapi_layout_get_by_path(path: *const c_char, flags: u32) -> *mut c_void;
 
+    pub(crate) fn llapi_open_by_fid(path: *const c_char, fid: *const lu_fid, flags: c_int) -> c_int;
+
+    pub(crate) fn llapi_fd2fid(fd: c_int, fid: *mut lu_fid) -> c_int;
+    pub(crate) fn llapi_getname(path: *const c_char, name: *mut c_char, len: usize) -> c_int;
+
+    pub(crate) fn llapi_layout_get_by_fd(fd: c_int, flags: u32) -> *mut c_void;
+
+    pub(crate) fn llapi_layout_is_composite(layout: *mut c_void) -> bool;
+
+    pub(crate) fn llapi_layout_comp_flags_get(layout: *const c_void, flags: *mut u32) -> c_int;
+
+    pub(crate) fn llapi_layout_comp_use(layout: *mut c_void, pos: u32) -> c_int;
+
+    pub(crate) fn llapi_layout_pattern_get(layout: *const c_void, pattern: *mut u64) -> c_int;
+
     pub(crate) fn llapi_layout_stripe_count_get(layout: *const c_void, count: *mut u64) -> c_int;
 
     pub(crate) fn llapi_layout_stripe_size_get(layout: *const c_void, size: *mut u64) -> c_int;
@@ -148,7 +163,28 @@ unsafe extern "C" {
         path: *mut c_char, type_: u32, index: u32, stat_buf: *mut obd_statfs, uuid_buf: *mut obd_uuid,
     ) -> c_int;
 
+    // Online pool migration -------------------------------------------------
+
+    pub(crate) fn llapi_get_poolmembers(
+        pool: *const c_char, list: *mut *mut c_char, count: c_int, buffer: *mut c_char, size: c_int,
+    ) -> c_int;
+    pub(crate) fn llapi_file_fget_mdtidx(fd: c_int, index: *mut c_int) -> c_int;
+    pub(crate) fn llapi_create_volatile_param(
+        directory: *const c_char, mdt: c_int, flags: c_int, mode: libc::mode_t,
+        stripe: *const bindings::llapi_stripe_param,
+    ) -> c_int;
+    pub(crate) fn llapi_group_lock(fd: c_int, gid: c_int) -> c_int;
+    pub(crate) fn llapi_group_unlock(fd: c_int, gid: c_int) -> c_int;
+    pub(crate) fn llapi_get_data_version(fd: c_int, version: *mut u64, flags: u64) -> c_int;
+    pub(crate) fn llapi_fswap_layouts_grouplock(
+        src: c_int, dst: c_int, src_version: u64, dst_version: u64, gid: c_int, flags: u64,
+    ) -> c_int;
+
     // HSM -------------------------------------------------------------------
+
+    pub(crate) fn llapi_get_fsname(path: *const c_char, name: *mut c_char, len: usize) -> c_int;
+
+    pub(crate) fn llapi_hsm_current_action(path: *const c_char, action: *mut bindings::hsm_current_action) -> c_int;
 
     pub(crate) fn llapi_hsm_state_get(path: *const c_char, hus: *mut hsm_user_state) -> c_int;
 

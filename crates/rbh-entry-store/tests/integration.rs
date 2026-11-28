@@ -516,6 +516,54 @@ async fn lustre_writes_keep_identical_fids_scoped_without_legacy_side_effects() 
     );
     assert_eq!(store.sum_scoped_size_where(&first_id, "1=1", &[]).await.unwrap(), 100);
     assert_eq!(store.sum_scoped_size_where(&second_id, "1=1", &[]).await.unwrap(), 200);
+    let access_time = first.atime + 60;
+    assert!(
+        store
+            .advance_lustre_atime(&first_id, &first.fid, access_time, first.mtime, first.ctime)
+            .await
+            .unwrap()
+    );
+    let key = EntryKey::new(first_id.clone(), ObjectId::Lustre(first.fid));
+    assert_eq!(store.get_scoped_entry(&key).await.unwrap().unwrap().atime, access_time);
+    store
+        .patch_scoped_sm_status(&key, &serde_json::json!({"tier": "hot"}))
+        .await
+        .unwrap();
+    store.upsert_lustre_entry(&first_id, &first).await.unwrap();
+    assert_eq!(store.get_scoped_entry(&key).await.unwrap().unwrap().atime, access_time);
+    // Older builds advanced the indexed timestamp alone.
+    let access_time = access_time + 60;
+    sqlx::query("UPDATE scoped_entries SET atime = ? WHERE filesystem_id = ?")
+        .bind(access_time)
+        .bind(first_id.as_str())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(store.get_scoped_entry(&key).await.unwrap().unwrap().atime, access_time);
+    store
+        .patch_scoped_sm_status(&key, &serde_json::json!({"tier": "cold"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .count_scoped_where(
+                &first_id,
+                "atime = ?",
+                &[rbh_entry_store::store::QueryParam::Int(access_time)]
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .get_lustre_entry(&second_id, &second.fid)
+            .await
+            .unwrap()
+            .unwrap()
+            .atime,
+        second.atime
+    );
     let mut first_osts = store
         .scoped_stripe_distribution(&first_id)
         .await
@@ -596,6 +644,7 @@ fn make_entry(seq: u64, oid: u32, name: &str) -> EntryRow {
         stripe_count: Some(2),
         stripe_size: Some(4_194_304),
         stripe_items: vec![0, 1],
+        layout_observed_at: None,
         pool_name: None,
         sm_status: serde_json::json!({}),
         last_seen: 1_775_955_820,
