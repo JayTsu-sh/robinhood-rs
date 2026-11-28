@@ -23,6 +23,7 @@ members = [
     "crates/rbh-namespace",
     "crates/rbh-policy",
     "crates/rbh-actions",
+    "crates/rbh-lustre-resources",
     "crates/rbh-api",
     "crates/rbh-daemon",
     "crates/rbh-cli",

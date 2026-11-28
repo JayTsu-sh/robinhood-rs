@@ -21,6 +21,7 @@ pub(crate) fn mount_source(fd: c_int) -> io::Result<Option<String>> {
 }
 
 pub(crate) struct LustreMount {
+    pub id: String,
     pub source: String,
     pub read_only: bool,
 }
@@ -53,6 +54,7 @@ pub(crate) fn lustre_mount(fd: c_int) -> io::Result<Option<LustreMount>> {
         }
     };
     Ok(Some(LustreMount {
+        id: mount_id,
         source: source.to_owned(),
         read_only,
     }))

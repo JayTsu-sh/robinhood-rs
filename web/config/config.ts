@@ -14,5 +14,6 @@ export default defineConfig({
     { path: '/', redirect: '/policies' },
     { path: '/policies', component: '@/pages/Policies' },
     { path: '/resources', component: '@/pages/Resources' },
+    { path: '/resources/detail', component: '@/pages/ResourceDetails' },
   ],
 });

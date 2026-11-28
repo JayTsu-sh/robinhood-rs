@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import type { FilesystemResource } from '../src/services/tiering';
 
 test('the daemon serves the compiled console and its real read APIs', async ({ page, request }) => {
   const [policyResponse, resourceResponse] = await Promise.all([
@@ -7,11 +8,7 @@ test('the daemon serves the compiled console and its real read APIs', async ({ p
   ]);
   expect(policyResponse.ok()).toBe(true);
   expect(resourceResponse.ok()).toBe(true);
-  const resources: {
-    id: string;
-    mountPath: string;
-    pools: { name: string; eligible: boolean }[] | null;
-  }[] = await resourceResponse.json();
+  const resources: FilesystemResource[] = await resourceResponse.json();
   const policies: {
     id: number;
     revision: number;
@@ -63,6 +60,19 @@ test('the daemon serves the compiled console and its real read APIs', async ({ p
   }
   if (!resources.length) {
     await expect(page.getByText('当前 daemon 未注册 Lustre 文件系统')).toBeVisible();
+  }
+  const mounted = resources.find(({ tieringAvailable }) => tieringAvailable);
+  if (mounted) {
+    await page.getByRole('link', { name: mounted.id, exact: true }).click();
+    await page.getByRole('tab', { name: '存储资源' }).click();
+    const pool = mounted.pools?.find(({ eligible }) => eligible);
+    if (pool) {
+      await expect(page.getByRole('cell', { name: pool.name, exact: true })).toBeVisible();
+    }
+    await page.getByRole('tab', { name: '挂载信息' }).click();
+    await page.reload();
+    await expect(page.getByRole('heading', { name: mounted.id, exact: true })).toBeVisible();
+    await expect(page.getByText(mounted.mount?.source ?? '未取得', { exact: true })).toBeVisible();
   }
 });
 
@@ -131,6 +141,11 @@ test('policies show saved values and distinguish empty, filtered, and failed req
 
 test('resources show eligible pools, failures and fresh results independently of policy data', async ({ page }) => {
   let mountMissing = false;
+  await page.route('**/api/filesystems/refresh', (route) => {
+    expect(route.request().method()).toBe('POST');
+    mountMissing = true;
+    return route.fulfill({ status: 204 });
+  });
   await page.route('**/api/filesystems', (route) => route.fulfill({
     json: [{
       id: 'lab-a',
@@ -138,6 +153,8 @@ test('resources show eligible pools, failures and fresh results independently of
       mountStatus: mountMissing ? 'unmounted' : 'mounted',
       collectionStatus: mountMissing ? 'unavailable' : 'partial',
       observedAt: 1795852800,
+      mount: mountMissing ? null : { source: '10.1.2.3@tcp:/lab', readOnly: false },
+      capacity: { status: 'missing', attemptedAt: 1795852800, sample: null, reason: null },
       pools: mountMissing ? null : [
         { name: 'cold', eligible: true, ostIndices: [8], reason: null },
         { name: 'empty', eligible: false, ostIndices: [], reason: 'pool_has_no_osts' },
@@ -158,7 +175,6 @@ test('resources show eligible pools, failures and fresh results independently of
   await expect(row).toContainText('部分采集');
   await row.getByRole('button', { name: '查看原因' }).click();
   await expect(page.getByText('unknown · 采集失败')).toBeVisible();
-  mountMissing = true;
   await page.getByRole('button', { name: '刷新' }).click();
   await expect(row).toContainText('未挂载');
   await expect(row).toContainText('无法确认可选池');

@@ -15,6 +15,7 @@
 
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
@@ -53,8 +54,15 @@ pub struct OstUsage {
     pub avail_bytes: u64,
 }
 
-impl OstUsage {
-    /// Used ratio in 0.0..1.0; `0` when `total_bytes == 0`.
+/// Block space measured on a mounted filesystem or one of its OSTs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceUsage {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+}
+
+impl SpaceUsage {
     pub fn used_ratio(&self) -> f64 {
         if self.total_bytes == 0 {
             0.0
@@ -62,6 +70,70 @@ impl OstUsage {
             self.used_bytes as f64 / self.total_bytes as f64
         }
     }
+
+    pub(crate) fn from_blocks(block_size: u64, blocks: u64, free: u64, available: u64) -> Result<Self> {
+        if block_size == 0 || free > blocks || available > free {
+            return Err(LustreApiError::RecordParse("invalid capacity block counters"));
+        }
+        let bytes = |count: u64| {
+            count
+                .checked_mul(block_size)
+                .ok_or(LustreApiError::IntegerOverflow("capacity bytes"))
+        };
+        Ok(Self {
+            total_bytes: bytes(blocks)?,
+            used_bytes: bytes(blocks - free)?,
+            available_bytes: bytes(available)?,
+        })
+    }
+}
+
+impl From<&OstUsage> for SpaceUsage {
+    fn from(ost: &OstUsage) -> Self {
+        Self {
+            total_bytes: ost.total_bytes,
+            used_bytes: ost.used_bytes,
+            available_bytes: ost.avail_bytes,
+        }
+    }
+}
+
+impl OstUsage {
+    /// Used ratio in 0.0..1.0; `0` when `total_bytes == 0`.
+    pub fn used_ratio(&self) -> f64 {
+        SpaceUsage::from(self).used_ratio()
+    }
+}
+
+pub(crate) fn read_ost_usage(fd: c_int, flags: u32, index: u32) -> Result<Option<OstUsage>> {
+    let mut stat_buf: MaybeUninit<sys::obd_statfs> = MaybeUninit::uninit();
+    let mut uuid = sys::obd_uuid {
+        uuid: [0; sys::UUID_MAX],
+    };
+    // SAFETY: fd is open and both writable out-params stay live for the call.
+    let rc = unsafe { sys::llapi_obd_fstatfs(fd, flags, index, stat_buf.as_mut_ptr(), &mut uuid) };
+    // A sparse slot returns EAGAIN before the kernel writes the UUID.
+    // A configured target may also return EAGAIN after writing its UUID.
+    if (rc == -libc::ENODEV || rc == -libc::EAGAIN) && uuid.uuid[0] == 0 {
+        return Ok(None);
+    }
+    check_rc(rc, "llapi_obd_fstatfs(OST)")?;
+
+    // SAFETY: a successful statfs ioctl fills the counters.
+    let stat = unsafe { stat_buf.assume_init() };
+    let uuid_bytes = uuid.uuid.map(|byte| byte as u8);
+    let full = CStr::from_bytes_until_nul(&uuid_bytes)
+        .map_err(|_| LustreApiError::RecordParse("invalid OST UUID"))?
+        .to_string_lossy();
+    let usage = SpaceUsage::from_blocks(stat.os_bsize.into(), stat.os_blocks, stat.os_bfree, stat.os_bavail)?;
+    Ok(Some(OstUsage {
+        index,
+        name: full.strip_suffix("_UUID").unwrap_or(&full).to_owned(),
+        total_bytes: usage.total_bytes,
+        used_bytes: usage.used_bytes,
+        free_bytes: usage.total_bytes - usage.used_bytes,
+        avail_bytes: usage.available_bytes,
+    }))
 }
 
 impl LustreApi {
@@ -146,7 +218,9 @@ impl LustreApi {
     /// about Lustre's block-size quirks.
     #[tracing::instrument(name = "lustre.ost_usage", skip(self), fields(mount = %mount.display()))]
     pub fn ost_usage(&self, mount: &Path) -> Result<Vec<OstUsage>> {
-        let mut c_mount = CString::new(mount.as_os_str().as_bytes())?.into_bytes_with_nul();
+        let directory = crate::mount::open_directory(mount)?;
+        let fd = directory.as_raw_fd();
+        let mut c_mount = CString::new(format!("/proc/self/fd/{fd}"))?.into_bytes_with_nul();
 
         let mut count: c_int = 0;
         let rc = unsafe {
@@ -160,53 +234,17 @@ impl LustreApi {
         if count < 0 {
             return Err(LustreApiError::IntegerOverflow("llapi_get_obd_count returned negative"));
         }
-        let count = count as u32;
-
         let mut out = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let mut stat_buf: MaybeUninit<sys::obd_statfs> = MaybeUninit::uninit();
-            let mut uuid_buf: MaybeUninit<sys::obd_uuid> = MaybeUninit::uninit();
-
-            // SAFETY: both out-params live on the stack for the duration.
-            let rc = unsafe {
-                sys::llapi_obd_statfs(
-                    c_mount.as_mut_ptr() as *mut c_char,
-                    sys::LL_STATFS_LOV,
-                    index,
-                    stat_buf.as_mut_ptr(),
-                    uuid_buf.as_mut_ptr(),
-                )
-            };
-            if rc < 0 {
-                if rc == -libc::ENODEV || rc == -libc::EAGAIN {
-                    continue;
-                }
-                check_rc(rc, "llapi_obd_statfs(OST)")?;
+        for index in 0..count as u32 {
+            match read_ost_usage(fd, sys::LL_STATFS_LOV, index) {
+                Ok(Some(usage)) => out.push(usage),
+                Ok(None)
+                | Err(LustreApiError::Ffi {
+                    errno: libc::ENODEV | libc::EAGAIN,
+                    ..
+                }) => {}
+                Err(error) => return Err(error),
             }
-
-            // SAFETY: rc >= 0 means both are initialized.
-            let st = unsafe { stat_buf.assume_init() };
-            let uuid = unsafe { uuid_buf.assume_init() };
-
-            let name_bytes: &[c_char] = &uuid.uuid;
-            let cstr = unsafe { CStr::from_ptr(name_bytes.as_ptr()) };
-            let full = cstr.to_string_lossy();
-            let name = full.strip_suffix("_UUID").unwrap_or(&full).to_owned();
-
-            let bsize = st.os_bsize as u64;
-            let total_bytes = st.os_blocks.saturating_mul(bsize);
-            let free_bytes = st.os_bfree.saturating_mul(bsize);
-            let avail_bytes = st.os_bavail.saturating_mul(bsize);
-            let used_bytes = total_bytes.saturating_sub(free_bytes);
-
-            out.push(OstUsage {
-                index,
-                name,
-                total_bytes,
-                used_bytes,
-                free_bytes,
-                avail_bytes,
-            });
         }
         Ok(out)
     }

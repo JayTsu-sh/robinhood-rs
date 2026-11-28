@@ -1,9 +1,10 @@
 import { SearchOutlined } from '@ant-design/icons';
 import { ProTable, type ProColumns } from '@ant-design/pro-components';
+import { Link, useSearchParams } from '@umijs/max';
 import { Button, Empty, Input, Select, Tag } from 'antd';
 import { useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
-import { listTieringPolicies, type TieringPolicy } from '@/services/tiering';
+import { filesystemDetailsPath, listTieringPolicies, type TieringPolicy } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
 
 const columns: ProColumns<TieringPolicy>[] = [
@@ -14,7 +15,7 @@ const columns: ProColumns<TieringPolicy>[] = [
     title: '文件系统',
     dataIndex: 'filesystem',
     width: 145,
-    renderText: (value) => <span className="console-mono">{value}</span>,
+    render: (_, { filesystem }) => <Link className="console-mono" to={filesystemDetailsPath(filesystem)}>{filesystem}</Link>,
   },
   {
     title: '源池 → 目标池',
@@ -32,9 +33,12 @@ export default function Policies() {
   const { state, refresh } = useInventory(listTieringPolicies);
   const [search, setSearch] = useState('');
   const [enabled, setEnabled] = useState('all');
-  const allRows = state.status === 'ready' ? state.rows : [];
+  const [params, setParams] = useSearchParams();
+  const policyId = params.get('policy');
+  const allRows = state.status === 'ready' ? state.data : [];
   const query = search.trim().toLowerCase();
   const rows = allRows.filter((row) =>
+    (!policyId || String(row.id) === policyId) &&
     (enabled === 'all' || row.enabled === (enabled === 'enabled')) &&
     [row.name, String(row.id), row.filesystem, row.sourcePool, row.targetPool]
       .some((value) => value.toLowerCase().includes(query)),
@@ -69,11 +73,20 @@ export default function Policies() {
             ]}
           />
           <Button
-            disabled={!search && enabled === 'all'}
-            onClick={() => { setSearch(''); setEnabled('all'); }}
+            disabled={!policyId && !search && enabled === 'all'}
+            onClick={() => {
+              setSearch('');
+              setEnabled('all');
+              if (policyId) {
+                const next = new URLSearchParams(params);
+                next.delete('policy');
+                setParams(next);
+              }
+            }}
           >
             重置筛选
           </Button>
+          {policyId && <Tag>策略 ID {policyId}</Tag>}
         </div>
         <ProTable
           columns={columns}

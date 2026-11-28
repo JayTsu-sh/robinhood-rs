@@ -2217,6 +2217,7 @@ dependencies = [
  "nix",
  "rbh-entry-store",
  "rbh-fs-scan",
+ "rbh-lustre-resources",
  "rbh-namespace",
  "rbh-observability",
  "rbh-policy",
@@ -2303,6 +2304,7 @@ dependencies = [
  "rbh-change-source",
  "rbh-entry-store",
  "rbh-fs-scan",
+ "rbh-lustre-resources",
  "rbh-namespace",
  "rbh-observability",
  "rbh-policy",
@@ -2349,6 +2351,19 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rbh-lustre-resources"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "lustre-api",
+ "rbh-entry-store",
+ "serde",
+ "sqlx",
  "tokio",
  "tracing",
 ]

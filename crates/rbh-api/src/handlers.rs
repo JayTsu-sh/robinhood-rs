@@ -1128,6 +1128,7 @@ pub(crate) enum ApiError {
     Unauthorized,
     BadRequest(String),
     NotFound(String),
+    ServiceUnavailable(String),
     Internal(String),
 }
 
@@ -1158,6 +1159,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             ApiError::Policy(e) => {
                 tracing::error!(error = %e, "policy error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())

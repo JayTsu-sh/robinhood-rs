@@ -53,6 +53,15 @@ installation directory, such as the local `web/dist/` for development.
 The daemon only needs read access to the installed files. Node.js is a build
 dependency.
 
+The daemon schedules Lustre resource collection through `scheduler-rs` at
+startup and every 60 seconds by default. Set `RBH_CONSOLE_COLLECT_SECS` to a
+positive number of seconds to change the interval. The console reads the
+latest MariaDB snapshots. Refresh requests wait for the selected collection
+to finish and then reload the saved snapshots.
+Each collector uses its hostname to scope saved observations. Set a stable,
+unique `RBH_CONSOLE_OBSERVER_ID` when daemon instances with the same hostname
+share a MariaDB database or when a deployment has a changing hostname.
+
 To exercise the browser flows against a running daemon with built assets,
 run `npx playwright install chromium` and `npm run test:e2e` in `web/`.
 `RBH_CONSOLE_TEST_URL` defaults to `http://127.0.0.1:8080`.

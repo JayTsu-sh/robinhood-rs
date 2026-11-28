@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 type Inventory<T> =
   | { status: 'loading' }
-  | { status: 'ready'; rows: T[] }
+  | { status: 'ready'; data: T }
   | { status: 'error'; message: string };
 
 function requestError(error: unknown): string {
@@ -12,7 +12,10 @@ function requestError(error: unknown): string {
   return error instanceof Error ? error.message : '无法连接 daemon';
 }
 
-export function useInventory<T>(load: (signal: AbortSignal) => Promise<T[]>) {
+export function useInventory<T>(
+  load: (signal: AbortSignal) => Promise<T>,
+  reload: (signal: AbortSignal) => Promise<T> = load,
+) {
   const [state, setState] = useState<Inventory<T>>({ status: 'loading' });
   const [attempt, setAttempt] = useState(0);
   const refresh = useCallback(() => {
@@ -22,16 +25,17 @@ export function useInventory<T>(load: (signal: AbortSignal) => Promise<T[]>) {
 
   useEffect(() => {
     const controller = new AbortController();
-    load(controller.signal).then(
-      (rows) => {
-        if (!controller.signal.aborted) setState({ status: 'ready', rows });
+    const request = attempt === 0 ? load : reload;
+    request(controller.signal).then(
+      (data) => {
+        if (!controller.signal.aborted) setState({ status: 'ready', data });
       },
       (error: unknown) => {
         if (!controller.signal.aborted) setState({ status: 'error', message: requestError(error) });
       },
     );
     return () => controller.abort();
-  }, [attempt, load]);
+  }, [attempt, load, reload]);
 
   return { state, refresh };
 }

@@ -10,6 +10,7 @@ mod heat_agent;
 mod heat_sampling;
 pub use heat_agent::{HeatAgentError, run_heat_agent};
 mod hsm_poller;
+mod resource_collection;
 mod runtime;
 mod signals;
 
@@ -458,18 +459,47 @@ pub async fn run() -> anyhow::Result<()> {
             }
         })
         .unwrap_or_else(|| "/usr/share/robinhood/console".into());
-    let app = rbh_api::router_with_console(
-        state,
-        writers,
-        runtime_registry.iter().map(|runtime| runtime.config.clone()).collect(),
-        console_dir,
+    let observer_id = match std::env::var("RBH_CONSOLE_OBSERVER_ID") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .context("read hostname for Lustre resource observations")?,
+        Err(error) => return Err(error).context("read RBH_CONSOLE_OBSERVER_ID"),
+    };
+    let observer_id = observer_id.trim();
+    anyhow::ensure!(
+        !observer_id.is_empty() && observer_id.len() <= 255,
+        "RBH_CONSOLE_OBSERVER_ID must contain 1 to 255 bytes"
     );
+    let console_resources = rbh_lustre_resources::ResourceObservations::new(
+        pool.clone(),
+        observer_id.to_owned(),
+        runtime_registry.iter().map(|runtime| runtime.config.clone()).collect(),
+    );
+    let console_collect_secs = match std::env::var("RBH_CONSOLE_COLLECT_SECS") {
+        Ok(value) => value
+            .parse::<u32>()
+            .context("RBH_CONSOLE_COLLECT_SECS must be a positive integer")?,
+        Err(std::env::VarError::NotPresent) => 60,
+        Err(error) => return Err(error).context("read RBH_CONSOLE_COLLECT_SECS"),
+    };
+    anyhow::ensure!(
+        console_collect_secs > 0,
+        "RBH_CONSOLE_COLLECT_SECS must be greater than zero"
+    );
+    let app = rbh_api::router_with_console(state, writers, console_resources.clone(), console_dir);
 
     // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
     let listen_addr = std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
+    resource_collection::register(
+        &scheduler,
+        console_resources.clone(),
+        std::time::Duration::from_secs(console_collect_secs.into()),
+    )
+    .await
+    .context("register Lustre resource collection")?;
     tracing::info!(addr = %listen_addr, "HTTP server listening");
 
     let shutdown_cancel = daemon_cancel.clone();
@@ -493,11 +523,13 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!("scheduler started");
     let outcome = tokio::select! {
         signal = signals::supervise(obs_guard, daemon_cancel.clone(), None, None) => {
+            console_resources.stop();
             scheduler.shutdown();
             signal.and(scheduler_run.await.context("Rev.8 scheduler shutdown failed"))
         }
         Some(error) = worker_failures.recv() => {
             daemon_cancel.cancel();
+            console_resources.stop();
             scheduler.shutdown();
             if let Err(shutdown_error) = scheduler_run.await {
                 tracing::warn!(%shutdown_error, "Rev.8 scheduler shutdown failed");
@@ -511,6 +543,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     };
     daemon_cancel.cancel();
+    console_resources.stop();
 
     // Tell systemd we're stopping so it can update unit state before
     // the process exits and suppresses its own timeout warnings.

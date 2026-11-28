@@ -36,14 +36,30 @@ export interface PoolResource {
   ostIndices: number[] | null;
   eligible: boolean;
   reason: string | null;
+  capacity: Capacity;
+}
+
+export interface Capacity {
+  status: 'collected' | 'partial' | 'missing' | 'error';
+  attemptedAt: number | null;
+  sample: {
+    observedAt: number;
+    totalBytes: number;
+    usedBytes: number;
+    availableBytes: number;
+    usedRatio: number;
+  } | null;
+  reason: string | null;
 }
 
 export interface FilesystemResource {
   id: string;
   mountPath: string;
   mountStatus: 'mounted' | 'unmounted' | 'unknown';
-  collectionStatus: 'collected' | 'partial' | 'unavailable' | 'error';
-  observedAt: number;
+  collectionStatus: 'pending' | 'collected' | 'partial' | 'unavailable' | 'error';
+  observedAt: number | null;
+  mount: { source: string; readOnly: boolean } | null;
+  capacity: Capacity;
   pools: PoolResource[] | null;
   tieringAvailable: boolean;
   reason: string | null;
@@ -88,4 +104,31 @@ export async function listTieringPolicies(signal: AbortSignal) {
 
 export function listFilesystems(signal: AbortSignal) {
   return request<FilesystemResource[]>('/api/filesystems', { signal, timeout: 15000, skipErrorHandler: true });
+}
+
+export function getFilesystem(id: string, signal: AbortSignal) {
+  return request<FilesystemResource>('/api/filesystems/detail', {
+    params: { filesystem: id }, signal, timeout: 15000, skipErrorHandler: true,
+  });
+}
+
+function collectFilesystems(signal: AbortSignal, id?: string) {
+  return request('/api/filesystems/refresh', {
+    method: 'POST', params: id === undefined ? undefined : { filesystem: id },
+    signal, timeout: 25000, skipErrorHandler: true,
+  });
+}
+
+export async function refreshFilesystems(signal: AbortSignal) {
+  await collectFilesystems(signal);
+  return listFilesystems(signal);
+}
+
+export async function refreshFilesystem(id: string, signal: AbortSignal) {
+  await collectFilesystems(signal, id);
+  return getFilesystem(id, signal);
+}
+
+export function filesystemDetailsPath(id: string) {
+  return `/resources/detail?${new URLSearchParams({ filesystem: id })}`;
 }

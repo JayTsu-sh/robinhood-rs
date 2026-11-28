@@ -12,7 +12,7 @@ const navigation = [
 
 export default function ConsoleLayout() {
   const { pathname } = useLocation();
-  const page = navigation.find(({ key }) => pathname === key);
+  const page = navigation.find(({ key }) => pathname === key || pathname.startsWith(`${key}/`));
   useEffect(() => { document.documentElement.lang = 'zh-CN'; }, []);
   return (
     <ConfigProvider
