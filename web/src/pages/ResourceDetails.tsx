@@ -1,8 +1,8 @@
 import { ArrowLeftOutlined } from '@ant-design/icons';
 import { ProTable, type ProColumns } from '@ant-design/pro-components';
-import { Link, useNavigate, useSearchParams } from '@umijs/max';
+import { Link, useSearchParams } from '@umijs/max';
 import { Alert, Button, Descriptions, Empty, Result, Space, Spin, Tabs, Tag, Typography } from 'antd';
-import { useCallback, useState } from 'react';
+import { useCallback } from 'react';
 import InventoryPage from '@/components/InventoryPage';
 import ResourceManagement, { useResourceManagement } from '@/components/ResourceManagement';
 import {
@@ -11,8 +11,8 @@ import {
 } from '@/components/ResourceStatus';
 import { getFilesystem, listTieringPolicies, type FilesystemResource, type PoolResource } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
-import { poolTiers, resourceOwnerLabels, type ResourceRegistration } from '@/services/resourceManagement';
 import { useResourceEvents } from '@/services/useResourceEvents';
+import { poolTiers, resourceOwnerLabels, withLiveMountStatus, type ResourceRegistration } from '@/services/resourceManagement';
 import './resource-details.css';
 
 function RelatedPolicies({ filesystem }: { filesystem: string }) {
@@ -111,17 +111,22 @@ function Storage({ resource, now, registration }: { resource: FilesystemResource
 
 function MountInformation({ resource, registration }: { resource: FilesystemResource; registration?: ResourceRegistration }) {
   const { id, mountPath, mountStatus, mount } = resource;
+  const source = mount?.source || (mountStatus === 'mounted' ? registration?.source : undefined);
+  let autoMount = '由外部负责';
+  if (registration?.owner === 'daemon') {
+    autoMount = registration.autoMount ? '开启' : '关闭';
+    if (registration.autoMount && !registration.desiredMounted) autoMount = '手动挂载后启用';
+  }
   return <Descriptions column={{ xs: 1, md: 2 }} items={[
     { key: 'id', label: '文件系统 ID', children: <span className="console-mono">{id}</span> },
     { key: 'path', label: '注册挂载路径', children: <span className="console-mono">{mountPath}</span> },
     { key: 'state', label: '挂载状态', children: <MountStatus status={mountStatus} /> },
-    { key: 'source', label: '挂载来源', children: <span className="console-mono">{mount?.source ?? '未取得'}</span> },
+    { key: 'source', label: '挂载来源', children: <span className="console-mono">{source || '未取得'}</span> },
     { key: 'mode', label: '访问模式', children: mount === null ? '未取得' : mount.readOnly ? '只读挂载' : '读写挂载' },
     ...(registration ? [
       { key: 'owner', label: '挂载所有权', children: resourceOwnerLabels[registration.owner] },
       { key: 'options', label: '挂载参数', children: registration.options.join(', ') || '默认' },
-      { key: 'auto', label: 'daemon 重启后恢复挂载', children: registration.owner === 'daemon' ?
-        registration.autoMount ? '开启' : '关闭' : '由外部负责' },
+      { key: 'auto', label: 'daemon 重启后恢复挂载', children: autoMount },
     ] : []),
   ]} />;
 }
@@ -132,14 +137,11 @@ function ResourceDetails({ id }: { id: string }) {
   const { management, error: managementError, refresh: reloadManagement } = useResourceManagement();
   useResourceEvents(refresh, reloadManagement, id);
   const registration = management?.resources.find((candidate) => candidate.id === id);
-  const [removing, setRemoving] = useState<ResourceRegistration>();
-  const editableRegistration = registration ?? removing;
-  const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const requestedTab = params.get('tab');
   const tab = requestedTab === 'storage' || requestedTab === 'mount' ? requestedTab : 'overview';
   const now = useObservationClock();
-  const resource = state.status === 'ready' ? state.data : null;
+  const resource = state.status === 'ready' && state.data ? withLiveMountStatus(state.data, registration) : null;
 
   function refreshResources() {
     refresh();
@@ -152,20 +154,16 @@ function ResourceDetails({ id }: { id: string }) {
       <InventoryPage title={registration?.name || id} status={state.status}
         error={state.status === 'error' ? state.message : undefined}
         refreshError={state.status === 'ready' ? state.refreshError : undefined} retry={refreshResources}
-        action={management && editableRegistration && (resource || removing) && <ResourceManagement
-          management={management} resource={editableRegistration} onRemoving={setRemoving}
+        action={registration && resource && <ResourceManagement resource={registration}
           pools={resource?.pools?.map(({ name }) => name)}
-          mounted={resource?.mountStatus === 'mounted'}
-          onRefresh={(removed) => {
-            if (removed) navigate('/resources');
-            else refreshResources();
-          }} />}>
-        {managementError && <Alert type="warning" showIcon message="集群接入信息读取失败" description={managementError}
+          mounted={resource.mountStatus === 'mounted'}
+          onRefresh={refreshResources} />}>
+        {managementError && <Alert type="warning" showIcon message="集群挂载信息读取失败" description={managementError}
           action={<Button onClick={reloadManagement}>重试</Button>} />}
         {state.status === 'ready' && !resource && <Result status="404" title="Lustre 文件系统未注册" />}
         {resource && (
           <div className="resource-panel">
-            {registration?.lastMountError && <Alert type="warning" showIcon message="最近挂载失败"
+            {resource.mountStatus !== 'mounted' && registration?.lastMountError && <Alert type="warning" showIcon message="最近挂载失败"
               description={registration.lastMountError} />}
             <Tabs activeKey={tab} onChange={(key) => setParams(key === 'overview' ? { filesystem: id } : { filesystem: id, tab: key })} items={[
               { key: 'overview', label: '集群概览', children: <Overview resource={resource} now={now} /> },

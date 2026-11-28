@@ -7,51 +7,57 @@ import {
   Availability, CapacityStatus, CollectionStatus, MountStatus, formatBytes,
   formatObservationTime, formatUsage, useObservationClock,
 } from '@/components/ResourceStatus';
-import { resourceOwnerLabels, type ResourceRegistration } from '@/services/resourceManagement';
+import { withLiveMountStatus, type ResourceRegistration } from '@/services/resourceManagement';
 import { filesystemDetailsPath, listFilesystems, type FilesystemResource } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
 import { useResourceEvents } from '@/services/useResourceEvents';
 import './resources.css';
 
-function resourceColumns(
-  now: number, registrations: Map<string, ResourceRegistration>,
-): TableColumnsType<FilesystemResource> {
+type ClusterRow = {
+  key: string;
+  mountPath: string;
+  mountStatus: FilesystemResource['mountStatus'];
+  source?: string;
+  resource?: FilesystemResource;
+  registration?: ResourceRegistration;
+};
+
+function resourceColumns(now: number): TableColumnsType<ClusterRow> {
   return [
     {
-      title: '集群名称 / 文件系统',
-      width: 154,
-      render: (_, { id, mount }) => {
-        const registration = registrations.get(id);
-        const name = registration?.name || id;
-        const source = mount?.source || registration?.source;
-        const filesystem = source?.match(/:\/([^/]+)/)?.[1] ?? id;
-        const identifiers = [...new Set([filesystem, id])].filter((label) => label !== name);
+      title: '集群名称',
+      width: 140,
+      render: (_, { resource, registration }) => {
+        if (!resource) return '—';
+        const { id } = resource;
+        return <Link to={filesystemDetailsPath(id)} className="lustre-table-link">{registration?.name || id}</Link>;
+      },
+    },
+    {
+      title: '文件系统',
+      width: 125,
+      render: (_, { resource, source }) => {
+        const filesystem = source?.match(/:\/([^/]+)/)?.[1] ?? resource?.id;
+        const id = resource?.id;
         return (
           <>
-            <Link to={filesystemDetailsPath(id)} className="lustre-table-link">{name}</Link>
-            {identifiers.length > 0 && <div className="lustre-cell-note console-mono">{identifiers.join(' · ')}</div>}
+            <span className="console-mono">{filesystem ?? '—'}</span>
+            {id && id !== filesystem && <div className="lustre-cell-note console-mono">{id}</div>}
+            {!resource && source && <div className="lustre-cell-note lustre-mount-source console-mono">{source}</div>}
           </>
         );
       },
     },
     {
-      title: '挂载路径 / 所有权',
-      width: 168,
-      render: (_, { id, mountPath }) => {
-        const registration = registrations.get(id);
-        return (
-          <>
-            <span className="console-mono">{mountPath}</span>
-            <div className="lustre-cell-note">{registration ? resourceOwnerLabels[registration.owner] : '—'}</div>
-          </>
-        );
-      },
+      title: '挂载路径',
+      width: 148,
+      render: (_, { mountPath }) => <span className="console-mono">{mountPath}</span>,
     },
     {
       title: '挂载状态',
       width: 92,
-      render: (_, { id, mountStatus }) => {
-        const error = registrations.get(id)?.lastMountError;
+      render: (_, { registration, mountStatus }) => {
+        const error = registration?.lastMountError;
         return (
           <>
             <MountStatus status={mountStatus} />
@@ -68,8 +74,10 @@ function resourceColumns(
     },
     {
       title: '信息采集',
-      width: 132,
-      render: (_, { collectionStatus, observedAt, pools }) => {
+      width: 116,
+      render: (_, { resource }) => {
+        if (!resource) return '—';
+        const { collectionStatus, observedAt, pools } = resource;
         const failedPools = pools?.filter((pool) => pool.ostIndices === null) ?? [];
         return (
           <>
@@ -93,7 +101,8 @@ function resourceColumns(
     {
       title: 'Pool 数',
       width: 74,
-      render: (_, { pools }) => {
+      render: (_, { resource }) => {
+        const pools = resource?.pools;
         if (!pools?.length) return pools?.length ?? '—';
         return (
           <Popover
@@ -113,23 +122,25 @@ function resourceColumns(
     {
       title: '总容量 / 使用率',
       width: 130,
-      render: (_, { capacity }) => (
-        <>
+      render: (_, { resource }) => {
+        if (!resource) return '—';
+        const { capacity } = resource;
+        return <>
           <div>{formatBytes(capacity.sample?.totalBytes)}</div>
           {capacity.sample && <div className="lustre-cell-note">{formatUsage(capacity.sample.usedRatio)}</div>}
           <CapacityStatus capacity={capacity} now={now} hideFresh />
-        </>
-      ),
+        </>;
+      },
     },
     {
       title: '分层状态',
       width: 125,
-      render: (_, resource) => <Availability resource={resource} compact />,
+      render: (_, { resource }) => resource ? <Availability resource={resource} compact /> : '—',
     },
     {
       title: '操作',
       width: 65,
-      render: (_, { id }) => <Link to={filesystemDetailsPath(id)} className="lustre-table-link">详情</Link>,
+      render: (_, { resource }) => resource && <Link to={filesystemDetailsPath(resource.id)} className="lustre-table-link">详情</Link>,
     },
   ];
 }
@@ -138,29 +149,37 @@ export default function Resources() {
   const { state, refresh } = useInventory(listFilesystems, listFilesystems, { keepPrevious: true, queueRefresh: true });
   const { management, error: managementError, refresh: reloadManagement } = useResourceManagement();
   useResourceEvents(refresh, reloadManagement);
+  const status = state.status === 'ready' && !management && !managementError ? 'loading' : state.status;
   const registrations = new Map(management?.resources.map((resource) => [resource.id, resource]));
   const now = useObservationClock();
   const [availability, setAvailability] = useState('all');
 
-  const allRows = state.status === 'ready' ? state.data : [];
+  const allRows: ClusterRow[] = (state.status === 'ready' ? state.data : []).map((snapshot) => {
+    const registration = registrations.get(snapshot.id);
+    const resource = withLiveMountStatus(snapshot, registration);
+    return {
+      key: resource.id, resource, registration, mountPath: resource.mountPath, mountStatus: resource.mountStatus,
+      source: resource.mount?.source || registration?.source,
+    };
+  });
+  const registeredPaths = new Set(allRows.map(({ mountPath }) => mountPath));
+  for (const { path, source } of management?.availableMounts ?? []) {
+    if (!registeredPaths.has(path)) allRows.push({ key: `mount:${path}`, mountPath: path, mountStatus: 'mounted', source });
+  }
   const rows = allRows.filter(
-    ({ tieringAvailable }) => availability === 'all' || tieringAvailable === (availability === 'available'),
+    ({ resource }) => availability === 'all' || (resource?.tieringAvailable === true) === (availability === 'available'),
   );
+  const normalClusters = allRows.filter(({ mountStatus, resource }) =>
+    mountStatus === 'mounted' && (resource?.tieringAvailable ?? true)).length;
   const metrics = [
-    { label: '已接入文件系统', value: allRows.length, caption: '本机 Lustre 客户端', color: 'blue' },
+    { label: '正常集群', value: normalClusters, color: 'green' },
+    { label: '异常集群', value: allRows.length - normalClusters, color: 'amber' },
+    { label: '文件系统', value: allRows.length, color: 'blue' },
     {
-      label: '已挂载', value: allRows.filter(({ mountStatus }) => mountStatus === 'mounted').length,
-      caption: '包含应用与外部管理挂载', color: 'green',
-    },
-    {
-      label: '分层不可用', value: allRows.filter(({ tieringAvailable }) => !tieringAvailable).length,
-      caption: '挂载、采集或 Pool 异常', color: 'amber',
-    },
-    {
-      label: '可用 Pool',
-      value: allRows.reduce((sum, { tieringAvailable, pools }) =>
-        sum + (tieringAvailable ? pools?.filter(({ eligible }) => eligible).length ?? 0 : 0), 0),
-      caption: '按文件系统统计', color: 'green',
+      label: '存储池',
+      value: allRows.reduce((sum, { resource }) =>
+        sum + (resource?.tieringAvailable ? resource.pools?.filter(({ eligible }) => eligible).length ?? 0 : 0), 0),
+      color: 'green',
     },
   ];
 
@@ -173,25 +192,24 @@ export default function Resources() {
     <div className="lustre-resources">
       <InventoryPage
         title="Lustre 集群"
-        description="管理本机客户端接入的 Lustre 文件系统、挂载及分层所需资源。"
-        status={state.status}
+        description="查看 Lustre 文件系统、挂载状态和存储池。"
+        status={status}
         error={state.status === 'error' ? state.message : undefined}
         refreshError={state.status === 'ready' ? state.refreshError : undefined}
         retry={refreshResources}
-        primaryAction={management && (
-          <ResourceManagement management={management} canAdd={!managementError} onRefresh={refreshResources} />
+        primaryAction={management?.canCreateMount && (
+          <ResourceManagement onRefresh={refreshResources} />
         )}
       >
         {managementError && (
-          <Alert type="warning" showIcon message="集群接入信息读取失败" description={managementError}
+          <Alert type="warning" showIcon message="集群挂载信息读取失败" description={managementError}
             action={<Button onClick={reloadManagement}>重试</Button>} />
         )}
         <dl className="lustre-metrics">
-          {metrics.map(({ label, value, caption, color }) => (
+          {metrics.map(({ label, value, color }) => (
             <div className={`lustre-metric lustre-metric-${color}`} key={label}>
               <dt>{label}</dt>
               <dd>{value}</dd>
-              <dd className="lustre-metric-caption">{caption}</dd>
             </div>
           ))}
         </dl>
@@ -208,30 +226,29 @@ export default function Resources() {
                 { value: 'unavailable', label: '分层不可用' },
               ]}
             />
-            <span>本机 Lustre Client · 当前节点</span>
           </div>
           <Table
-            columns={resourceColumns(now, registrations)}
+            columns={resourceColumns(now)}
             dataSource={rows}
-            rowKey="id"
-            onRow={({ id }) => ({
+            rowKey="key"
+            onRow={({ resource }) => resource ? ({
               onClick: ({ target, currentTarget }) => {
                 if (target instanceof Element && currentTarget.contains(target) &&
                   !target.closest('a, button') && window.getSelection()?.isCollapsed !== false) {
-                  history.push(filesystemDetailsPath(id));
+                  history.push(filesystemDetailsPath(resource.id));
                 }
               },
               className: 'lustre-resource-row',
-            })}
+            }) : {}}
             pagination={false}
-            scroll={{ x: 940 }}
+            scroll={{ x: 1020 }}
             locale={{
               emptyText: <div className="lustre-empty">
-                {allRows.length ? '没有符合筛选条件的文件系统' : '当前 daemon 未注册 Lustre 文件系统'}
+                {allRows.length ? '没有符合筛选条件的文件系统' : '暂无 Lustre 资源'}
               </div>,
             }}
           />
-          <div className="lustre-table-footer">共 {rows.length} / {allRows.length} 个资源 · 以文件系统为接入单位</div>
+          <div className="lustre-table-footer">共 {rows.length} / {allRows.length} 个资源 · 以文件系统为单位</div>
         </div>
       </InventoryPage>
     </div>

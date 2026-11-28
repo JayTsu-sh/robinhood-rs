@@ -328,7 +328,7 @@ post() {
 old_container=$(compose managed ps -q rbh-daemon)
 wait_api managed '/api/scans?filesystem=qa-managed' 'all(.[]; .state != "running")'
 docker exec -d "$old_container" sh -ec '
-    cd /mnt/rbh-lustre/qa-managed
+    cd /mnt/qa-managed
     touch /tmp/qa-busy-ready
     while [ ! -f /tmp/qa-busy-release ]; do sleep 1; done
 '
@@ -345,14 +345,23 @@ get "$management" | jq -e 'any(.resources[]; .id == "qa-managed" and .autoMount 
     > "$output/busy-unmount-keeps-intent.json" || fail 'A failed unmount changed the restore intent.'
 printf 'Busy unmount preserved automatic restoration.\n'
 
+docker kill "$old_container" >/dev/null
 compose managed up -d --force-recreate --no-build --pull never
 [[ $(compose managed ps -q rbh-daemon) != "$old_container" ]] || fail 'The managed mount container was not replaced.'
+wait_api managed /api/health '.status == "ok"'
+get "$management" | jq -e 'any(.resources[]; .id == "qa-managed" and .mounted)' \
+    > "$output/restored-mount.json" || fail 'The restored mount was missing from the first management response.'
 wait_api managed /api/filesystems 'any(.[]; .id == "qa-managed" and .tieringAvailable)'
-browser managed mount-lifecycle lustre-container.spec.ts --grep 'restores after|attaches an actual' --workers=1
+browser managed mount-lifecycle lustre-container.spec.ts --grep 'restores after|shows an actual external' --workers=1
+
+compose managed up -d --force-recreate --no-build --pull never
+wait_api managed /api/health '.status == "ok"'
+get "$management" | jq -e 'any(.resources[]; .id == "qa-managed" and .autoMount and .desiredMounted == false and .mounted == false)' \
+    > "$output/unmounted-after-restart.json" || fail 'A manually unmounted cluster was lost or remounted.'
 
 status=$(post "$management" '{"id":"qa-external","name":"Registration race","mount":{"type":"existing","path":"/mnt/qa-existing"}}' \
     "$output/race-register.json")
-[[ $status == 201 ]] || fail "Could not reattach the external mount, got HTTP $status."
+[[ $status == 201 ]] || fail "Could not register the external mount, got HTTP $status."
 wait_api managed '/api/scans?filesystem=qa-external' 'all(.[]; .state != "running")'
 jq '.metadata.name="qa-registration-race" | .spec.target.filesystem="qa-external" | del(.spec.target.directoryScope) |
     .spec.execution.activation.mode="preview" |

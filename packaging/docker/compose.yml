@@ -21,7 +21,7 @@ services:
       - "RBH_LISTEN_ADDR=${RBH_LISTEN_ADDR:-127.0.0.1:8080}"
       - "RBH_FILESYSTEMS_JSON=${RBH_FILESYSTEMS_JSON:-[]}"
       - "RBH_CONSOLE_OBSERVER_ID=${RBH_CONSOLE_OBSERVER_ID:?set a stable unique ID for this daemon}"
-      - RBH_LUSTRE_MANAGED_ROOT=/mnt/rbh-lustre
+      - RBH_LUSTRE_MANAGED_ROOT=/mnt
       - RBH_POLICY_WRITERS_FILE=/run/rbh-config/writers.json
       - RBH_HSM_PRINCIPAL_FILE
     volumes:

@@ -160,7 +160,8 @@ impl PolicyStore {
             .cloned()
     }
 
-    async fn console_mount_matches(&self, config: &FileSystemConfig) -> bool {
+    /// Check the live mount for a console registration.
+    pub async fn console_mount_matches(&self, config: &FileSystemConfig) -> bool {
         let Some(source) = self.console_mount_source(&config.id) else {
             return true;
         };

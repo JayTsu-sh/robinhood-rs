@@ -93,7 +93,7 @@ test('the daemon serves the compiled console and its real read APIs', { tag: '@d
     }
   }
   if (!resources.length) {
-    await expect(page.getByText('当前 daemon 未注册 Lustre 文件系统')).toBeVisible();
+    await expect(page.getByText('暂无 Lustre 资源')).toBeVisible();
   }
   const mounted = resources.find(({ tieringAvailable }) => tieringAvailable);
   if (mounted) {
@@ -188,19 +188,19 @@ test('policies show saved values and distinguish empty, filtered, and failed req
   await expect(page.getByText('暂无分层策略')).toBeVisible();
 });
 
-test('Lustre resource list shows the prototype columns, pool counts and collection failures', async ({ page }) => {
+test('Lustre resource list shows separate cluster and filesystem columns, pool counts and collection failures', async ({ page }) => {
   const send = await controlResourceEvents(page);
-  let name = '测试集群';
   let mountMissing = false;
   let managementFails = false;
+  let externalMount = false;
   await page.route('**/api/filesystems/management', (route) => managementFails
     ? route.fulfill({ status: 503, json: { error: '无法读取注册信息' } })
     : route.fulfill({
       json: {
-        canCreateMount: false, availableMounts: [],
+        canCreateMount: false, availableMounts: externalMount ? [{ path: '/mnt/external', source: '10.1.2.3@tcp:/external' }] : [],
         resources: [{
-          id: 'lab-a', name, owner: 'external', source: '10.1.2.3@tcp:/oldlab',
-          lastMountError: '连接超时',
+          id: 'lab-a', name: '测试集群', owner: 'external', source: '10.1.2.3@tcp:/oldlab',
+          path: '/mnt/lab', mounted: !mountMissing, lastMountError: '连接超时',
         }],
       },
     }));
@@ -229,29 +229,36 @@ test('Lustre resource list shows the prototype columns, pool counts and collecti
   }));
   await page.goto('/console/#/resources');
   await expect(page.getByRole('columnheader')).toHaveText([
-    '集群名称 / 文件系统', '挂载路径 / 所有权', '挂载状态', '信息采集',
+    '集群名称', '文件系统', '挂载路径', '挂载状态', '信息采集',
     'Pool 数', '总容量 / 使用率', '分层状态', '操作',
   ]);
-  await expect(page.getByText('共 1 / 1 个资源 · 以文件系统为接入单位')).toBeVisible();
+  const metrics = page.locator('.lustre-metrics');
+  await expect(metrics.locator('dt')).toHaveText(['正常集群', '异常集群', '文件系统', '存储池']);
+  await expect(metrics.locator('dd')).toHaveText(['1', '0', '1', '2']);
+  await expect(page.getByText('本机 Lustre Client · 当前节点', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('共 1 / 1 个资源 · 以文件系统为单位', { exact: true })).toBeVisible();
   const row = page.getByRole('row').filter({ hasText: '测试集群' });
-  await expect(row.getByRole('cell').nth(0)).toHaveText('测试集群lab · lab-a');
-  await expect(row.getByRole('cell').nth(1)).toHaveText('/mnt/lab外部管理');
-  await expect(row.getByRole('cell').nth(6)).toHaveText('可用');
+  const cells = row.getByRole('cell');
+  await expect(cells.nth(0)).toHaveText('测试集群');
+  await expect(cells.nth(1)).toHaveText('lablab-a');
+  await expect(cells.nth(2)).toHaveText('/mnt/lab');
+  await expect(cells.nth(7)).toHaveText('可用');
   await expect(row.getByRole('link', { name: '详情' })).toHaveAttribute('href', '#/resources/detail?filesystem=lab-a');
   const pools = row.getByRole('button', { name: '查看 4 个 Pool' });
   await pools.click();
   await expect(page.getByText('cold', { exact: true })).toBeVisible();
   await expect(page.getByText('hot', { exact: true })).toBeVisible();
   await pools.click();
-  await expect(row).toContainText('部分采集');
+  await expect(cells.nth(4)).toContainText('部分采集');
   await row.getByRole('button', { name: '查看原因' }).click();
   await expect(page.getByText('unknown · 采集失败')).toBeVisible();
   await expect(page.getByRole('button', { name: '刷新资源' })).toHaveCount(0);
   mountMissing = true;
   await send('snapshot', 'lab-a');
   await expect(row).toContainText('未挂载');
-  await expect(row.getByRole('cell').nth(0)).toHaveText('测试集群oldlab · lab-a');
-  await expect(row.getByRole('cell').nth(4)).toHaveText('—');
+  await expect(cells.nth(0)).toHaveText('测试集群');
+  await expect(cells.nth(1)).toHaveText('oldlablab-a');
+  await expect(cells.nth(5)).toHaveText('—');
   await expect(row).toContainText('配置路径未挂载 Lustre');
   await row.getByRole('button', { name: '挂载异常' }).press('Enter');
   await expect(page.getByText('连接超时', { exact: true })).toBeVisible();
@@ -259,12 +266,12 @@ test('Lustre resource list shows the prototype columns, pool counts and collecti
   managementFails = true;
   await send('management', '*');
   await expect(page.getByRole('alert')).toContainText('无法读取注册信息');
-  await expect(row).toContainText('外部管理');
+  await expect(cells.nth(0)).toHaveText('测试集群');
   await expect(page.getByRole('button', { name: '添加集群' })).toHaveCount(0);
   managementFails = false;
-  name = '恢复连接后更新的集群';
+  externalMount = true;
   await send('disconnect');
-  await expect(page.getByRole('link', { name })).toBeVisible({ timeout: 8_000 });
+  await expect(page.getByText('/mnt/external', { exact: true })).toBeVisible({ timeout: 8_000 });
   await expect(page.getByRole('alert')).toHaveCount(0);
   expect(collections).toEqual([]);
 });

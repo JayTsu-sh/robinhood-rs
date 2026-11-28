@@ -960,6 +960,10 @@ pub(crate) async fn start_scan(
         .root
         .clone()
         .unwrap_or_else(|| config.mount_path.to_string_lossy().into_owned());
+    let mut scans = state.scans.lock().await;
+    if !state.policy_store.console_mount_matches(&config).await {
+        return Err(ApiError::BadRequest("registered Lustre mount is unavailable".into()));
+    }
     let id = uuid::Uuid::new_v4().to_string();
 
     // Record the full glob list visible to the walker so operators can
@@ -981,7 +985,8 @@ pub(crate) async fn start_scan(
         finished_at: None,
         error_message: None,
     };
-    state.scans.lock().await.insert(id.clone(), rec);
+    scans.insert(id.clone(), rec);
+    drop(scans);
 
     // Detach a worker that drains the scan into the entry store.
     let scans = state.scans.clone();

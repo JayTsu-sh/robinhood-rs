@@ -1,7 +1,7 @@
 //! Console-managed Lustre client registrations and mount lifecycle.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -18,13 +18,23 @@ use rbh_entry_store::{BackendCapabilities, BackendKind, FileSystemConfig, FileSy
 use rbh_lustre_resources::ResourceObservations;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json as Stored;
-use tokio::{process::Command, sync::Mutex};
+use tokio::{
+    process::Command,
+    sync::{Mutex, MutexGuard},
+};
 
 use crate::{
     AppState, PolicyWriters,
     handlers::{ApiError, StartScanRequest, start_scan},
-    state::ScanState,
+    state::{ScanRecord, ScanState},
 };
+
+const CONTAINER_MANAGED_ROOT: &str = "/mnt";
+const LEGACY_CONTAINER_MANAGED_ROOT: &str = "/mnt/rbh-lustre";
+
+/// Marks requests received through the dedicated console gateway socket.
+#[derive(Clone, Copy)]
+pub struct ConsoleGateway;
 
 #[derive(Clone)]
 pub struct ResourceAdministration {
@@ -54,6 +64,27 @@ pub enum ResourceAdministrationError {
         #[source]
         source: StoreError,
     },
+}
+
+fn validate_managed_root(root: &Path) -> Result<(), ResourceAdministrationError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let (canonical, metadata) = root
+        .canonicalize()
+        .and_then(|path| path.metadata().map(|metadata| (path, metadata)))
+        .map_err(|source| ResourceAdministrationError::ManagedRootIo {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    if canonical != root
+        || root == Path::new("/")
+        || !metadata.is_dir()
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+    {
+        return Err(ResourceAdministrationError::InvalidManagedRoot);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,8 +142,16 @@ impl Registration {
 #[serde(rename_all = "camelCase")]
 struct ManagementView {
     can_create_mount: bool,
-    resources: Vec<Registration>,
+    resources: Vec<RegistrationView>,
     available_mounts: Vec<DetectedMount>,
+}
+
+#[derive(Serialize)]
+struct RegistrationView {
+    #[serde(flatten)]
+    registration: Registration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mounted: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -174,22 +213,7 @@ impl ResourceAdministration {
         app: AppState, observations: ResourceObservations, observer: String, managed_root: Option<PathBuf>,
     ) -> Result<Self, ResourceAdministrationError> {
         if let Some(root) = &managed_root {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let (canonical, metadata) = root
-                .canonicalize()
-                .and_then(|path| path.metadata().map(|metadata| (path, metadata)))
-                .map_err(|source| ResourceAdministrationError::ManagedRootIo {
-                    path: root.clone(),
-                    source,
-                })?;
-            if canonical != *root
-                || root == Path::new("/")
-                || !metadata.is_dir()
-                || metadata.permissions().mode() & 0o022 != 0
-                || metadata.uid() != nix::unistd::geteuid().as_raw()
-            {
-                return Err(ResourceAdministrationError::InvalidManagedRoot);
-            }
+            validate_managed_root(root)?;
         }
         let deployment_ids = Arc::new(observations.registered_ids().into_iter().collect());
         Ok(Self {
@@ -341,26 +365,36 @@ impl ResourceAdministration {
     fn mount_path(&self, id: &FileSystemId, path: Option<PathBuf>) -> Result<PathBuf, ApiError> {
         let root = self
             .managed_root
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| bad("部署未配置 daemon 挂载目录"))?;
-        if matches!(id.as_str(), "." | "..") {
-            return Err(bad("无效的文件系统 ID"));
-        }
         let path = path.unwrap_or_else(|| root.join(id.as_str()));
-        if path.parent() != Some(root)
-            || !path.file_name().is_some_and(|name| {
-                name.to_str().is_some_and(|name| {
-                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-                })
-            })
-        {
-            return Err(bad("挂载路径须为部署挂载目录的直接子目录"));
+        if root == Path::new(CONTAINER_MANAGED_ROOT) && path == Path::new(LEGACY_CONTAINER_MANAGED_ROOT) {
+            return Err(bad("该挂载路径保留用于恢复旧版挂载"));
         }
+        validate_mount_path(root, id, &path)?;
         Ok(path)
     }
 
+    fn uses_legacy_mount_path(&self, path: &Path) -> bool {
+        self.managed_root.as_deref() == Some(Path::new(CONTAINER_MANAGED_ROOT))
+            && path.parent() == Some(Path::new(LEGACY_CONTAINER_MANAGED_ROOT))
+    }
+
+    fn registered_mount_path(&self, registration: &Registration) -> Result<PathBuf, ApiError> {
+        if self.uses_legacy_mount_path(&registration.path) {
+            let legacy_root = Path::new(LEGACY_CONTAINER_MANAGED_ROOT);
+            validate_managed_root(legacy_root).map_err(|error| {
+                tracing::warn!(%error, "could not use the previous container mount root");
+                bad("旧版挂载根目录不可用")
+            })?;
+            validate_mount_path(legacy_root, &registration.id, &registration.path)?;
+            return Ok(registration.path.clone());
+        }
+        self.mount_path(&registration.id, Some(registration.path.clone()))
+    }
+
     async fn mount(&self, registration: &Registration) -> Result<(), ApiError> {
-        let path = self.mount_path(&registration.id, Some(registration.path.clone()))?;
+        let path = self.registered_mount_path(registration)?;
         let mounts = read_mounts()?;
         if let Some(existing) = mounts.get(&path) {
             return if existing.as_deref() == Some(&registration.source) {
@@ -407,7 +441,7 @@ impl ResourceAdministration {
 
     async fn require_idle(
         &self, id: &FileSystemId, removing: bool, tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    ) -> Result<(), ApiError> {
+    ) -> Result<MutexGuard<'_, HashMap<String, ScanRecord>>, ApiError> {
         // Use the same lock order as the policy worker. A new write or dispatch
         // cannot race the checks and the unmount.
         for table in ["policy_worker_lock", "policy_configuration_lock"] {
@@ -432,17 +466,14 @@ impl ResourceAdministration {
         .fetch_one(&mut **tx)
         .await
         .map_err(database_error)?;
-        let scanning = self
-            .app
-            .scans
-            .lock()
-            .await
+        let scans = self.app.scans.lock().await;
+        let scanning = scans
             .values()
             .any(|scan| scan.filesystem == *id && scan.state == ScanState::Running);
         if policy || operations || scanning {
             return Err(bad("存在关联策略、正在扫描或有待核对的操作"));
         }
-        Ok(())
+        Ok(scans)
     }
 }
 
@@ -462,7 +493,13 @@ async fn list(State(admin): State<ResourceAdministration>) -> Result<impl IntoRe
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?
     {
-        if admin.observations.contains(&config.id) && !resources.iter().any(|r| r.id == config.id) {
+        if admin.observations.contains(&config.id) {
+            if let Some(resource) = resources.iter_mut().find(|resource| resource.id == config.id) {
+                if resource.owner == Owner::Deployment {
+                    resource.path = config.mount_path;
+                }
+                continue;
+            }
             resources.push(Registration {
                 name: config.id.to_string(),
                 id: config.id,
@@ -478,13 +515,32 @@ async fn list(State(admin): State<ResourceAdministration>) -> Result<impl IntoRe
             });
         }
     }
-    let available_mounts = read_mounts()?
-        .into_iter()
+    let mounts = read_mounts()?;
+    let available_mounts = mounts
+        .iter()
         .filter_map(|(path, source)| {
-            if resources.iter().any(|r| r.path == path) {
+            if resources.iter().any(|r| &r.path == path) {
                 return None;
             }
-            Some(DetectedMount { path, source: source? })
+            Some(DetectedMount {
+                path: path.clone(),
+                source: source.as_ref()?.clone(),
+            })
+        })
+        .collect();
+    let resources = resources
+        .into_iter()
+        .map(|registration| {
+            let mounted = match registration.owner {
+                // A configured path can also refer to a subtree or alias, whose
+                // status comes from the filesystem probe.
+                Owner::Deployment => mounts
+                    .get(&registration.path)
+                    .is_some_and(Option::is_some)
+                    .then_some(true),
+                Owner::Daemon | Owner::External => Some(mounted(&registration, &mounts)),
+            };
+            RegistrationView { registration, mounted }
         })
         .collect();
     Ok((
@@ -500,10 +556,13 @@ async fn list(State(admin): State<ResourceAdministration>) -> Result<impl IntoRe
 #[tracing::instrument(skip_all)]
 async fn check(
     State(admin): State<ResourceAdministration>, Extension(writers): Extension<PolicyWriters>, headers: HeaderMap,
-    Json(request): Json<RegisterRequest>,
+    gateway: Option<Extension<ConsoleGateway>>, Json(request): Json<RegisterRequest>,
 ) -> Result<StatusCode, ApiError> {
     writers.authorize(&headers)?;
-    let (registration, _) = registration(&admin, request)?;
+    if gateway.is_some() && matches!(request.mount, NewMount::Existing { .. }) {
+        return Err(bad("外部挂载由部署管理"));
+    }
+    let (registration, _) = registration(&admin, request).await?;
     if registration.owner == Owner::Daemon {
         let (nids, _) = registration.source.split_once(":/").expect("validated Lustre source");
         let (host, networks) = nids.split_once('@').ok_or_else(|| bad("无法从 MGS 配置提取 NID"))?;
@@ -519,11 +578,14 @@ async fn check(
 #[tracing::instrument(skip_all)]
 async fn register(
     State(admin): State<ResourceAdministration>, Extension(writers): Extension<PolicyWriters>, headers: HeaderMap,
-    Json(request): Json<RegisterRequest>,
+    gateway: Option<Extension<ConsoleGateway>>, Json(request): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<Registration>), ApiError> {
     let actor = writers.authorize(&headers)?;
+    if gateway.is_some() && matches!(request.mount, NewMount::Existing { .. }) {
+        return Err(bad("外部挂载由部署管理"));
+    }
     let _change = admin.changes.lock().await;
-    let (mut resource, mount_now) = registration(&admin, request)?;
+    let (mut resource, mount_now) = registration(&admin, request).await?;
     let records = admin.records().await.map_err(database_error)?;
     let retired_same_source = records
         .iter()
@@ -576,9 +638,13 @@ impl ResourceAdministration {
 #[tracing::instrument(skip_all)]
 async fn change(
     State(admin): State<ResourceAdministration>, Extension(writers): Extension<PolicyWriters>,
-    ApiPath(id): ApiPath<FileSystemId>, headers: HeaderMap, Json(change): Json<Change>,
+    ApiPath(id): ApiPath<FileSystemId>, headers: HeaderMap, gateway: Option<Extension<ConsoleGateway>>,
+    Json(change): Json<Change>,
 ) -> Result<StatusCode, ApiError> {
     let actor = writers.authorize(&headers)?;
+    if gateway.is_some() && matches!(change, Change::Remove) {
+        return Err(bad("请通过 daemon REST API 管理外部接入"));
+    }
     let change_guard = admin.changes.clone().lock_owned().await;
     let mut resource =
         match admin.records().await.map_err(database_error)?.into_iter().find(|r| {
@@ -636,39 +702,52 @@ async fn change(
             admin.start_baseline_if_mounted(&resource).await?;
         }
         Change::Unmount if resource.owner == Owner::Daemon => {
-            let path = admin.mount_path(&id, Some(resource.path.clone()))?;
-            let mut tx = admin.app.entry_store.pool().begin().await.map_err(database_error)?;
-            admin.require_idle(&id, false, &mut tx).await?;
-            let mounts = read_mounts()?;
-            let is_mounted = mounted(&resource, &mounts);
-            if !is_mounted && mounts.contains_key(&resource.path) {
-                return Err(bad("挂载点来源已变化"));
-            }
-            if is_mounted {
-                let mut command = Command::new("/usr/bin/umount");
-                command.args(["--no-canonicalize", "--"]).arg(path);
-                execute(command).await?;
-            }
-            resource.desired_mounted = false;
-            resource.last_mount_error = None;
-            admin.write_registration(&resource, &mut *tx).await?;
-            tx.commit().await.map_err(database_error)?;
-            admin.observations.management_changed(Some(id.clone()));
-            admin
-                .observations
-                .refresh(Some(&id))
-                .await
-                .map_err(ApiError::ServiceUnavailable)?;
+            tokio::spawn(async move {
+                let _change = change_guard;
+                let path = admin.registered_mount_path(&resource)?;
+                let mut tx = admin.app.entry_store.pool().begin().await.map_err(database_error)?;
+                let scans = admin.require_idle(&resource.id, false, &mut tx).await?;
+                let mounts = read_mounts()?;
+                let is_mounted = mounted(&resource, &mounts);
+                if !is_mounted && mounts.contains_key(&resource.path) {
+                    return Err(bad("挂载点来源已变化"));
+                }
+
+                // Record the operator's intent before changing the mount. A process interruption
+                // after a successful unmount cannot re-arm automatic restoration.
+                let previous = resource.clone();
+                resource.desired_mounted = false;
+                resource.last_mount_error = None;
+                admin.save(&resource).await?;
+                if is_mounted {
+                    let mut command = Command::new("/usr/bin/umount");
+                    command.args(["--no-canonicalize", "--"]).arg(path);
+                    if let Err(error) = execute(command).await {
+                        admin.save(&previous).await?;
+                        return Err(error);
+                    }
+                }
+                tx.commit().await.map_err(database_error)?;
+                drop(scans);
+                admin.observations.management_changed(Some(resource.id.clone()));
+                admin
+                    .observations
+                    .refresh(Some(&resource.id))
+                    .await
+                    .map_err(ApiError::ServiceUnavailable)
+            })
+            .await
+            .map_err(|error| ApiError::Internal(format!("unmount Lustre registration: {error}")))??;
         }
-        Change::Remove if resource.owner != Owner::Deployment => {
-            let mut tx = admin.app.entry_store.pool().begin().await.map_err(database_error)?;
-            admin.require_idle(&id, true, &mut tx).await?;
-            resource.removed = true;
-            admin.write_registration(&resource, &mut *tx).await?;
+        Change::Remove if resource.owner == Owner::External => {
             let removed_id = id.clone();
             // Finish the state transition even if the HTTP request goes away during commit.
             tokio::spawn(async move {
                 let _change = change_guard;
+                let mut tx = admin.app.entry_store.pool().begin().await.map_err(database_error)?;
+                let _scans = admin.require_idle(&removed_id, true, &mut tx).await?;
+                resource.removed = true;
+                admin.write_registration(&resource, &mut *tx).await?;
                 admin.app.policy_store.set_filesystem_configured(&removed_id, false);
                 if let Err(error) = tx.commit().await {
                     admin.app.policy_store.set_filesystem_configured(&removed_id, true);
@@ -681,6 +760,7 @@ async fn change(
             .await
             .map_err(|error| ApiError::Internal(format!("remove Lustre registration: {error}")))??;
         }
+        Change::Remove if resource.owner == Owner::Daemon => return Err(bad("应用管理挂载请使用卸载操作")),
         _ => return Err(bad("当前挂载由部署或外部运维管理")),
     }
     tracing::info!(%actor, filesystem = %id, "console updated Lustre filesystem");
@@ -695,7 +775,25 @@ fn valid_name(name: &str) -> Result<String, ApiError> {
     Ok(name.to_owned())
 }
 
-fn registration(admin: &ResourceAdministration, request: RegisterRequest) -> Result<(Registration, bool), ApiError> {
+fn validate_mount_path(root: &Path, id: &FileSystemId, path: &Path) -> Result<(), ApiError> {
+    if matches!(id.as_str(), "." | "..") {
+        return Err(bad("无效的文件系统 ID"));
+    }
+    if path.parent() != Some(root)
+        || !path.file_name().is_some_and(|name| {
+            name.to_str().is_some_and(|name| {
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            })
+        })
+    {
+        return Err(bad("挂载路径须为部署挂载目录的直接子目录"));
+    }
+    Ok(())
+}
+
+async fn registration(
+    admin: &ResourceAdministration, request: RegisterRequest,
+) -> Result<(Registration, bool), ApiError> {
     let name = valid_name(&request.name)?;
     let (path, source, owner, options, auto_mount, desired_mounted, mount_now) = match request.mount {
         NewMount::Existing { path } => {
@@ -739,11 +837,34 @@ fn registration(admin: &ResourceAdministration, request: RegisterRequest) -> Res
                     "挂载参数仅支持 flock、localflock、noflock、noatime、relatime、lazystatfs、verbose",
                 ));
             }
-            let path = admin.mount_path(&request.id, path)?;
-            if read_mounts()?.contains_key(&path) {
+            let source = format!("{mgs_nids}:/{filesystem}");
+            let mut restore_legacy = false;
+            let path = match path {
+                Some(path) if admin.uses_legacy_mount_path(&path) => {
+                    let retired = admin
+                        .records()
+                        .await
+                        .map_err(database_error)?
+                        .into_iter()
+                        .find(|entry| {
+                            entry.removed
+                                && entry.owner == Owner::Daemon
+                                && entry.id == request.id
+                                && entry.source == source
+                                && entry.path == path
+                        })
+                        .ok_or_else(|| bad("旧版挂载路径仅用于恢复原有集群"))?;
+                    restore_legacy = true;
+                    admin.registered_mount_path(&retired)?
+                }
+                path => admin.mount_path(&request.id, path)?,
+            };
+            let mounts = read_mounts()?;
+            if let Some(existing) = mounts.get(&path)
+                && !(restore_legacy && existing.as_deref() == Some(source.as_str()))
+            {
                 return Err(bad("挂载路径已占用，请从已有挂载接入"));
             }
-            let source = format!("{mgs_nids}:/{filesystem}");
             (path, source, Owner::Daemon, options, auto_mount, mount_now, mount_now)
         }
     };

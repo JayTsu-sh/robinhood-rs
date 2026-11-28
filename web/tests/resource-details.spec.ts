@@ -1,27 +1,27 @@
 import { expect, test } from '@playwright/test';
 import { controlResourceEvents } from './resource-events';
 
-test('adds a discovered Lustre mount even when a background read fails during editing', async ({ page }) => {
+test('creates a Lustre mount even when a background read fails during editing', async ({ page }) => {
   const send = await controlResourceEvents(page);
   let registered = false;
   let managementFails = false;
   const path = '/mnt/new-fs';
   const record = {
-    id: 'new-fs', name: '测试集群', path, source: '192.0.2.1@tcp:/labfs', owner: 'external',
-    options: [], autoMount: false, desiredMounted: false, tiers: {},
+    id: 'new-fs', name: '测试集群', path, source: '192.0.2.1@tcp:/labfs', owner: 'daemon',
+    options: [], autoMount: true, desiredMounted: true, tiers: {},
   };
   await page.route('**/api/filesystems/management', (route) => {
     if (route.request().method() === 'POST') {
       expect(route.request().postDataJSON()).toEqual({
-        id: record.id, name: record.name, mount: { type: 'existing', path },
+        id: record.id, name: record.name,
+        mount: { type: 'managed', filesystem: 'labfs', mgsNids: '192.0.2.1@tcp', path, autoMount: true, mountNow: true },
       });
       registered = true;
       return route.fulfill({ status: 201, json: record });
     }
     if (managementFails) return route.fulfill({ status: 503, json: { error: '挂载信息暂时不可用' } });
     return route.fulfill({ json: {
-      canCreateMount: false, resources: registered ? [record] : [],
-      availableMounts: registered ? [] : [{ path, source: record.source }],
+      canCreateMount: true, resources: registered ? [record] : [], availableMounts: [],
     } });
   });
   await page.route('**/api/filesystems', (route) => route.fulfill({ json: registered ? [{
@@ -34,8 +34,10 @@ test('adds a discovered Lustre mount even when a background read fails during ed
   const form = page.getByRole('dialog', { name: '添加集群' });
   await form.getByLabel('文件系统 ID').fill(record.id);
   await form.getByLabel('集群名称').fill(record.name);
-  await form.getByRole('combobox', { name: '本机 Lustre 挂载' }).click();
-  await page.getByRole('option', { name: `${path} · ${record.source}` }).click();
+  await expect(form.getByLabel('接入方式')).toHaveCount(0);
+  await form.getByLabel('Lustre 文件系统名称').fill('labfs');
+  await form.getByLabel('MGS NID').fill('192.0.2.1@tcp');
+  await form.getByLabel('挂载路径').fill(path);
   managementFails = true;
   await send('management', '*');
   await expect(page.getByText('挂载信息暂时不可用')).toBeAttached();
@@ -43,6 +45,77 @@ test('adds a discovered Lustre mount even when a background read fails during ed
   managementFails = false;
   await form.getByRole('button', { name: '添加', exact: true }).click();
   await expect(page.getByRole('link', { name: record.name })).toBeVisible();
+});
+
+test('shows a restored mount before collection and keeps the cluster after unmount', async ({ page }) => {
+  const id = 'restored-fs';
+  const name = '恢复的集群';
+  const path = '/mnt/rbh-lustre/restored-fs';
+  const source = '192.0.2.1@tcp:/labfs';
+  let mounted = true;
+  const managementReady = Promise.withResolvers<void>();
+  const staleSnapshot = {
+    id, mountPath: path, mountStatus: 'unmounted', mount: null, collectionStatus: 'unavailable',
+    observedAt: 1795852800, tieringAvailable: false, previewAvailable: false, reason: 'not_a_lustre_mount',
+    capacity: { status: 'missing', attemptedAt: 1795852800, sample: null, reason: 'not_a_lustre_mount' }, pools: null,
+  };
+  await page.route('**/api/filesystems', (route) => route.fulfill({ json: [staleSnapshot] }));
+  await page.route('**/api/filesystems/detail?filesystem=restored-fs', (route) => route.fulfill({ json: staleSnapshot }));
+  await page.route('**/api/filesystems/management', async (route) => {
+    await managementReady.promise;
+    await route.fulfill({ json: {
+      canCreateMount: true, availableMounts: [], resources: [{
+        id, name, path, source, owner: 'daemon', options: [], autoMount: true, desiredMounted: mounted, mounted, tiers: {},
+      }],
+    } });
+  });
+  await page.route('**/api/filesystems/management/restored-fs', (route) => {
+    expect(route.request().method()).toBe('POST');
+    expect(route.request().postDataJSON()).toEqual({ action: 'unmount' });
+    mounted = false;
+    return route.fulfill({ status: 204 });
+  });
+
+  const snapshot = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/filesystems');
+  await page.goto('/console/#/resources');
+  await snapshot;
+  const row = page.getByRole('row').filter({ hasText: name });
+  try {
+    await expect(page.getByText('正在读取', { exact: true })).toBeVisible();
+    await expect(page.getByRole('row').filter({ hasText: path })).toHaveCount(0);
+  } finally {
+    managementReady.resolve();
+  }
+  await expect(row).toContainText('已挂载');
+  await expect(row).toContainText('等待采集');
+  await row.getByRole('link', { name }).click();
+  await expect(page.getByRole('heading', { name })).toBeVisible();
+  await expect(page.getByRole('button', { name: '移除接入' })).toHaveCount(0);
+  await page.getByRole('button', { name: '卸载', exact: true }).click();
+  await page.getByRole('dialog', { name: '卸载' }).getByRole('button', { name: '确认' }).click();
+  await expect(page.getByRole('button', { name: '挂载', exact: true })).toBeVisible();
+  await expect(page.getByText('未挂载', { exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: '挂载信息' }).click();
+  await expect(page.getByText('手动挂载后启用')).toBeVisible();
+  await page.getByRole('link', { name: '返回 Lustre 集群列表' }).click();
+  await expect(row).toContainText('未挂载');
+});
+
+test('lists an externally discovered mount without registering it', async ({ page }) => {
+  const path = '/mnt/external';
+  const source = '192.0.2.1@tcp:/external';
+  await page.route('**/api/filesystems', (route) => route.fulfill({ json: [] }));
+  await page.route('**/api/filesystems/management', (route) => route.fulfill({ json: {
+    canCreateMount: false, resources: [], availableMounts: [{ path, source }],
+  } }));
+  await page.goto('/console/#/resources');
+  const row = page.getByRole('row').filter({ hasText: path });
+  await expect(row.getByRole('cell').nth(0)).toHaveText('—');
+  await expect(row.getByRole('cell').nth(1)).toHaveText(`external${source}`);
+  await expect(row.getByRole('cell').nth(2)).toHaveText(path);
+  await expect(row).toContainText('已挂载');
+  await expect(row.getByRole('link')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '添加集群' })).toHaveCount(0);
 });
 
 test('updates the open resource on notification and follows an associated policy', async ({ page }) => {
@@ -152,46 +225,4 @@ test('updates the open resource on notification and follows an associated policy
   removed = true;
   await send('management', 'lab-b');
   await expect(page.getByText('Lustre 文件系统未注册', { exact: true })).toBeVisible();
-});
-
-test('returns to the list after a removal even when its notification arrives first', async ({ page }) => {
-  const send = await controlResourceEvents(page);
-  const id = 'lab-remove';
-  const record = {
-    id, name: '待移除集群', owner: 'external', path: '/mnt/lab', source: '192.0.2.1@tcp:/lab',
-    options: [], autoMount: false, desiredMounted: false, tiers: {},
-  };
-  let removed = false;
-  const response = Promise.withResolvers<void>();
-  const removal = Promise.withResolvers<void>();
-  await page.route(`**/api/filesystems/detail?filesystem=${id}`, (route) => removed
-    ? route.fulfill({ status: 404, json: { error: '未注册' } })
-    : route.fulfill({ json: {
-      id, mountPath: record.path, mountStatus: 'unmounted', collectionStatus: 'pending',
-      observedAt: null, tieringAvailable: false, capacity: { status: 'missing', sample: null },
-      mount: null, pools: null,
-    } }));
-  await page.route('**/api/filesystems', (route) => route.fulfill({ json: [] }));
-  await page.route('**/api/filesystems/management', (route) => route.fulfill({ json: {
-    canCreateMount: true, availableMounts: [], resources: removed ? [] : [record],
-  } }));
-  await page.route(`**/api/filesystems/management/${id}`, async (route) => {
-    expect(route.request().postDataJSON()).toEqual({ action: 'remove' });
-    removed = true;
-    removal.resolve();
-    await response.promise;
-    await route.fulfill({ status: 204 });
-  });
-
-  await page.goto(`/console/#/resources/detail?filesystem=${id}`);
-  await page.getByRole('button', { name: '移除接入' }).click();
-  await page.getByRole('dialog', { name: '移除接入' }).getByRole('button', { name: '确认' }).click();
-  try {
-    await removal.promise;
-    await send('management', id);
-    await expect(page.getByText('Lustre 文件系统未注册', { exact: true })).toBeAttached();
-  } finally {
-    response.resolve();
-  }
-  await expect(page).toHaveURL(/#\/resources$/);
 });

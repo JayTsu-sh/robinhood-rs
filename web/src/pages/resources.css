@@ -59,13 +59,6 @@
   line-height: 1.35;
 }
 
-.lustre-metric .lustre-metric-caption {
-  margin: 0;
-  color: var(--lustre-muted);
-  font-size: 11px;
-  font-weight: 400;
-}
-
 .lustre-resources .console-table {
   border-radius: 10px;
   box-shadow: 0 2px 5px #22354f06;
@@ -154,6 +147,10 @@
 
 div.lustre-cell-note {
   margin-top: 3px;
+}
+
+.lustre-mount-source {
+  overflow-wrap: anywhere;
 }
 
 .lustre-resources .lustre-table-link,

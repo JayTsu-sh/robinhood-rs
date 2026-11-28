@@ -41,7 +41,7 @@ mod run_history_tests;
 pub mod state;
 
 pub use policy_auth::PolicyWriters;
-pub use resource_management::{ResourceAdministration, ResourceAdministrationError};
+pub use resource_management::{ConsoleGateway, ResourceAdministration, ResourceAdministrationError};
 pub use state::AppState;
 
 use axum::Router;

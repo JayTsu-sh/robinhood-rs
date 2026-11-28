@@ -37,6 +37,7 @@ COPY src src
 RUN CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --locked --release -p robinhood-rs -p rbh-cli
 
 FROM debian:trixie-slim
+# Keep the previous mount directory available for saved cluster registrations.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libkeyutils1 libssl3t64 libnl-genl-3-200 libreadline8t64 libyaml-0-2 mount \
     && rm -rf /var/lib/apt/lists/* \

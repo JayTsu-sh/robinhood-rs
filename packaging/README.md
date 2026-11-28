@@ -60,12 +60,21 @@ installation directory, such as the local `web/dist/` for development.
 The daemon only needs read access to the installed files. Node.js is a build
 dependency.
 
-For remote operators who use a configured policy writer, bind the daemon to
-a loopback listener such as `RBH_LISTEN_ADDR=127.0.0.1:8080` and terminate HTTPS
-at your reverse proxy. Forward both `/console/` and `/api/` from the same
-HTTPS origin to that listener. Preserve the request URI and the
-`Authorization` and `If-Match` headers. Open `https://<your-host>/console/`
-for writer actions. Local access can use `http://127.0.0.1:8080/console/`.
+The [container deployment](../README.md#deploy-a-container-that-mounts-lustre)
+uses `docker/compose.console.yml` to serve the console over HTTP on a trusted
+operator network. Set `RBH_CONSOLE_HTTP_LISTEN` to the host's private IP and port
+and `RBH_CONSOLE_HTTP_HOST` to the hostname or IP operators enter in their
+browsers. Set `RBH_CONSOLE_TRUSTED_CIDR` to the operator network. Every client
+allowed by the gateway can write, and the daemon records those writes under
+`trusted-gateway`. The gateway connects over a Unix socket in a volume shared
+with the daemon and authenticates using the `console-gateway.token` file
+created at deployment. Keep `RBH_LISTEN_ADDR` on loopback and use this listener
+with the same credential for administrative REST calls.
+
+For a bearer-token deployment behind a separately managed HTTPS reverse proxy,
+forward `/console/` and `/api/` on the same origin to the daemon. Preserve the
+request URI and the `Authorization` and `If-Match` headers. Local browser access
+can use `http://127.0.0.1:8080/console/`.
 
 The daemon schedules Lustre resource collection through `scheduler-rs` at
 startup and every 60 seconds by default. Set `RBH_CONSOLE_COLLECT_SECS` to a
@@ -84,20 +93,24 @@ daemon with two eligible Lustre pools and a saved policy with an explicit pool p
 
 ### Daemon-managed Lustre mounts
 
-The console can register existing Lustre mounts visible in the daemon's mount
-namespace. To let the daemon create, unmount, and restore its own mounts, set
+The cluster list shows Lustre mounts discovered in the daemon's mount namespace.
+Deployments can configure existing mounts through `RBH_FILESYSTEMS_JSON` for
+policy execution and resource collection. To let the daemon create, unmount,
+and restore its own mounts through the console, set
 `RBH_LUSTRE_MANAGED_ROOT` to a canonical writable directory owned by the service
 user, and grant the service host Lustre mount privileges. On Linux this requires
 `CAP_SYS_ADMIN` in the mount namespace where the daemon runs. The packaged
 systemd unit also needs the managed directory in `ReadWritePaths`. The daemon
 runs the local Lustre client helpers and confines new mount paths to immediate
-children of that directory. Resource management writes require a configured
-writer token. Install the Lustre mount helpers and their shared libraries from
-the same client release.
+children of that directory. Enable resource management writes through the
+trusted HTTP gateway or a configured writer token. Install the Lustre mount
+helpers and their shared libraries from the same client release.
 
-Removing a console registration keeps its catalog and run history. The daemon
-blocks removal while a strategy references it, and it blocks unmounting while a
-scan or operation is active or a referencing strategy is enabled.
+Unmounting an application-managed mount keeps the filesystem ID, catalog, policy
+references, and run history. The daemon blocks unmounting while a scan or operation
+is active or a referencing policy is enabled. A manually unmounted mount stays
+unmounted across restarts until mounted again. To restore mounts after replacing
+a Pod, reuse the same MariaDB database and `RBH_CONSOLE_OBSERVER_ID`.
 
 ## Enable pool migration under systemd
 

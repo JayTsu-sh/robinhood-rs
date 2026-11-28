@@ -7,7 +7,67 @@ and monitor online tiering between OST pools on the same Lustre filesystem.
 Native Lustre HSM actions are available through the policy API. The cross-storage
 HSM card in the console is marked **暂未开放**.
 
-## Try the project locally
+## Deploy a container that mounts Lustre
+
+Use this deployment to connect real Lustre clusters, manage their mounts, and
+save tiering policies in the console. Use rootful Docker Engine and Compose on
+a Linux x86-64 Lustre client node.
+Install and load the host's Lustre and LNet kernel modules, configure LNet,
+verify that `/dev/lnet` exists, and check MGS connectivity from the host with
+`lctl ping <MGS-NID>`. The image supplies
+the Lustre client tools and shared libraries. When you add a cluster and leave
+the mount path blank, the daemon mounts it at `/mnt/<filesystem-id>` inside
+the container. Previously registered mount paths stay in use after an upgrade.
+[Lustre client setup](https://wiki.lustre.org/Mounting_a_Lustre_File_System_on_Client_Nodes)
+
+1. Initialize a database as described in [Initialize MariaDB](#2-initialize-mariadb).
+   Use a MariaDB URL reachable from the host network.
+2. Create a dedicated container configuration directory. For actual migration,
+   place `principal.json` in that directory and set
+   `RBH_HSM_PRINCIPAL_FILE=/run/rbh-config/principal.json`.
+3. Supply the database URL, a stable observer ID, the console's private address,
+   and the CIDR of the trusted operator network. Clients in that network can
+   use the HTTP console and write without a token. Use the same observer ID and
+   database when recreating the container so the daemon can restore saved mounts.
+   The container starts with an empty filesystem registry unless you set
+   `RBH_FILESYSTEMS_JSON`.
+
+```sh
+export RBH_DATABASE_URL='mysql://rbh_service:PASSWORD@127.0.0.1:3306/rbh_entries'
+export RBH_CONTAINER_CONFIG_DIR=/etc/robinhood/container
+export RBH_CONSOLE_OBSERVER_ID='tiering-node-1'
+export RBH_CONSOLE_HTTP_LISTEN=10.0.0.10:8080
+export RBH_CONSOLE_HTTP_HOST=10.0.0.10
+export RBH_CONSOLE_TRUSTED_CIDR=10.0.0.0/24
+export RBH_LISTEN_ADDR=127.0.0.1:18080
+sudo install -d -m 0700 "$RBH_CONTAINER_CONFIG_DIR"
+sudo sh -c 'umask 077; set -C; openssl rand -hex 32 > "$1/console-gateway.token"' sh "$RBH_CONTAINER_CONFIG_DIR"
+docker compose -f packaging/docker/compose.yml -f packaging/docker/compose.console.yml up -d --build
+curl -fsS --retry 10 --retry-connrefused http://10.0.0.10:8080/api/health
+```
+
+4. Open `http://<console-host>:8080/console/`. Under **存储资源 → Lustre 集群**, choose
+   **添加集群**. Enter the Lustre filesystem name and MGS NIDs, test the connection,
+   and submit to mount it. Keep **daemon 重启后恢复挂载** enabled to restore the
+   mount after a restart. The restored mount appears under the same cluster entry.
+   Use **卸载** in the cluster details after associated scans and operations finish.
+   The cluster stays in the list and can be mounted again from its details.
+
+The Compose service uses the host network and `/dev/lnet` and grants
+`SYS_ADMIN` for mounts, `NET_ADMIN` for LNet connectivity checks, and
+`DAC_READ_SEARCH` for the FID-to-path verification used by directory-scoped
+policies on mounts with `nouser_fid2path`. Its AppArmor setting defaults to
+`unconfined` to permit the mount. On hosts with a
+profile that permits Lustre mounts and the required device access, set
+`RBH_CONTAINER_APPARMOR_PROFILE` to the installed profile name. The default
+HTTP listener is on loopback. The optional `RBH_CONTAINER_IMAGE` selects the
+image tag, which defaults to `robinhood-rs:lustre`.
+For a standalone daemon with bearer-token writes, run only
+`packaging/docker/compose.yml` and install `writers.json` in the container
+configuration directory. [Writer setup](#3-configure-and-start-the-daemon)
+[HTTP gateway settings](packaging/README.md#build-and-serve-the-web-console)
+
+## Develop and test without a Lustre cluster
 
 From the repository root, start the development stack with Docker Compose and
 BuildKit. The image includes the compiled console, and MariaDB imports the
@@ -19,58 +79,8 @@ curl -fsS --retry 10 --retry-connrefused http://127.0.0.1:8080/api/health
 docker compose -f dev/compose/docker-compose.yml exec rbh-daemon rbh --filesystem lustre status
 ```
 
-Open [the console](http://127.0.0.1:8080/console/). This stack is for trying the
-UI, catalog, and API with development data. To seed sample data and preview a
-policy, follow the [Compose guide](dev/compose/README.md).
-
-## Deploy a container that mounts Lustre
-
-Use rootful Docker Engine and Compose on a Linux x86-64 Lustre client node.
-Install and load the host's Lustre and LNet kernel modules, configure LNet,
-verify that `/dev/lnet` exists, and check MGS connectivity from the host with
-`lctl ping <MGS-NID>`. The image supplies
-the Lustre client tools and shared libraries. The daemon creates the mounts
-under `/mnt/rbh-lustre` inside the container when you add a cluster.
-[Lustre client setup](https://wiki.lustre.org/Mounting_a_Lustre_File_System_on_Client_Nodes)
-
-1. Initialize a database as described in [Initialize MariaDB](#2-initialize-mariadb).
-   Use a MariaDB URL reachable from the host network.
-2. Create `writers.json` with the [writer setup](#3-configure-and-start-the-daemon).
-   Install only the digest file in a dedicated container configuration directory.
-   Keep the operator's token file on the host. For actual migration, place
-   `principal.json` in the configuration directory and set
-   `RBH_HSM_PRINCIPAL_FILE=/run/rbh-config/principal.json`.
-3. Supply the database URL and a stable observer ID, then start the daemon.
-   Use the same observer ID and database when recreating the container so
-   the daemon can restore saved mounts. The container starts with an empty
-   filesystem registry unless you set `RBH_FILESYSTEMS_JSON`.
-
-```sh
-export RBH_DATABASE_URL='mysql://rbh_service:PASSWORD@127.0.0.1:3306/rbh_entries'
-export RBH_CONTAINER_CONFIG_DIR=/etc/robinhood/container
-export RBH_CONSOLE_OBSERVER_ID='tiering-node-1'
-sudo install -d -m 0700 "$RBH_CONTAINER_CONFIG_DIR"
-sudo install -m 0600 "$writer_dir/writers.json" "$RBH_CONTAINER_CONFIG_DIR/writers.json"
-docker compose -f packaging/docker/compose.yml up -d --build
-curl -fsS --retry 10 --retry-connrefused http://127.0.0.1:8080/api/health
-```
-
-4. Open `http://127.0.0.1:8080/console/`. Under **Lustre 集群** choose
-   **添加集群** and **创建新挂载**. Enter the Lustre filesystem name and MGS NIDs,
-   test the connection, and leave **添加后立即挂载** selected. Select
-   **daemon 重启后恢复挂载** to restore it on the next start. Use the cluster
-   details to unmount it after associated scans and operations finish.
-
-The Compose service uses the host network and `/dev/lnet` and grants
-`SYS_ADMIN` for mounts, `NET_ADMIN` for LNet connectivity checks, and
-`DAC_READ_SEARCH` for the FID-to-path verification used by directory-scoped
-policies on mounts with `nouser_fid2path`. Its AppArmor setting defaults to
-`unconfined` to permit the mount. On hosts with a
-profile that permits Lustre mounts and the required device access, set
-`RBH_CONTAINER_APPARMOR_PROFILE` to the installed profile name. The default
-HTTP listener is on loopback. The optional `RBH_CONTAINER_IMAGE` selects the
-image tag, which defaults to `robinhood-rs:lustre`.
-[Managed mount Compose file](packaging/docker/compose.yml)
+Open [the console](http://127.0.0.1:8080/console/). To seed sample data and
+preview a policy, follow the [development Compose guide](dev/compose/README.md).
 
 ## Deploy on a Lustre client
 
@@ -171,10 +181,10 @@ them after a restart when configured to do so.
 
 ## Run a tiering policy from the console
 
-1. Open `/console/` and go to **Lustre 集群**. The mount configured at startup
-   appears there. To attach another mount visible to the daemon, use **添加集群**
-   and select the existing mount. Check that the source and target OST pools
-   are both eligible, and allow the baseline scan to populate the catalog.
+1. Open `/console/` and go to **Lustre 集群**. Select a filesystem configured at
+   startup or use **添加集群** to create a new mount when the daemon manages mounts.
+   Check that the source and target OST pools are both eligible, and allow the
+   baseline scan to populate the catalog.
 2. In **分层策略**, create a same-filesystem tiering policy. Select the filesystem
    and pool pair, choose a scan scope and file rules, and set the trigger and
    per-run limits. For a first run, use a small test directory and a manual
@@ -201,14 +211,17 @@ in the wizard. The built-in preview governance is for Dry-run.
 
 For a test filesystem registered as `lustre`, the following commands use
 `curl` and `jq` to create the three resources for `tiering-daemon`. Set
-`RBH_POLICY_TOKEN_FILE` to the writer token file first. Use `tiering-local`
-for the authorization and approval
-selections in the wizard. The system safety policy applies by filesystem scope.
+`RBH_API_URL` to the daemon's loopback HTTP origin and
+`RBH_POLICY_TOKEN_FILE` to the writer token file. For the trusted gateway
+deployment above, use `http://127.0.0.1:18080` and the protected
+`console-gateway.token` file. Use `tiering-local` for the authorization and
+approval selections in the wizard. The system safety policy applies by
+filesystem scope.
 
 ```bash
 create_tiering_resource() {
   jq -c --arg kind "$2" '{apiVersion:"hsm.storage.io/v1alpha3",kind:$kind,metadata:{name:"tiering-local"},spec:.}' |
-    curl -fsS "http://127.0.0.1:8080/api/$1" \
+    curl -fsS "${RBH_API_URL:-http://127.0.0.1:8080}/api/$1" \
       -H "Authorization: Bearer $(cat "$RBH_POLICY_TOKEN_FILE")" \
       -H 'Content-Type: application/json' --data-binary @-
 }
@@ -342,11 +355,12 @@ Submit policies through REST as `hsm.storage.io/v1alpha3` documents with
 
 ### Native Lustre HSM
 
-Set `RBH_POLICY_WRITERS_FILE` to a server-side JSON map from writer principal
-names to the hex SHA-256 digests of their high-entropy bearer tokens. Send a
-configured token in the `Authorization: Bearer …` header for every
-configuration write. Use a local connection or a TLS-terminating proxy for
-the token. The service records the principal from its configured allowlist.
+The trusted-network container deployment accepts policy writes through its HTTP
+gateway. For a bearer-token deployment, set `RBH_POLICY_WRITERS_FILE` to a
+server-side JSON map from writer principal names to the hex SHA-256 digests of
+their bearer tokens. Send a configured token in the `Authorization: Bearer …`
+header over a local connection or through a TLS-terminating proxy. The daemon
+records the writer principal from its configured allowlist.
 
 Send the following document to `POST /api/policies` as JSON, substituting
 the ID of a registered Lustre filesystem with HSM enabled.
@@ -657,7 +671,10 @@ from the running process environment.
 | `RBH_CONSOLE_COLLECT_SECS` | Lustre resource collection interval in seconds. Defaults to `60` and accepts positive integers. |
 | `RBH_CONSOLE_OBSERVER_ID` | Resource snapshot and console registration scope. Defaults to the hostname. Set a stable, unique value when multiple daemons with the same hostname share MariaDB. |
 | `RBH_LUSTRE_MANAGED_ROOT` | Set for daemon-created Lustre mounts. Use an existing canonical directory owned by the daemon account. The daemon also needs host mount privileges. |
-| `RBH_POLICY_WRITERS_FILE` | Set for console or API writes. The daemon reads a JSON map of writer names to SHA-256 bearer-token digests. |
+| `RBH_POLICY_WRITERS_FILE` | Enables bearer-token writes. The daemon reads a JSON map of writer names to SHA-256 token digests. |
+| `RBH_TRUSTED_GATEWAY_WRITES` | Defaults to `false`. Set to `true` with a loopback daemon listener and an access-controlled gateway. Leave `RBH_POLICY_WRITERS_FILE` unset in this mode. |
+| `RBH_TRUSTED_GATEWAY_TOKEN_FILE` | In trusted gateway mode, the daemon reads a 64-digit hexadecimal token from this file. The gateway supplies the credential on forwarded requests. |
+| `RBH_TRUSTED_GATEWAY_SOCKET` | In trusted gateway mode, an absolute Unix socket path inside a directory shared exclusively with the gateway. The daemon also keeps its loopback API listener. |
 | `RBH_HSM_PRINCIPAL_FILE` | Set for actual policy execution. The daemon reads a JSON workload identity with a `serviceAccount` authorized for the requested action. |
 | `RBH_HSM_POLL_SECS` | Native HSM state polling interval in seconds for HSM-capable runtimes. Defaults to `0`, which disables the poller. |
 | `RBH_HSM_POLL_BATCH` | Native HSM state polling batch size. Defaults to `200`. |
