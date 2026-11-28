@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import type { Capacity, FilesystemResource } from '../src/services/tiering';
 
 async function select(page: Page, label: string, option: string) {
   const control = page.getByLabel(label, { exact: false }).and(page.getByRole('combobox'));
@@ -9,10 +10,12 @@ async function select(page: Page, label: string, option: string) {
 }
 
 test('a tiering draft can be resumed and revalidated after changing the filesystem', async ({ page }) => {
+  const capacity: Capacity = { status: 'missing', attemptedAt: null, sample: null, reason: null };
   await page.route('**/api/filesystems', (route) => route.fulfill({
-    json: ['lab-a', 'lab-b'].map((id) => ({
-      id, tieringAvailable: true,
-      pools: ['hot', 'cold'].map((name) => ({ name, eligible: true })),
+    json: ['lab-a', 'lab-b'].map((id): FilesystemResource => ({
+      id, mountPath: `/mnt/${id}`, mountStatus: 'mounted', collectionStatus: 'collected',
+      observedAt: null, mount: null, capacity, tieringAvailable: true, previewAvailable: true, reason: null,
+      pools: ['hot', 'cold'].map((name, index) => ({ name, eligible: true, ostIndices: [index], reason: null, capacity })),
     })),
   }));
   for (const resource of ['execution-profiles', 'authorization-policies', 'approval-policies']) {

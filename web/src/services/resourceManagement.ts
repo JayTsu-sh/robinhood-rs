@@ -23,6 +23,9 @@ interface ResourceManagement {
 }
 
 export const poolTiers = { hot: '热层', warm: '温层', cold: '冷层' } as const;
+export const resourceOwnerLabels: Record<ResourceRegistration['owner'], string> = {
+  deployment: '部署管理', external: '外部管理', daemon: '应用管理',
+};
 
 const endpoint = '/api/filesystems/management';
 

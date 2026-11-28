@@ -1,0 +1,219 @@
+.lustre-resources {
+  --lustre-muted: #64758b;
+  --lustre-line: #e0e7ef;
+}
+
+.lustre-resources .console-title h1 {
+  margin-bottom: 5px;
+  font-size: 26px;
+}
+
+.lustre-resources .console-title .ant-typography-secondary {
+  color: var(--lustre-muted);
+  font-size: 13px;
+}
+
+.lustre-resources .console-title .ant-btn,
+.lustre-toolbar .ant-select {
+  height: 38px;
+}
+
+.lustre-resources .console-title .ant-btn {
+  padding-inline: 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.lustre-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin: 22px 0;
+  line-height: 1.6;
+}
+
+.lustre-metric {
+  min-width: 0;
+  padding: 17px 19px;
+  border: 1px solid var(--lustre-line);
+  border-top: 3px solid var(--lustre-metric-accent);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.lustre-metric-blue { --lustre-metric-accent: #4a86ec; }
+.lustre-metric-green { --lustre-metric-accent: #24a082; }
+.lustre-metric-amber { --lustre-metric-accent: #d99a2b; }
+
+.lustre-metric dt {
+  color: var(--lustre-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.lustre-metric dd {
+  margin: 5px 0;
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.lustre-metric .lustre-metric-caption {
+  margin: 0;
+  color: var(--lustre-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.lustre-resources .console-table {
+  border-radius: 10px;
+  box-shadow: 0 2px 5px #22354f06;
+}
+
+.lustre-resources .lustre-toolbar {
+  justify-content: space-between;
+  padding: 15px 18px;
+  border-color: var(--lustre-line);
+  color: var(--lustre-muted);
+  font-size: 13px;
+}
+
+.lustre-toolbar .ant-select {
+  min-width: 116px;
+}
+
+.lustre-resources .ant-table-thead > tr > th,
+.lustre-resources .ant-table-tbody > tr > td {
+  padding: 14px 15px;
+  border-bottom-color: var(--lustre-line);
+}
+
+.lustre-resources .ant-table-thead > tr > th {
+  color: #5d6d82;
+  background: #f5f7fa;
+  font-size: 12px;
+}
+
+.lustre-resources .ant-table-thead > tr > th::before {
+  display: none;
+}
+
+.lustre-resources .ant-table-tbody > tr.lustre-resource-row {
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.lustre-resources .ant-table-tbody > tr > td.ant-table-cell-row-hover {
+  background: #f8fbff;
+}
+
+.lustre-resources .ant-table-cell .ant-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 4px 2px 0;
+  padding: 2px 7px;
+  border-color: transparent;
+  border-radius: 5px;
+  background: #edf1f6;
+  color: #506176;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.lustre-resources .ant-table-cell .ant-tag-success {
+  background: #e5f5ed;
+  color: #16764f;
+}
+
+.lustre-resources .ant-table-cell .ant-tag-warning {
+  background: #fff3d9;
+  color: #87580b;
+}
+
+.lustre-resources .ant-table-cell .ant-tag-error {
+  background: #fdebea;
+  color: #a33833;
+}
+
+.lustre-resources .ant-table-cell .ant-tag::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: '';
+}
+
+.lustre-cell-note,
+.lustre-resources .console-status-reason .ant-typography {
+  color: #64758b;
+  font-size: 11px;
+}
+
+div.lustre-cell-note {
+  margin-top: 3px;
+}
+
+.lustre-resources .lustre-table-link,
+.lustre-resources .lustre-table-button {
+  color: #215db8;
+  font-weight: 600;
+}
+
+.lustre-resources .lustre-table-button {
+  height: auto;
+  padding: 0;
+  font-size: inherit;
+}
+
+.lustre-resources .lustre-table-link:hover,
+.lustre-resources .lustre-table-button:hover {
+  text-decoration: underline;
+}
+
+.lustre-pool-list,
+.lustre-mount-error {
+  max-width: 280px;
+  max-height: 240px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.lustre-pool-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.lustre-empty {
+  padding: 28px 12px;
+  color: var(--lustre-muted);
+}
+
+.lustre-table-footer {
+  padding: 12px 18px;
+  color: var(--lustre-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 1100px) {
+  .lustre-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 767px) {
+  .lustre-metrics {
+    gap: 9px;
+    margin: 16px 0;
+  }
+
+  .lustre-metric {
+    padding: 12px;
+  }
+
+  .lustre-metric dd {
+    font-size: 24px;
+  }
+}

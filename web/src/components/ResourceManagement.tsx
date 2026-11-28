@@ -1,3 +1,4 @@
+import { PlusOutlined } from '@ant-design/icons';
 import { Alert, Button, Checkbox, Flex, Form, Input, Modal, Select, Space, Typography } from 'antd';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -6,9 +7,14 @@ import {
 import { writeError, writerTransportAllowed } from '@/services/policies';
 import { requestError, useInventory } from '@/services/useInventory';
 
-export function useResourceManagement() {
-  const { state, refresh } = useInventory(listResourceManagement);
-  return { management: state.status === 'ready' ? state.data : undefined, refresh };
+export function useResourceManagement({ keepPrevious = false } = {}) {
+  const { state, refresh, refreshing } = useInventory(listResourceManagement, listResourceManagement, { keepPrevious });
+  return {
+    management: state.status === 'ready' ? state.data : undefined,
+    error: state.status === 'error' ? state.message : state.status === 'ready' ? state.refreshError : undefined,
+    refresh,
+    refreshing,
+  };
 }
 
 type Management = Awaited<ReturnType<typeof listResourceManagement>>;
@@ -130,7 +136,7 @@ export default function ResourceManagement({ management, resource, pools = [], m
           <Button onClick={() => open(mounted ? 'unmount' : 'mount')}>{mounted ? labels.unmount : labels.mount}</Button>
         </>}
         {resource.owner !== 'deployment' && <Button danger onClick={() => open('remove')}>{labels.remove}</Button>}
-      </Space> : <Button type="primary" onClick={() => open('add')}>添加集群</Button>}
+      </Space> : <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={() => open('add')}>添加集群</Button>}
       <Modal title={action && labels[action]} open={action !== undefined} onCancel={close}
         closable={!operation} maskClosable={false} keyboard={!operation} destroyOnHidden
         footer={<Flex align="center" gap={8} justify="end">

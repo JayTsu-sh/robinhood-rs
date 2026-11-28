@@ -4,22 +4,35 @@ import type { ReactNode } from 'react';
 
 interface Props {
   title: string;
+  description?: string;
   status: 'loading' | 'ready' | 'error';
   error?: string;
   refresh?: () => void;
+  refreshLabel?: string;
   refreshing?: boolean;
   children: ReactNode;
   action?: ReactNode;
+  primaryAction?: ReactNode;
 }
 
-export default function InventoryPage({ title, status, error, refresh, refreshing, children, action }: Props) {
+export default function InventoryPage({
+  title, description, status, error, refresh, refreshLabel = '刷新', refreshing, children, action, primaryAction,
+}: Props) {
   return (
     <section>
       <div className="console-title">
-        <Typography.Title level={1}>{title}</Typography.Title>
-        <Flex gap={12} align="center">
+        {description ? <div>
+          <Typography.Title level={1}>{title}</Typography.Title>
+          <Typography.Text type="secondary">{description}</Typography.Text>
+        </div> : <Typography.Title level={1}>{title}</Typography.Title>}
+        <Flex gap={12} align="center" wrap>
           {action}
-          {refresh && <Button icon={<ReloadOutlined aria-hidden />} loading={status === 'loading' || refreshing} onClick={refresh}>刷新</Button>}
+          {refresh && (
+            <Button icon={<ReloadOutlined aria-hidden />} loading={status === 'loading' || refreshing} onClick={refresh}>
+              {refreshLabel}
+            </Button>
+          )}
+          {primaryAction}
         </Flex>
       </div>
       {status === 'error' && (

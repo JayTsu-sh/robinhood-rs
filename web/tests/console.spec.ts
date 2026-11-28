@@ -1,6 +1,30 @@
 import { expect, test } from '@playwright/test';
 import type { FilesystemResource } from '../src/services/tiering';
 
+test('sidebar groups Lustre resources above data tiering', async ({ page }) => {
+  await page.goto('/console/');
+  await expect(page.getByRole('link', { name: 'Robinhood', exact: true })).toBeVisible();
+
+  const nav = page.getByRole('navigation', { name: '控制台导航' });
+  const groups = nav.getByRole('menuitem', { name: /^(存储资源|数据分层)$/ });
+  await expect(groups).toHaveText(['存储资源', '数据分层']);
+  const storage = nav.getByRole('menuitem', { name: '存储资源', exact: true });
+  await expect(storage).toHaveAttribute('aria-expanded', 'true');
+  await storage.click();
+  await expect(nav.getByRole('link', { name: 'Lustre 集群' })).toBeHidden();
+  await expect(nav.getByRole('link', { name: '分层策略' })).toBeVisible();
+  await expect(nav.getByRole('link', { name: '执行记录' })).toBeVisible();
+  await storage.click();
+  await nav.getByRole('link', { name: 'Lustre 集群' }).click();
+  await expect(page.getByRole('heading', { name: 'Lustre 集群' })).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(nav.getByRole('link')).toHaveText(['Lustre 集群', '分层策略', '执行记录']);
+  await expect(nav.getByRole('link', { name: 'Lustre 集群' })).toHaveAttribute('aria-current', 'page');
+  await nav.getByRole('link', { name: '分层策略' }).click();
+  await expect(page.getByRole('heading', { name: '分层策略' })).toBeVisible();
+});
+
 test('the daemon serves the compiled console and its real read APIs', { tag: '@daemon' }, async ({ page, request }) => {
   const [policyResponse, resourceResponse] = await Promise.all([
     request.get('/api/policies?configuredOnly=true'),
@@ -51,11 +75,20 @@ test('the daemon serves the compiled console and its real read APIs', { tag: '@d
   await page.getByRole('link', { name: 'Lustre 集群' }).click();
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Lustre 集群' })).toBeVisible();
+  const detailLink = (id: string) => {
+    const query = new URLSearchParams({ filesystem: id });
+    return page.getByRole('link', { name: '详情', exact: true }).and(page.locator(`a[href$="?${query}"]`));
+  };
   for (const resource of resources) {
-    const row = page.getByRole('row').filter({ has: page.getByRole('cell', { name: resource.id, exact: true }) });
+    const row = page.getByRole('row').filter({ has: detailLink(resource.id) });
     await expect(row).toContainText(resource.mountPath);
-    for (const pool of resource.pools?.filter(({ eligible }) => eligible) ?? []) {
-      await expect(row.getByText(pool.name, { exact: true })).toBeVisible();
+    if (resource.pools?.length) {
+      const pools = row.getByRole('button', { name: `查看 ${resource.pools.length} 个 Pool` });
+      await pools.click();
+      for (const pool of resource.pools.filter(({ eligible }) => eligible)) {
+        await expect(page.getByText(pool.name, { exact: true })).toBeVisible();
+      }
+      await pools.click();
     }
   }
   if (!resources.length) {
@@ -63,7 +96,9 @@ test('the daemon serves the compiled console and its real read APIs', { tag: '@d
   }
   const mounted = resources.find(({ tieringAvailable }) => tieringAvailable);
   if (mounted) {
-    await page.getByRole('link', { name: mounted.id, exact: true }).click();
+    const detail = detailLink(mounted.id);
+    const name = await page.getByRole('row').filter({ has: detail }).getByRole('link').first().innerText();
+    await detail.click();
     await page.getByRole('tab', { name: '存储资源' }).click();
     const pool = mounted.pools?.find(({ eligible }) => eligible);
     if (pool) {
@@ -71,7 +106,7 @@ test('the daemon serves the compiled console and its real read APIs', { tag: '@d
     }
     await page.getByRole('tab', { name: '挂载信息' }).click();
     await page.reload();
-    await expect(page.getByRole('heading', { name: mounted.id, exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
     await expect(page.getByText(mounted.mount?.source ?? '未取得', { exact: true })).toBeVisible();
   }
 });
@@ -152,8 +187,20 @@ test('policies show saved values and distinguish empty, filtered, and failed req
   await expect(page.getByText('暂无分层策略')).toBeVisible();
 });
 
-test('resources show eligible pools, failures and fresh results independently of policy data', async ({ page }) => {
+test('Lustre resource list shows the prototype columns, pool counts and collection failures', async ({ page }) => {
   let mountMissing = false;
+  let managementFails = false;
+  await page.route('**/api/filesystems/management', (route) => managementFails
+    ? route.fulfill({ status: 503, json: { error: '无法读取注册信息' } })
+    : route.fulfill({
+      json: {
+        canCreateMount: false, availableMounts: [],
+        resources: [{
+          id: 'lab-a', name: '测试集群', owner: 'external', source: '10.1.2.3@tcp:/oldlab',
+          lastMountError: '连接超时',
+        }],
+      },
+    }));
   await page.route('**/api/filesystems/refresh', (route) => {
     expect(route.request().method()).toBe('POST');
     mountMissing = true;
@@ -179,19 +226,39 @@ test('resources show eligible pools, failures and fresh results independently of
     }],
   }));
   await page.goto('/console/#/resources');
-  const row = page.getByRole('row').filter({ hasText: 'lab-a' });
-  await expect(row).toContainText('/mnt/lab');
-  await expect(row).toContainText('可用于分层');
-  await expect(row).toContainText('cold');
-  await expect(row).toContainText('hot');
-  await expect(row.getByText('unknown', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('columnheader')).toHaveText([
+    '集群名称 / 文件系统', '挂载路径 / 所有权', '挂载状态', '信息采集',
+    'Pool 数', '总容量 / 使用率', '分层状态', '操作',
+  ]);
+  await expect(page.getByText('共 1 / 1 个资源 · 以文件系统为接入单位')).toBeVisible();
+  const row = page.getByRole('row').filter({ hasText: '测试集群' });
+  await expect(row.getByRole('cell').nth(0)).toHaveText('测试集群lab · lab-a');
+  await expect(row.getByRole('cell').nth(1)).toHaveText('/mnt/lab外部管理');
+  await expect(row.getByRole('cell').nth(6)).toHaveText('可用');
+  await expect(row.getByRole('link', { name: '详情' })).toHaveAttribute('href', '#/resources/detail?filesystem=lab-a');
+  const pools = row.getByRole('button', { name: '查看 4 个 Pool' });
+  await pools.click();
+  await expect(page.getByText('cold', { exact: true })).toBeVisible();
+  await expect(page.getByText('hot', { exact: true })).toBeVisible();
+  await pools.click();
   await expect(row).toContainText('部分采集');
   await row.getByRole('button', { name: '查看原因' }).click();
   await expect(page.getByText('unknown · 采集失败')).toBeVisible();
-  await page.getByRole('button', { name: '刷新' }).click();
+  await page.getByRole('button', { name: '刷新资源' }).click();
   await expect(row).toContainText('未挂载');
-  await expect(row).toContainText('无法确认可选池');
+  await expect(page.getByText('资源已刷新', { exact: true })).toBeVisible();
+  await expect(row.getByRole('cell').nth(0)).toHaveText('测试集群oldlab · lab-a');
+  await expect(row.getByRole('cell').nth(4)).toHaveText('—');
   await expect(row).toContainText('配置路径未挂载 Lustre');
+  await row.getByRole('button', { name: '挂载异常' }).press('Enter');
+  await expect(page.getByText('连接超时', { exact: true })).toBeVisible();
+
+  managementFails = true;
+  await page.getByRole('button', { name: '刷新资源' }).click();
+  await expect(page.getByRole('alert')).toContainText('无法读取注册信息');
+  await expect(row).toContainText('外部管理');
+  await expect(page.getByRole('button', { name: '添加集群' })).toHaveCount(0);
+  await expect(page.getByText('资源已刷新', { exact: true })).toHaveCount(0, { timeout: 1_000 });
 });
 
 test('an unsaved tiering preview uses the selected pool pair and invalidates old results', async ({ page }) => {

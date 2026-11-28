@@ -95,21 +95,24 @@ export function CollectionStatus({ status, observedAt, now }: {
   return <><Tag color={color}>{label}</Tag>{stale && <Tag color="warning">快照已过期</Tag>}</>;
 }
 
-export function Availability({ resource }: { resource: FilesystemResource }) {
+export function Availability({ resource, compact = false }: { resource: FilesystemResource; compact?: boolean }) {
+  const { tieringAvailable, reason } = resource;
+  const [color, label] = tieringAvailable
+    ? ['success', compact ? '可用' : '可用于分层']
+    : [compact ? 'warning' : 'default', compact ? '不可用' : '暂不可用于分层'];
   return (
     <>
-      <Tag color={resource.tieringAvailable ? 'success' : 'default'}>
-        {resource.tieringAvailable ? '可用于分层' : '暂不可用于分层'}
-      </Tag>
-      <Reason reason={resource.reason} />
+      <Tag color={color}>{label}</Tag>
+      <Reason reason={reason} />
     </>
   );
 }
 
-export function CapacityStatus({ capacity, now }: { capacity: Capacity; now: number }) {
+export function CapacityStatus({ capacity, now, hideFresh = false }: { capacity: Capacity; now: number; hideFresh?: boolean }) {
   const { status, attemptedAt, sample, reason } = capacity;
   const [color, label] = capacityLabels[status];
   const stale = sample && (status !== 'collected' || now - sample.observedAt >= 300);
+  if (hideFresh && sample && !stale) return null;
   return (
     <>
       {stale && <Tag color="warning">容量已过期</Tag>}

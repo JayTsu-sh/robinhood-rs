@@ -14,37 +14,27 @@ html, body, #root {
   background: #14263d;
 }
 
-.console-mark {
-  display: grid;
-  flex: 0 0 35px;
-  height: 35px;
-  place-items: center;
-  border-radius: 9px;
-  background: #3477f4;
-  color: #fff;
-  font-size: 18px;
-}
-
 .console-brand {
   display: flex;
   align-items: center;
-  gap: 11px;
-  margin: 23px 19px 32px;
+  min-height: 42px;
+  margin: 20px 19px 24px;
   white-space: nowrap;
-  color: #fff;
-  font-size: 17px;
-  font-weight: 650;
+  color: #eaf7ed;
+  font-family: Georgia, 'Palatino Linotype', serif;
+  font-size: 34px;
+  font-style: italic;
+  font-weight: 700;
+  letter-spacing: -0.05em;
+  line-height: 1;
 }
 
 .console-brand:hover {
   color: #fff;
 }
 
-.ant-layout-sider-collapsed .console-brand-name {
-  display: none;
-}
-
-.console-sidebar .ant-menu-item {
+.console-sidebar .ant-menu-item,
+.console-sidebar .ant-menu-submenu-title {
   margin: 5px 9px;
   width: calc(100% - 18px);
 }
@@ -80,6 +70,10 @@ html, body, #root {
   max-width: 1500px;
   margin: 0 auto;
   padding: 28px 30px 56px;
+}
+
+.console-mobile-nav {
+  display: none;
 }
 
 .console-title,
@@ -151,12 +145,38 @@ html, body, #root {
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 767px) {
+@media (max-width: 780px) {
+  .console .console-sidebar {
+    display: none;
+  }
+
   .console .console-header {
     padding: 0 16px;
   }
 
   .console-content {
     padding: 18px 12px 36px;
+  }
+
+  .console-mobile-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+
+  .console-mobile-nav a {
+    padding: 6px 10px;
+    border: 1px solid #cdd8e5;
+    border-radius: 6px;
+    background: #fff;
+    color: #34455b;
+  }
+
+  .console-mobile-nav a[aria-current='page'] {
+    border-color: #a4c6ff;
+    background: #eef5ff;
+    color: #1d4ed8;
+    font-weight: 600;
   }
 }
