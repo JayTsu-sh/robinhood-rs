@@ -20,6 +20,9 @@ use rbh_entry_store::{EntryStore, FileSystemConfig, FileSystemId};
 mod rev8_execution;
 mod rev8_heat;
 mod rev8_resources;
+pub use rev8_execution::history::{
+    HistoryOperation, HistoryPage, LatestRun, OperationSearch, OperationState, RunHistory, RunSearch, RunState,
+};
 pub use rev8_execution::{Rev8Operation, Rev8Run};
 pub use rev8_heat::HeatSampler;
 pub use rev8_resources::ResourceRevision;
@@ -43,9 +46,14 @@ pub struct PolicyStore {
 pub struct Rev8PolicyRow {
     pub id: u64,
     pub revision: u64,
+    pub id_exact: String,
+    pub revision_exact: String,
     pub definition: Json<serde_json::Value>,
     pub resource_bindings: Option<Json<Vec<ResourceBinding>>>,
     pub modified_by: Option<String>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_run: Option<LatestRun>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,10 +63,16 @@ pub enum Rev8PolicyWrite {
 }
 
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SavedRev8Policy {
     pub id: u64,
     pub revision: u64,
+    pub id_exact: String,
+    pub revision_exact: String,
 }
+
+const REV8_POLICY_FIELDS: &str = "r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by,
+    CAST(r.policy_id AS CHAR) AS id_exact, CAST(r.revision AS CHAR) AS revision_exact";
 
 const POLICY_HEAD_REVISION: &str =
     "SELECT revision FROM policies WHERE id = ? AND name IS NOT NULL AND revision IS NOT NULL";
@@ -242,29 +256,39 @@ impl PolicyStore {
         };
         record_rev8_revision(&mut tx, id, bindings, actor).await?;
         tx.commit().await?;
-        Ok(SavedRev8Policy { id, revision })
+        Ok(SavedRev8Policy {
+            id,
+            revision,
+            id_exact: id.to_string(),
+            revision_exact: revision.to_string(),
+        })
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn get_rev8(&self, id: u64) -> Result<Option<Rev8PolicyRow>, PolicyError> {
-        Ok(sqlx::query_as(
-            "SELECT r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by
-             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.id = ? AND p.name IS NOT NULL",
-        ).bind(id).fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_as(&format!(
+            "SELECT {REV8_POLICY_FIELDS}
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.id = ? AND p.name IS NOT NULL"
+        )).bind(id).fetch_optional(&self.pool).await?)
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn list_rev8(&self) -> Result<Vec<Rev8PolicyRow>, PolicyError> {
-        Ok(sqlx::query_as(
-            "SELECT r.policy_id AS id, r.revision, r.definition, r.resource_bindings, r.modified_by
-             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.name IS NOT NULL ORDER BY p.id",
-        ).fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as(&format!(
+            "SELECT {REV8_POLICY_FIELDS}
+             FROM policies p JOIN rev8_policy_revisions r ON r.policy_id = p.id AND r.revision = p.revision WHERE p.name IS NOT NULL ORDER BY p.id"
+        )).fetch_all(&self.pool).await?)
     }
 
     /// List current revisions whose target belongs to this deployment's registry.
     #[tracing::instrument(skip(self))]
     pub async fn list_configured_rev8(&self) -> Result<Vec<Rev8PolicyRow>, PolicyError> {
         let mut rows = self.list_rev8().await?;
+        self.retain_configured_rev8(&mut rows);
+        Ok(rows)
+    }
+
+    fn retain_configured_rev8(&self, rows: &mut Vec<Rev8PolicyRow>) {
         if let Some(configured) = &self.configured_filesystems {
             rows.retain(|row| {
                 row.definition["spec"]["target"]["filesystem"]
@@ -273,15 +297,14 @@ impl PolicyStore {
                     .is_some_and(|id| configured.contains(&id))
             });
         }
-        Ok(rows)
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn get_rev8_revision(&self, id: u64, revision: u64) -> Result<Rev8PolicyRow, PolicyError> {
-        sqlx::query_as(
-            "SELECT policy_id AS id, revision, definition, resource_bindings, modified_by
-             FROM rev8_policy_revisions WHERE policy_id = ? AND revision = ?",
-        )
+        sqlx::query_as(&format!(
+            "SELECT {REV8_POLICY_FIELDS}
+             FROM rev8_policy_revisions r WHERE policy_id = ? AND revision = ?"
+        ))
         .bind(id)
         .bind(revision)
         .fetch_optional(&self.pool)

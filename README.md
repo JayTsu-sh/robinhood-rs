@@ -231,6 +231,27 @@ Use the profile and policy admission windows to restrict submission times.
 - `POST /api/policies/{id}/breaker/reset` resets the policy circuit breaker
   with an authenticated writer. Outstanding operation limits remain in force.
 
+### Rev.8 execution history
+
+- `GET /api/runs` lists runs newest first. Filters include `policyId`,
+  `policyName` (a substring of the name saved with the run), `runId`, and
+  `state`.
+- `GET /api/runs/{id}` includes the run's pinned revision and
+  `hasPendingOperations`. A `finished` run may still have operations in
+  `submitting`, `submitted`, or `unknown`.
+- `GET /api/runs/{id}/operations` lists recorded operations oldest first.
+  Filter by `state`, `reason` (a literal substring), or full Lustre
+  `fid`. Use `exceptionsOnly=true` for failed, deferred, and unknown
+  operations. Migration plans and observed layout evidence are separate fields.
+- Each list returns `{items, nextCursor}`. Use the cursor as `beforeId`
+  for runs or `afterId` for operations with the same filters. A null
+  cursor means the last page. The default `limit` is 25 and the maximum
+  is 100. Cursors and the `*Exact` fields carry IDs and byte values as
+  decimal strings for JavaScript clients.
+- Add `includeLatestRun=true` to the current policy list or detail request
+  to include the dispatching run, the latest queued run, or the latest run
+  in that order of preference.
+
 ### Rev.8 policy resources
 
 Manage `Selector`, `ExecutionProfile`, `AuthorizationPolicy`, `ApprovalPolicy`

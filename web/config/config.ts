@@ -18,6 +18,8 @@ export default defineConfig({
     { path: '/policies/:id/edit', component: '@/pages/PolicyWizard' },
     { path: '/policies/:id/revisions/:revision', component: '@/pages/PolicyDetails' },
     { path: '/policies/:id', component: '@/pages/PolicyDetails' },
+    { path: '/runs', component: '@/pages/Runs' },
+    { path: '/runs/:id', component: '@/pages/RunDetails' },
     { path: '/resources', component: '@/pages/Resources' },
     { path: '/resources/detail', component: '@/pages/ResourceDetails' },
   ],

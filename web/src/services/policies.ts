@@ -1,14 +1,18 @@
 import { request } from '@umijs/max';
 import type { PolicyDefinition } from '@/domain/tieringPolicy';
+import type { LatestRun } from './executions';
 import type { PolicyPreview } from './policyPreview';
 import { listFilesystems } from './tiering';
 
 export interface PolicyRevision {
   id: number;
   revision: number;
+  idExact: string;
+  revisionExact: string;
   definition: PolicyDefinition;
   resourceBindings: PolicyPreview['resourceBindings'] | null;
   modifiedBy: string | null;
+  latestRun?: LatestRun;
 }
 
 export interface ResourceRevision {
@@ -19,16 +23,19 @@ export interface ResourceRevision {
 
 const readOptions = { timeout: 15_000, skipErrorHandler: true };
 
-export const policyDetailsPath = (id: number, revision?: number) =>
-  revision === undefined ? `/policies/${id}` : `/policies/${id}/revisions/${revision}`;
+export const policyDetailsPath = (id: number | string, revision?: number | string) =>
+  revision === undefined ? `/policies/${encodeURIComponent(id)}` :
+    `/policies/${encodeURIComponent(id)}/revisions/${encodeURIComponent(revision)}`;
 
-export const policyEditPath = (id: number) => `${policyDetailsPath(id)}/edit`;
+export const policyEditPath = (id: number | string) => `${policyDetailsPath(id)}/edit`;
 
-export function getPolicy(id: number, signal: AbortSignal, revision?: number) {
-  return request<PolicyRevision>(`/api${policyDetailsPath(id, revision)}`, { ...readOptions, signal });
+export function getPolicy(id: number | string, signal: AbortSignal, revision?: number | string, includeLatestRun = false) {
+  return request<PolicyRevision>(`/api${policyDetailsPath(id, revision)}`, {
+    ...readOptions, signal, params: includeLatestRun && revision === undefined ? { includeLatestRun: true } : undefined,
+  });
 }
 
-export async function getPolicyDefinition(id: number, revision: number, signal: AbortSignal) {
+export async function getPolicyDefinition(id: number | string, revision: number | string, signal: AbortSignal) {
   const response = await fetch(`/api${policyDetailsPath(id, revision)}/definition`, {
     signal: AbortSignal.any([signal, AbortSignal.timeout(readOptions.timeout)]),
   });
@@ -47,7 +54,7 @@ export async function loadWizardResources(signal: AbortSignal) {
 
 export type WizardResources = Awaited<ReturnType<typeof loadWizardResources>>;
 
-export interface SavedRevision { id: number; revision: number }
+export interface SavedRevision { id: string | number; revision: string | number }
 
 export function writerTransportAllowed() {
   const { protocol, hostname } = window.location;
@@ -62,13 +69,13 @@ export function savePolicy(document: object, base?: SavedRevision, token?: strin
   const headers: Record<string, string> = {};
   if (base) headers['If-Match'] = `"${base.revision}"`;
   if (token) headers.Authorization = `Bearer ${token}`;
-  return request<SavedRevision>(base ? `/api/policies/${base.id}` : '/api/policies', {
+  return request<Pick<PolicyRevision, 'idExact' | 'revisionExact'>>(base ? `/api${policyDetailsPath(base.id)}` : '/api/policies', {
     method: base ? 'PUT' : 'POST', data: document, headers, timeout: 60_000, skipErrorHandler: true,
   });
 }
 
 export function writeError(error: unknown) {
   return (error as {
-    response?: { status?: number; data?: { currentRevision?: number; field?: string } };
+    response?: { status?: number; data?: { currentRevisionExact?: string; field?: string } };
   } | undefined)?.response;
 }

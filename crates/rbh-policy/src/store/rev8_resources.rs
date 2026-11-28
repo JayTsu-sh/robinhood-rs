@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{MySql, Transaction, types::Json};
 
-use super::{PolicyStore, Rev8PolicyRow, record_rev8_revision};
+use super::{PolicyStore, REV8_POLICY_FIELDS, Rev8PolicyRow, record_rev8_revision};
 use crate::{
     PolicyError,
     rev8::{
@@ -294,11 +294,11 @@ impl PolicyStore {
 }
 
 async fn enabled_policies(tx: &mut Transaction<'_, MySql>) -> Result<Vec<Rev8PolicyRow>, PolicyError> {
-    Ok(sqlx::query_as(
-        "SELECT p.id, r.revision, r.definition, r.resource_bindings, r.modified_by
+    Ok(sqlx::query_as(&format!(
+        "SELECT {REV8_POLICY_FIELDS}
          FROM policies p JOIN rev8_policy_revisions r ON p.id = r.policy_id AND p.revision = r.revision
-         WHERE p.name IS NOT NULL AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.definition, '$.spec.enabled')), 'true') <> 'false'",
-    )
+         WHERE p.name IS NOT NULL AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.definition, '$.spec.enabled')), 'true') <> 'false'"
+    ))
     .fetch_all(&mut **tx)
     .await?)
 }

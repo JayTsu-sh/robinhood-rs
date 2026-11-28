@@ -8,14 +8,14 @@ export interface PolicyDraft {
   settings: PolicySettings;
 }
 
-function draftKey(id?: number) {
+function draftKey(id?: SavedRevision['id']) {
   return `rbh.console.policy-draft.v1.${id ?? 'new'}`;
 }
 
-export function readPolicyDraft(id?: number): PolicyDraft | null {
+export function readPolicyDraft(id?: SavedRevision['id']): PolicyDraft | null {
   try {
     const draft = JSON.parse(localStorage.getItem(draftKey(id)) ?? 'null') as PolicyDraft | null;
-    if (draft?.version !== 1 || draft.base?.id !== id || !draft.values || !draft.settings) return null;
+    if (draft?.version !== 1 || String(draft.base?.id ?? '') !== String(id ?? '') || !draft.values || !draft.settings) return null;
     if (typeof draft.values.name !== 'string' || !Array.isArray(draft.values.rules) ||
       !Array.isArray(draft.values.include?.clauses) || !Array.isArray(draft.values.exclude?.clauses) ||
       !Array.isArray(draft.values.excludedSubtrees)) return null;

@@ -80,13 +80,16 @@ test('policies show saved values and distinguish empty, filtered, and failed req
   let status = 200;
   let revision = 7;
   let seen = true;
-  await page.route('**/api/policies?configuredOnly=true', (route) =>
+  await page.route('**/api/policies?configuredOnly=true&includeLatestRun=true', (route) =>
     route.fulfill({
       status,
       json: status !== 200 ? { error: '数据库不可用' } : seen ? [
         {
           id: 42,
           revision,
+          idExact: '42',
+          revisionExact: String(revision),
+          latestRun: { id: '501', revision: '6', state: 'running', startedAt: '2026-11-28T06:15:00Z' },
           definition: {
             metadata: { name: '按访问时间降温' },
             spec: {
@@ -105,6 +108,8 @@ test('policies show saved values and distinguish empty, filtered, and failed req
         {
           id: 5,
           revision: 1,
+          idExact: '5',
+          revisionExact: '1',
           definition: {
             metadata: { name: '原生归档' },
             spec: {
@@ -123,7 +128,15 @@ test('policies show saved values and distinguish empty, filtered, and failed req
   await expect(row).toContainText('lab-a');
   await expect(row).toContainText('hot → cold');
   await expect(row).toContainText('已停用');
+  await expect(row).toContainText('派发中');
+  await expect(row.getByRole('link', { name: '#501' })).toHaveAttribute('href', '#/runs/501');
   await expect(page.getByText('原生归档')).toHaveCount(0);
+  const runState = page.getByRole('combobox', { name: '当前或最近运行状态' });
+  await runState.press('ArrowDown');
+  const options = page.locator(`[id="${await runState.getAttribute('aria-controls')}"]`);
+  await options.getByRole('option', { name: '未执行' }).click();
+  await expect(page.getByText('没有符合筛选条件的策略')).toBeVisible();
+  await page.getByRole('button', { name: '重置筛选' }).click();
   await page.getByRole('searchbox', { name: '搜索策略' }).fill('无匹配');
   await expect(page.getByText('没有符合筛选条件的策略')).toBeVisible();
   await page.getByRole('button', { name: '重置筛选' }).click();

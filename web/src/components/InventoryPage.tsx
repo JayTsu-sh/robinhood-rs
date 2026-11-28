@@ -7,18 +7,19 @@ interface Props {
   status: 'loading' | 'ready' | 'error';
   error?: string;
   refresh?: () => void;
+  refreshing?: boolean;
   children: ReactNode;
   action?: ReactNode;
 }
 
-export default function InventoryPage({ title, status, error, refresh, children, action }: Props) {
+export default function InventoryPage({ title, status, error, refresh, refreshing, children, action }: Props) {
   return (
     <section>
       <div className="console-title">
         <Typography.Title level={1}>{title}</Typography.Title>
         <Flex gap={12} align="center">
           {action}
-          {refresh && <Button icon={<ReloadOutlined />} loading={status === 'loading'} onClick={refresh}>刷新</Button>}
+          {refresh && <Button icon={<ReloadOutlined aria-hidden />} loading={status === 'loading' || refreshing} onClick={refresh}>刷新</Button>}
         </Flex>
       </div>
       {status === 'error' && (

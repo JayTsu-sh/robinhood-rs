@@ -43,9 +43,10 @@ test('opens a resource directly, refreshes that resource and follows an associat
     listRequests += 1;
     return route.fulfill({ json: [resource(), { ...resource(), id: 'lab-b', tieringAvailable: false }] });
   });
-  await page.route('**/api/policies?configuredOnly=true', (route) => route.fulfill({
+  await page.route((url) => url.pathname === '/api/policies' && url.searchParams.get('configuredOnly') === 'true', (route) => route.fulfill({
     json: ['lab-a', 'lab-b'].map((filesystem, index) => ({
       id: index + 42, revision: 1,
+      idExact: String(index + 42), revisionExact: '1',
       definition: {
         metadata: { name: `数据降温 ${filesystem}` },
         spec: { enabled: false, target: { filesystem }, rules: { entries: [

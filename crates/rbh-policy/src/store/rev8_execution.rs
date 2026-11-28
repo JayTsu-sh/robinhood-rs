@@ -1,3 +1,4 @@
+pub(super) mod history;
 mod migration;
 mod native_admission;
 mod native_recovery;

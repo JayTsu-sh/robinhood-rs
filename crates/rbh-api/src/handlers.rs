@@ -22,6 +22,7 @@ use crate::{
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
+        .merge(crate::run_history::routes())
         .route(
             "/classifiers",
             post(crate::classifier_handlers::create_classifier).get(crate::classifier_handlers::list_classifiers),
@@ -125,16 +126,23 @@ async fn create_policy(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PolicyListQuery {
+struct PolicyReadQuery {
     #[serde(default)]
     configured_only: bool,
+    #[serde(default)]
+    include_latest_run: bool,
 }
 
 #[tracing::instrument(skip(state))]
 async fn list_policies(
-    State(state): State<AppState>, axum::extract::Query(query): axum::extract::Query<PolicyListQuery>,
+    State(state): State<AppState>, axum::extract::Query(query): axum::extract::Query<PolicyReadQuery>,
 ) -> Result<Json<Vec<Rev8PolicyRow>>, ApiError> {
-    let rows = if query.configured_only {
+    let rows = if query.include_latest_run {
+        state
+            .policy_store
+            .list_rev8_with_latest_run(query.configured_only)
+            .await?
+    } else if query.configured_only {
         state.policy_store.list_configured_rev8().await?
     } else {
         state.policy_store.list_rev8().await?
@@ -143,14 +151,16 @@ async fn list_policies(
 }
 
 #[tracing::instrument(skip(state))]
-async fn get_policy(State(state): State<AppState>, Path(id): Path<u64>) -> Result<Json<Rev8PolicyRow>, ApiError> {
-    Ok(Json(
-        state
-            .policy_store
-            .get_rev8(id)
-            .await?
-            .ok_or(PolicyError::NotFound(id))?,
-    ))
+async fn get_policy(
+    State(state): State<AppState>, Path(id): Path<u64>,
+    axum::extract::Query(query): axum::extract::Query<PolicyReadQuery>,
+) -> Result<Json<Rev8PolicyRow>, ApiError> {
+    let row = if query.include_latest_run {
+        state.policy_store.get_rev8_with_latest_run(id).await?
+    } else {
+        state.policy_store.get_rev8(id).await?
+    };
+    Ok(Json(row.ok_or(PolicyError::NotFound(id))?))
 }
 
 #[tracing::instrument(skip_all, fields(id))]
@@ -1213,7 +1223,11 @@ impl IntoResponse for ApiError {
             ApiError::Policy(error @ PolicyError::RevisionConflict { current, .. }) => {
                 return (
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": error.to_string(), "currentRevision": current })),
+                    Json(serde_json::json!({
+                        "error": error.to_string(),
+                        "currentRevision": current,
+                        "currentRevisionExact": current.to_string(),
+                    })),
                 )
                     .into_response();
             }
@@ -1369,9 +1383,13 @@ pub(crate) mod scoped_api_tests {
             (right_response, left_response, &right)
         };
         winner.assert_status_ok();
-        assert_eq!(winner.json::<Value>(), json!({ "id": id, "revision": 2 }));
+        assert_eq!(
+            winner.json::<Value>(),
+            json!({ "id": id, "revision": 2, "idExact": id.to_string(), "revisionExact": "2" })
+        );
         loser.assert_status(StatusCode::CONFLICT);
         assert_eq!(loser.json::<Value>()["currentRevision"], 2);
+        assert_eq!(loser.json::<Value>()["currentRevisionExact"], "2");
         let mut stale = document.clone();
         stale["spec"]["target"]["filesystem"] = "unavailable-filesystem".into();
         let response = server.put(&path).add_header(IF_MATCH, "\"1\"").json(&stale).await;

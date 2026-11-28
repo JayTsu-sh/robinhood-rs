@@ -91,6 +91,20 @@ html, body, #root {
   gap: 12px;
 }
 
+.console-pagination {
+  justify-content: flex-end;
+  padding: 12px 16px;
+  border-top: 1px solid #eaf0f6;
+}
+
+.console-execution-filter {
+  min-width: 155px;
+}
+
+.console-execution-reason {
+  white-space: pre-wrap;
+}
+
 .console-title {
   margin-bottom: 20px;
 }

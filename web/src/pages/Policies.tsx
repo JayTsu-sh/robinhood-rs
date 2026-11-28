@@ -3,6 +3,7 @@ import { ProTable, type ProColumns } from '@ant-design/pro-components';
 import { Link, useSearchParams } from '@umijs/max';
 import { Button, Empty, Flex, Input, Select, Tag } from 'antd';
 import { useState } from 'react';
+import { LatestRunLink, runStateOptions } from '@/components/ExecutionStatus';
 import InventoryPage from '@/components/InventoryPage';
 import { policyDetailsPath, policyEditPath } from '@/services/policies';
 import { filesystemDetailsPath, listTieringPolicies, type TieringPolicy } from '@/services/tiering';
@@ -34,16 +35,24 @@ const columns: ProColumns<TieringPolicy>[] = [
     render: (_, row) => <Tag color={row.enabled ? 'success' : 'default'}>{row.enabled ? '已启用' : '已停用'}</Tag>,
   },
   {
+    title: '当前或最近运行',
+    width: 205,
+    render: (_, row) => <LatestRunLink run={row.latestRun} />,
+  },
+  {
     title: '操作',
     width: 85,
     render: (_, row) => row.editable ? <Link to={policyEditPath(row.id)}>编辑</Link> : '—',
   },
 ];
 
+const loadPolicies = (signal: AbortSignal) => listTieringPolicies(signal, true);
+
 export default function Policies() {
-  const { state, refresh } = useInventory(listTieringPolicies);
+  const { state, refresh } = useInventory(loadPolicies);
   const [search, setSearch] = useState('');
   const [enabled, setEnabled] = useState('all');
+  const [runState, setRunState] = useState('all');
   const [params, setParams] = useSearchParams();
   const policyId = params.get('policy');
   const allRows = state.status === 'ready' ? state.data : [];
@@ -51,6 +60,7 @@ export default function Policies() {
   const rows = allRows.filter((row) =>
     (!policyId || String(row.id) === policyId) &&
     (enabled === 'all' || row.enabled === (enabled === 'enabled')) &&
+    (runState === 'all' || (row.latestRun?.state ?? 'never') === runState) &&
     [row.name, String(row.id), row.filesystem, row.sourcePool, row.targetPool]
       .some((value) => value.toLowerCase().includes(query)),
   );
@@ -87,11 +97,17 @@ export default function Policies() {
               { value: 'disabled', label: '已停用' },
             ]}
           />
+          <Select aria-label="当前或最近运行状态" value={runState} onChange={setRunState} virtual={false} options={[
+            { value: 'all', label: '全部运行状态' },
+            { value: 'never', label: '未执行' },
+            ...runStateOptions,
+          ]} />
           <Button
-            disabled={!policyId && !search && enabled === 'all'}
+            disabled={!policyId && !search && enabled === 'all' && runState === 'all'}
             onClick={() => {
               setSearch('');
               setEnabled('all');
+              setRunState('all');
               if (policyId) {
                 const next = new URLSearchParams(params);
                 next.delete('policy');
@@ -110,7 +126,7 @@ export default function Policies() {
           search={false}
           toolBarRender={false}
           pagination={rows.length > 10 ? { defaultPageSize: 10 } : false}
-          scroll={{ x: 830 }}
+          scroll={{ x: 1035 }}
           locale={{
             emptyText: <Empty className="console-empty" image={Empty.PRESENTED_IMAGE_SIMPLE} description={
               allRows.length ? '没有符合筛选条件的策略' : '暂无分层策略'

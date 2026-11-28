@@ -8,6 +8,9 @@
 //! * `POST /api/policies/preview` — evaluate an unsaved Rev.8 document
 //! * `POST /api/policies/:id/preview` — evaluate Rev.8 candidates
 //! * `DELETE /api/policies/:id` — delete policy
+//! * `GET /api/runs` — search cross-policy execution history
+//! * `GET /api/runs/{id}` — read a run and its pinned policy metadata
+//! * `GET /api/runs/{id}/operations` — search a run's recorded file operations
 //! * `GET /api/entries/count` — entry catalog count
 //! * `GET /api/entries/{object_id}?filesystem=ID` — look up one catalog entry
 //! * `POST /api/scans` — start a filesystem scan
@@ -30,6 +33,9 @@ mod rev8_handlers;
 mod rev8_heat_tests;
 #[cfg(test)]
 mod rev8_preview_tests;
+mod run_history;
+#[cfg(test)]
+mod run_history_tests;
 pub mod state;
 
 pub use rev8_auth::Rev8Writers;

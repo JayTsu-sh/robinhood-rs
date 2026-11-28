@@ -1,4 +1,4 @@
-import { ClusterOutlined, DatabaseOutlined, SwapOutlined } from '@ant-design/icons';
+import { ClusterOutlined, DatabaseOutlined, HistoryOutlined, SwapOutlined } from '@ant-design/icons';
 import { Link, Outlet, useLocation } from '@umijs/max';
 import { ConfigProvider, Layout, Menu } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
@@ -7,6 +7,7 @@ import './layout.css';
 
 const navigation = [
   { key: '/policies', title: '分层策略', icon: <SwapOutlined /> },
+  { key: '/runs', title: '执行记录', icon: <HistoryOutlined /> },
   { key: '/resources', title: 'Lustre 集群', icon: <ClusterOutlined /> },
 ];
 

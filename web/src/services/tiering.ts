@@ -1,17 +1,19 @@
 import { request } from '@umijs/max';
 
 import { policyPoolPair, readEditablePolicy } from '@/domain/tieringPolicy';
+import type { LatestRun } from './executions';
 import type { PolicyRevision } from './policies';
 
 export interface TieringPolicy {
-  id: number;
-  revision: number;
+  id: string;
+  revision: string;
   name: string;
   enabled: boolean;
   editable: boolean;
   filesystem: string;
   sourcePool: string;
   targetPool: string;
+  latestRun?: LatestRun;
 }
 
 export interface PoolResource {
@@ -49,20 +51,20 @@ export interface FilesystemResource {
   reason: string | null;
 }
 
-function toTieringPolicy({ id, revision, definition }: PolicyRevision): TieringPolicy[] {
+function toTieringPolicy({ idExact, revisionExact, definition, latestRun }: PolicyRevision): TieringPolicy[] {
   const pair = policyPoolPair(definition);
   if (!pair) return [];
   return [{
-    id, revision, ...pair, name: definition.metadata.name,
+    id: idExact, revision: revisionExact, ...pair, name: definition.metadata.name,
     enabled: definition.spec.enabled ?? true,
     editable: readEditablePolicy(definition) !== null,
-    filesystem: definition.spec.target.filesystem,
+    filesystem: definition.spec.target.filesystem, latestRun,
   }];
 }
 
-export async function listTieringPolicies(signal: AbortSignal) {
+export async function listTieringPolicies(signal: AbortSignal, includeLatestRun = false) {
   const rows = await request<PolicyRevision[]>('/api/policies', {
-    params: { configuredOnly: true },
+    params: includeLatestRun ? { configuredOnly: true, includeLatestRun } : { configuredOnly: true },
     signal,
     timeout: 15000,
     skipErrorHandler: true,

@@ -18,11 +18,11 @@ import {
 import { requestError, useInventory } from '@/services/useInventory';
 
 type PreviewState = { loading: true } | { data: PolicyPreview } | { error: string };
-type SaveFailure = { message: string; conflict?: number };
+type SaveFailure = { message: string; conflict?: string };
 
 function Editor({ initial, settings: initialSettings, base: initialBase, resources, reload, currentRevision, exitRecovery }: {
   initial: WizardValues; settings: PolicySettings; base?: SavedRevision; resources: WizardResources;
-  reload: (signal: AbortSignal) => Promise<void>; currentRevision?: number; exitRecovery?: () => void;
+  reload: (signal: AbortSignal) => Promise<void>; currentRevision?: string; exitRecovery?: () => void;
 }) {
   const [form] = Form.useForm();
   const [values, setValues] = useState(initial);
@@ -209,7 +209,7 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
       const saved = await savePolicy(policyDocument(config, settings), base, token);
       clearDraft();
       allowNavigation.current = true;
-      history.replace(policyDetailsPath(saved.id, saved.revision));
+      history.replace(policyDetailsPath(saved.idExact, saved.revisionExact));
     } catch (error) {
       const response = writeError(error);
       if (response?.status === 401) {
@@ -221,7 +221,7 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
         }
       } else {
         setWriterPrompt(false);
-        const conflict = response?.status === 409 ? response.data?.currentRevision : undefined;
+        const conflict = response?.status === 409 ? response.data?.currentRevisionExact : undefined;
         const message = requestError(error);
         setFailure({
           message, conflict,
@@ -243,8 +243,8 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
     }
   }
 
-  const canRestore = draft && draft.base?.id === initialBase?.id;
-  const stale = base && currentRevision !== undefined && base.revision !== currentRevision;
+  const canRestore = draft && String(draft.base?.id ?? '') === String(initialBase?.id ?? '');
+  const stale = base && currentRevision !== undefined && String(base.revision) !== currentRevision;
   const validationMessage = invalid.find(({ name }) => name.length === 1 && name[0] === 'rules');
   const busy = saving || reloading;
   return (
@@ -321,7 +321,7 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
 function PolicyWizardPage({ id }: { id?: string }) {
   const load = useCallback(async (signal: AbortSignal) => {
     const [resources, row] = await Promise.all([
-      loadWizardResources(signal), id ? getPolicy(Number(id), signal) : Promise.resolve(undefined),
+      loadWizardResources(signal), id ? getPolicy(id, signal) : Promise.resolve(undefined),
     ]);
     return { resources, row, editable: row ? readEditablePolicy(row.definition) : null };
   }, [id]);
@@ -338,26 +338,26 @@ function PolicyWizardPage({ id }: { id?: string }) {
   const data = reloaded ?? (state.status === 'ready' ? state.data : null);
   const row = data?.row;
   const editable = data?.editable;
-  const draft = row && !editable ? readPolicyDraft(row.id) : null;
+  const draft = row && !editable ? readPolicyDraft(row.idExact) : null;
   const recovered = recover ? draft : null;
   const title = id ? '编辑策略' : '新建策略';
   return (
     <InventoryPage title={title} status={state.status} error={state.status === 'error' ? state.message : undefined}
       refresh={state.status === 'error' ? refresh : undefined}
-      action={<Link to={id ? policyDetailsPath(Number(id)) : '/policies'}>返回{id ? '策略详情' : '策略列表'}</Link>}>
+      action={<Link to={id ? policyDetailsPath(id) : '/policies'}>返回{id ? '策略详情' : '策略列表'}</Link>}>
       {data && (
         row && !editable && !recovered ? (
           <Alert type="info" showIcon message="此修订可只读查看和导出"
             action={<Flex align="center" wrap gap={8}>
               {draft && <Button onClick={() => setRecover(true)}>恢复草稿</Button>}
-              <Link to={policyDetailsPath(row.id, row.revision)}>查看策略修订</Link>
+              <Link to={policyDetailsPath(row.idExact, row.revisionExact)}>查看策略修订</Link>
             </Flex>} />
         ) : (
-          <Editor key={row?.revision ?? 'new'}
+          <Editor key={row?.revisionExact ?? 'new'}
             initial={editable?.values ?? recovered?.values ?? newWizardValues()}
             settings={editable?.settings ?? recovered?.settings ?? { enabled: false, mode: 'enforced' }}
-            base={recovered?.base ?? (row && { id: row.id, revision: row.revision })}
-            currentRevision={row?.revision} exitRecovery={recovered ? () => setRecover(false) : undefined}
+            base={recovered?.base ?? (row && { id: row.idExact, revision: row.revisionExact })}
+            currentRevision={row?.revisionExact} exitRecovery={recovered ? () => setRecover(false) : undefined}
             resources={data.resources} reload={reload} />
         )
       )}

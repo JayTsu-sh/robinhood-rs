@@ -1,15 +1,18 @@
-import { Link, useParams } from '@umijs/max';
+import { Link, useParams, useSearchParams } from '@umijs/max';
 import { Alert, Button, Card, Descriptions, Flex, Tabs, Tag, Typography } from 'antd';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
+import { LatestRunLink } from '@/components/ExecutionStatus';
 import { PolicyBindings, PolicyConfiguration } from '@/components/PolicyConfiguration';
+import RunHistoryTable from '@/components/RunHistoryTable';
 import { policyPoolPair, readEditablePolicy } from '@/domain/tieringPolicy';
+import { executionFilters, runHistoryPath } from '@/services/executions';
 import { readPolicyDraft } from '@/services/policyDrafts';
 import { getPolicy, getPolicyDefinition, policyDetailsPath, policyEditPath, type PolicyRevision } from '@/services/policies';
 import { filesystemDetailsPath } from '@/services/tiering';
 import { requestError, useInventory } from '@/services/useInventory';
 
-function PolicyJson({ id, revision }: { id: number; revision: number }) {
+function PolicyJson({ id, revision }: { id: string; revision: string }) {
   const read = useCallback((signal: AbortSignal) => getPolicyDefinition(id, revision, signal), [id, revision]);
   const { state, refresh } = useInventory(read);
   if (state.status === 'error') {
@@ -27,10 +30,14 @@ function PolicyJson({ id, revision }: { id: number; revision: number }) {
 }
 
 function Details({ row, historical }: { row: PolicyRevision; historical: boolean }) {
-  const { id, revision, definition } = row;
+  const { definition, idExact: id, revisionExact: revision } = row;
+  const previous = BigInt(revision) - 1n;
   const { metadata, spec } = definition;
   const decoded = readEditablePolicy(definition);
   const pair = policyPoolPair(definition);
+  const [params, setParams] = useSearchParams();
+  const selectedTab = params.get('tab');
+  const tab = selectedTab === 'configuration' || selectedTab === 'history' ? selectedTab : 'overview';
   const [downloading, setDownloading] = useState(false);
   const [exportError, setExportError] = useState<string>();
   const exportRequest = useRef<AbortController | null>(null);
@@ -58,20 +65,24 @@ function Details({ row, historical }: { row: PolicyRevision; historical: boolean
     }
   }
 
+  function openTab(value: string) {
+    setParams(executionFilters(params, { tab: value === 'overview' ? undefined : value }));
+  }
+
   return (
     <Flex vertical gap={16}>
       <Flex gap={12} align="center" wrap>
         <Tag>修订 {revision}</Tag>
         <Tag color={spec.enabled === false ? 'default' : 'success'}>{spec.enabled === false ? '已停用' : '已启用'}</Tag>
         {historical && <Link to={policyDetailsPath(id)}>查看当前修订</Link>}
-        {revision > 1 && <Link to={policyDetailsPath(id, revision - 1)}>查看上一修订</Link>}
+        {previous > 0n && <Link to={policyDetailsPath(id, previous.toString())}>查看上一修订</Link>}
         {decoded && !historical && <Link to={policyEditPath(id)}>编辑策略</Link>}
         {!decoded && !historical && readPolicyDraft(id) && <Link to={policyEditPath(id)}>查看本地草稿</Link>}
         <Button loading={downloading} onClick={exportDefinition}>导出 Rev.8 JSON</Button>
       </Flex>
       {exportError && <Alert showIcon type="error" message="导出失败" description={exportError} />}
       {!decoded && <Alert showIcon type="info" message="此策略超出向导的可编辑范围，可查看和导出完整定义。" />}
-      <Tabs items={[
+      <Tabs activeKey={tab} onChange={openTab} items={[
         {
           key: 'overview', label: '策略概览',
           children: (
@@ -86,9 +97,23 @@ function Details({ row, historical }: { row: PolicyRevision; historical: boolean
                 { key: 'root', label: '起始目录', children: spec.target.directoryScope?.root ?? '未限定目录' },
                 { key: 'excluded', label: '排除子目录', children: spec.target.directoryScope?.excludedSubtrees?.join('、') || '无' },
                 { key: 'interval', label: '周期', children: spec.trigger.interval ?? '—' },
+                ...(!historical ? [{
+                  key: 'run', label: '当前或最近运行',
+                  children: <Flex vertical gap={8} align="start">
+                    <LatestRunLink run={row.latestRun} />
+                    <Button type="link" style={{ padding: 0 }} onClick={() => openTab('history')}>查看执行历史</Button>
+                  </Flex>,
+                }] : []),
               ]} />
             </Card>
           ),
+        },
+        {
+          key: 'history', label: '执行历史',
+          children: <Flex vertical gap={12}>
+            <Link to={runHistoryPath(id)}>在执行记录中查看</Link>
+            <RunHistoryTable policyId={id} />
+          </Flex>,
         },
         {
           key: 'configuration', label: '策略配置',
@@ -105,20 +130,20 @@ function Details({ row, historical }: { row: PolicyRevision; historical: boolean
   );
 }
 
-function PolicyRevisionPage({ id, revision }: { id: number; revision?: number }) {
-  const load = useCallback((signal: AbortSignal) => getPolicy(id, signal, revision), [id, revision]);
+function PolicyRevisionPage({ id, revision }: { id: string; revision?: string }) {
+  const load = useCallback((signal: AbortSignal) => getPolicy(id, signal, revision, true), [id, revision]);
   const { state, refresh } = useInventory(load);
   const title = state.status === 'ready' ? state.data.definition.metadata.name : '策略详情';
   return (
     <InventoryPage title={title} status={state.status} error={state.status === 'error' ? state.message : undefined}
-      refresh={state.status === 'error' ? refresh : undefined}
+      refresh={refresh}
       action={<Link to="/policies">返回策略列表</Link>}>
-      {state.status === 'ready' && <Details key={state.data.revision} row={state.data} historical={revision !== undefined} />}
+      {state.status === 'ready' && <Details key={state.data.revisionExact} row={state.data} historical={revision !== undefined} />}
     </InventoryPage>
   );
 }
 
 export default function PolicyDetails() {
-  const { id, revision } = useParams();
-  return <PolicyRevisionPage key={`${id}/${revision}`} id={Number(id)} revision={revision ? Number(revision) : undefined} />;
+  const { id = '', revision } = useParams();
+  return <PolicyRevisionPage key={`${id}/${revision}`} id={id} revision={revision} />;
 }
