@@ -53,4 +53,5 @@ done
 
 docker run --interactive --rm --init --name "$SMOKE_CONTAINER" \
     --network "container:$db_id" --env LD_BIND_NOW=1 --env RBH_TEST_CONSOLE=1 \
+    --env RBH_SCHEMA_FILE=/usr/share/robinhood/schema.sql \
     --entrypoint bash "$SMOKE_IMAGE" -s < "$ROOT/tests/e2e.sh"

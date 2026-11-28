@@ -28,7 +28,7 @@ const resourceReasons: Record<string, string> = {
   read_only_mount: '挂载为只读',
   probe_failed: '采集任务失败',
   probe_timed_out: '采集超时，请刷新重试',
-  lustre_hsm_capability_required: '当前 Rev.8 策略要求注册配置开启 Lustre HSM 能力',
+  lustre_hsm_capability_required: '当前策略要求注册配置开启 Lustre HSM 能力',
   stripe_and_ost_capabilities_required: '注册配置需开启条带和 OST 能力',
   two_eligible_pools_required: '至少需要两个可用且不同的池',
   pool_has_no_osts: '池内没有 OST',

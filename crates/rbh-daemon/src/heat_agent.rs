@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     routing::post,
 };
-use rbh_policy::rev8::heat::agent::{MAX_BATCH_SIZE, SampleRequest, SampleResult, sample_mount, valid_token};
+use rbh_policy::policy::heat::agent::{MAX_BATCH_SIZE, SampleRequest, SampleResult, sample_mount, valid_token};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;

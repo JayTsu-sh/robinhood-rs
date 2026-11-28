@@ -64,7 +64,7 @@ export function writerTransportAllowed() {
 
 function policyWriteHeaders(base?: SavedRevision, token?: string) {
   if (token && !writerTransportAllowed()) {
-    throw new Error('请通过本机回环地址或 HTTPS 连接后使用 Rev.8 writer。');
+    throw new Error('请通过本机回环地址或 HTTPS 连接后提交策略写入请求。');
   }
   const headers: Record<string, string> = {};
   if (base) headers['If-Match'] = `"${base.revision}"`;

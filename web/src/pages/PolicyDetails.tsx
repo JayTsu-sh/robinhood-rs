@@ -65,7 +65,7 @@ function Details({ row, historical, refresh }: { row: PolicyRevision; historical
         {pair && !historical && <PolicyExecutionActions id={id} revision={revision} name={metadata.name}
           enabled={spec.enabled !== false} showToggle latestRun={row.latestRun} onRefresh={refresh} />}
         {!decoded && !historical && readPolicyDraft(id) && <Link to={policyEditPath(id)}>查看本地草稿</Link>}
-        <Button loading={downloading} onClick={exportDefinition}>导出 Rev.8 JSON</Button>
+        <Button loading={downloading} onClick={exportDefinition}>导出策略 JSON</Button>
       </Flex>
       {exportError && <Alert showIcon type="error" message="导出失败" description={exportError} />}
       {!decoded && <Alert showIcon type="info" message="此策略超出向导的可编辑范围，可查看和导出完整定义。" />}

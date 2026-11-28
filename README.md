@@ -4,7 +4,7 @@ A Rust rewrite of the [Robinhood Policy Engine](https://github.com/cea-hpc/robin
 for Lustre filesystems. Policies are stored in a database and managed
 via REST; an operator-facing `rbh` CLI wraps the REST surface.
 
-The daemon uses Rev.8 policies for native Lustre HSM and optional online
+The daemon uses policies for native Lustre HSM and optional online
 tiering. It maintains its catalog through scans and filesystem change
 sources.
 
@@ -36,7 +36,7 @@ sources.
                      └───────┬───────┘
                              ▼
                      ┌───────────────┐
-                     │ rbh-policy    │ durable Rev.8 runs
+                     │ rbh-policy    │ durable policy runs
                      │               │ → Lustre HSM and pool migration
                      └───────┬───────┘
                              │
@@ -63,7 +63,11 @@ catalog seeding, and API smoke checks.
 ## Quick start
 
 ```bash
-# 1. Point the daemon at MariaDB and (optionally) your Lustre MDTs.
+# 1. Initialize a new MariaDB database.
+mariadb --execute 'CREATE DATABASE rbh_entries'
+mariadb rbh_entries < crates/rbh-entry-store/schema.sql
+
+# Configure the daemon and optional Lustre changelog readers.
 export RBH_DATABASE_URL=mysql://root@127.0.0.1/rbh_entries
 export RBH_LUSTRE_MOUNT=/lustre
 export RBH_MDTS=testfs-MDT0000           # unset = no changelog listener
@@ -101,7 +105,7 @@ and reports missing parents and stale catalog paths as distinct typed errors.
 | `diff --mount`  | Walk a mount and diff `(name, size)` against the catalog |
 | `policy-list`   | List policies |
 | `policy-show <id>` | Show one policy |
-| `policy-run <id>` | Queue a Rev.8 run with `--token-file PATH` or `RBH_REV8_TOKEN_FILE`. Use `--dry-run` to preview. |
+| `policy-run <id>` | Queue a policy run with `--token-file PATH` or `RBH_POLICY_TOKEN_FILE`. Use `--dry-run` to preview. |
 | `status --filesystem ID` | `/api/entries/count?filesystem=ID` |
 | `health`        | `/api/health` |
 
@@ -122,37 +126,30 @@ and reports missing parents and stale catalog paths as distinct typed errors.
 | DELETE | `/api/removed/{object}?filesystem=ID` | Forget one typed backend object |
 | GET / POST | `/api/policies`  | CRUD |
 | GET / PUT | `/api/policies/{id}` | Read or update a policy |
-| DELETE | `/api/policies/{id}` | Stop scheduling and retire the Rev.8 policy |
+| DELETE | `/api/policies/{id}` | Stop scheduling and retire the policy |
 | POST   | `/api/policies/{id}/run` | Manual one-shot run |
-| POST   | `/api/policies/{id}/preview` | Read-only Rev.8 candidate totals |
+| POST   | `/api/policies/{id}/preview` | Read-only candidate totals |
 | POST   | `/api/scans`         | Start an async scan |
 | GET    | `/api/scans[/{id}]`  | Scan progress |
 
 The unscoped Lustre dump, restore, orphan-sweep, and classifier-run surfaces
 are retained only under `/api/compat/lustre/` as an explicit migration boundary.
 
-### Upgrading policy configuration
+### Database and policy configuration
 
-Stop the previous daemon before starting the upgraded version against its
-catalog. The upgrade retires unversioned policies and frees their names.
-Their submitted JSON remains in `policies.definition` on rows with a null
-`revision`. The new daemon pauses persisted legacy jobs before the
-scheduler starts and retains their execution history. Rev.8 policy heads,
-revisions, periodic schedules and the operation journal survive the upgrade.
-Existing requests submitted to Lustre before the upgrade remain under the
-Lustre coordinator's control.
+Initialize a new MariaDB database with [schema.sql](crates/rbh-entry-store/schema.sql).
+Compose imports it when its database volume is created. The daemon checks the
+schema version at startup. For an incompatible development database, create
+a separate empty database and point `RBH_DATABASE_URL` at it.
 
 Submit policies through REST as `hsm.storage.io/v1alpha3` documents with
-`kind: Policy`, `metadata` and `spec`. Legacy submissions return HTTP 400.
-Resubmit any policies you still need using the Rev.8 resources and action
-contracts documented below. Catalog operations and classifiers continue to
-use their existing endpoints.
+`kind: Policy`, `metadata` and `spec`. Unsupported formats return HTTP 400.
 
-### Rev.8 native Lustre HSM
+### Native Lustre HSM
 
-Set `RBH_REV8_WRITERS_FILE` to a server-side JSON map from writer principal
+Set `RBH_POLICY_WRITERS_FILE` to a server-side JSON map from writer principal
 names to the hex SHA-256 digests of their high-entropy bearer tokens. Send a
-configured token in the `Authorization: Bearer …` header for every Rev.8
+configured token in the `Authorization: Bearer …` header for every
 configuration write. Use a local connection or a TLS-terminating proxy for
 the token. The service records the principal from its configured allowlist.
 
@@ -193,13 +190,13 @@ and the total logical `estimatedBytes` before any execution budget is applied.
 regular files, the built-in preview references, and first-match archive rules
 with size comparisons or boolean conditions.
 
-To enable execution, point `RBH_REV8_HSM_PRINCIPAL_FILE` to a JSON file supplied
+To enable execution, point `RBH_HSM_PRINCIPAL_FILE` to a JSON file supplied
 by the daemon deployment, for example
 `{"serviceAccount":"hsm-controller","roles":["storage-operator"]}`. The
 daemon uses this identity for both scheduled and manual native submissions.
 The API writer identity is recorded separately. The built-in submit path
 requires MariaDB `innodb_flush_log_at_trx_commit=1` and a durable database
-volume. Deploy the daemon as the trusted actuator. Rev.8's separate deployment
+volume. Deploy the daemon as the trusted actuator. Separate deployment
 attestation and cross-node permit log verification are outside this execution
 path.
 
@@ -231,7 +228,7 @@ Use the profile and policy admission windows to restrict submission times.
 - `POST /api/policies/{id}/breaker/reset` resets the policy circuit breaker
   with an authenticated writer. Outstanding operation limits remain in force.
 
-### Rev.8 execution history
+### Policy execution history
 
 - `GET /api/runs` lists runs newest first. Filters include `policyId`,
   `policyName` (a substring of the name saved with the run), `runId`, and
@@ -268,12 +265,12 @@ Use the profile and policy admission windows to restrict submission times.
   to include the dispatching run, the latest queued run, or the latest run
   in that order of preference.
 
-### Rev.8 policy resources
+### Policy resources
 
 Manage `Selector`, `ExecutionProfile`, `AuthorizationPolicy`, `ApprovalPolicy`
 and `SystemSafetyPolicy` at `/api/selectors`, `/api/execution-profiles`,
 `/api/authorization-policies`, `/api/approval-policies` and
-`/api/system-safety-policies`. Submit a Rev.8 document with `POST` on the
+`/api/system-safety-policies`. Submit a resource document with `POST` on the
 collection and use `GET`, `PUT` or `DELETE` at the resource name. The controls
 registered by the server are available at `GET /api/action-contracts` and
 `GET /api/action-contracts/{name}`.
@@ -290,14 +287,14 @@ return the bindings in `resourceBindings`. Read the pinned definitions at
 policy binding at `GET /api/policies/{id}/revisions/{revision}`. References
 from enabled policies and from other selectors block resource deletion.
 
-### Rev.8 Lustre pool migration
+### Lustre pool migration
 
 Register the Lustre mount with HSM, stripe and OST capabilities. A pool
 migration policy has a periodic trigger and one pool pair on that filesystem.
 The action contract is available at `GET /api/action-contracts/lustre.pool_migrate`.
 When using the packaged systemd unit, allow writes to the executor mount.
 [Configure the service drop-in](packaging/README.md#enable-pool-migration-under-systemd).
-For example, use these fields in a Rev.8 policy:
+For example, use these fields in a policy:
 
 ```json
 {
@@ -336,7 +333,7 @@ Execution rechecks the source placement and HSM state. Classifier tags come
 from the catalog and are rechecked on the locked candidate row along with its
 indexed file generation. Optional `stripeCount`
 and `stripeSize` override the source stripe geometry. Set `minResidence`
-to a positive Rev.8 duration such as `24h` to require time in the source
+to a positive duration such as `24h` to require time in the source
 pool. The catalog starts the clock on its first verified observation of
 the pool or a change of pool, and retains it across rescans and restarts.
 For existing observed layouts, the upgrade starts the clock at upgrade time.
@@ -351,7 +348,7 @@ A completed operation includes the actual pool and OSTs from a fresh open by
 FID. If the catalog write fails, the pending operation retains the slot and
 the restarted daemon reconciles the live layout before any new migration.
 
-### Rev.8 Lustre read heat
+### Lustre read heat
 
 Add a `read_heat` block to a Lustre filesystem in `RBH_FILESYSTEMS_JSON`.
 A sampler starts for that filesystem when an enabled pool-migration
@@ -396,7 +393,7 @@ request and runs without a database connection. The sampling process needs
 for local business mounts too when the controller runs as the unprivileged
 packaged service.
 
-Submit a separate periodic policy through the Rev.8 policy API for warming.
+Submit a separate periodic policy through the policy API for warming.
 For example, set this execute rule and use the execution and governance
 resources for `lustre.pool_migrate` described above.
 
@@ -511,7 +508,7 @@ lookups, and actions use filesystem-scoped native identities.
 See [`packaging/grafana/robinhood-rs.json`](packaging/grafana/robinhood-rs.json)
 for a ready-to-import dashboard.
 
-Query Rev.8 policy runs and file-level actions through the REST history
+Query policy runs and file-level actions through the REST history
 endpoints.
 
 ## Development

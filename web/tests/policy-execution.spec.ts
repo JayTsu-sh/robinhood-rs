@@ -97,7 +97,7 @@ test('an operator creates a scoped policy in the console and downloads real Lust
     const dialog = page.getByRole('dialog', { name: actionName });
     const submit = dialog.getByRole('button', { name: actionName });
     await submit.click();
-    await dialog.getByLabel('Rev.8 writer token').fill(token!);
+    await dialog.getByLabel('策略写入令牌').fill(token!);
     await submit.click();
   }
 
@@ -145,8 +145,8 @@ test('an operator creates a scoped policy in the console and downloads real Lust
   await expect(preview.locator('.ant-statistic-content').first()).toHaveText('2');
   expect((await (await request.get('/api/runs')).json()).items).toEqual([]);
   await page.getByRole('button', { name: '保存策略' }).click();
-  const save = page.getByRole('dialog', { name: 'Rev.8 writer 凭据' });
-  await save.getByLabel('Rev.8 writer token').fill(token!);
+  const save = page.getByRole('dialog', { name: '策略写入凭据' });
+  await save.getByLabel('策略写入令牌').fill(token!);
   await save.getByRole('button', { name: '提交保存' }).click();
   await expect(page).toHaveURL(/#\/policies\/\d+$/);
   const policy = page.url().split('/').at(-1)!;

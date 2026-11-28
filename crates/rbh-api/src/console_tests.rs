@@ -6,7 +6,7 @@ use rbh_entry_store::{BackendCapabilities, BackendKind, FileSystemConfig, FileSy
 use rbh_lustre_resources::ResourceObservations;
 use serde_json::{Value, json};
 
-use crate::{Rev8Writers, handlers::scoped_api_tests::state_without_database_connection};
+use crate::{PolicyWriters, handlers::scoped_api_tests::state_without_database_connection};
 
 #[tokio::test]
 async fn daemon_serves_the_console_and_assets_beside_the_api() {
@@ -21,7 +21,7 @@ async fn daemon_serves_the_console_and_assets_beside_the_api() {
     let resources = ResourceObservations::new(state.entry_store.pool().clone(), "test".to_owned(), Vec::new());
     let server = TestServer::new(crate::router_with_console(
         state,
-        Rev8Writers::default(),
+        PolicyWriters::default(),
         resources,
         assets.path().to_owned(),
     ))
@@ -64,7 +64,7 @@ async fn resource_inventory_reads_saved_snapshots_and_refreshes_only_the_selecte
     let resources = ResourceObservations::new(store.pool().clone(), "observer-a".to_owned(), configs);
     let server = TestServer::new(crate::router_with_console(
         state_without_database_connection(),
-        Rev8Writers::default(),
+        PolicyWriters::default(),
         resources,
         temp.path().to_owned(),
     ))

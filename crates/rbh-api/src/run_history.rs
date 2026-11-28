@@ -97,7 +97,7 @@ async fn list_runs(
         before_id: query.before_id,
         limit: page_limit(query.limit)?,
     };
-    Ok(Json(state.policy_store.search_rev8_runs(filter).await?))
+    Ok(Json(state.policy_store.search_policy_runs(filter).await?))
 }
 
 #[tracing::instrument(skip(state))]
@@ -105,7 +105,7 @@ async fn get_run(State(state): State<AppState>, Path(id): Path<u64>) -> Result<J
     Ok(Json(
         state
             .policy_store
-            .rev8_run_detail(id)
+            .get_policy_run(id)
             .await?
             .ok_or_else(|| run_not_found(id))?,
     ))
@@ -123,7 +123,7 @@ async fn list_operations(
     Ok(Json(
         state
             .policy_store
-            .search_rev8_operations(id, filter)
+            .search_run_operations(id, filter)
             .await?
             .ok_or_else(|| run_not_found(id))?,
     ))
@@ -136,7 +136,7 @@ async fn summarize_operations(
     Ok(Json(
         state
             .policy_store
-            .summarize_rev8_operations(id, query.filter()?)
+            .summarize_run_operations(id, query.filter()?)
             .await?
             .ok_or_else(|| run_not_found(id))?,
     ))
@@ -177,7 +177,7 @@ async fn export_report(
         .try_acquire()
         .map_err(|_| ApiError::ServiceUnavailable("report generation is busy, retry shortly".into()))?;
     let deadline = Instant::now() + REPORT_GENERATION_TIMEOUT;
-    let (snapshot, mut operations) = timeout_at(deadline, state.policy_store.open_rev8_run_report(id, filter.clone()))
+    let (snapshot, mut operations) = timeout_at(deadline, state.policy_store.open_run_report(id, filter.clone()))
         .await
         .map_err(|_| ApiError::ServiceUnavailable("report generation timed out".into()))??
         .ok_or_else(|| run_not_found(id))?;

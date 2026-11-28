@@ -72,22 +72,14 @@ async fn juicefs_purge_uses_native_inode_namespace_and_persists_removal() {
     if !enabled() {
         return;
     }
-    let admin = sqlx::MySqlPool::connect("mysql://root@127.0.0.1/mysql").await.unwrap();
-    sqlx::query("DROP DATABASE IF EXISTS rbh_actions_test")
-        .execute(&admin)
-        .await
-        .unwrap();
-    sqlx::query("CREATE DATABASE rbh_actions_test")
-        .execute(&admin)
-        .await
-        .unwrap();
-    let store = EntryStore::connect(DB).await.unwrap();
+    let database = std::env::var("RBH_TEST_DATABASE_URL").unwrap_or_else(|_| DB.to_owned());
+    let store = EntryStore::connect(&database).await.expect("initialized test database");
     let temp = tempfile::tempdir().unwrap();
     let mount = temp.path().join("jfs");
     fs::create_dir(&mount).unwrap();
     let path = mount.join("victim");
     fs::write(&path, b"purge me").unwrap();
-    let filesystem = FileSystemId::new("juice-purge").unwrap();
+    let filesystem = FileSystemId::new(format!("juice-purge-{}", uuid::Uuid::new_v4().simple())).unwrap();
     store
         .register_filesystem(&FileSystemConfig {
             id: filesystem.clone(),

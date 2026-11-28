@@ -11,7 +11,7 @@ pub struct FileSystemRuntime {
     pub config: FileSystemConfig,
     pub changelog_agent: Option<JuiceFsAgentConfig>,
     pub lustre_changelog: Vec<LustreChangelogConfig>,
-    pub read_heat: Option<rbh_policy::rev8::heat::ReadHeatConfig>,
+    pub read_heat: Option<rbh_policy::policy::heat::ReadHeatConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -34,7 +34,7 @@ struct RuntimeInput {
     changelog_agent: Option<JuiceFsAgentConfig>,
     #[serde(default)]
     lustre_changelog: Vec<LustreChangelogConfig>,
-    read_heat: Option<rbh_policy::rev8::heat::ReadHeatConfig>,
+    read_heat: Option<rbh_policy::policy::heat::ReadHeatConfig>,
 }
 
 impl FileSystemRuntime {

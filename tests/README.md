@@ -2,17 +2,16 @@
 
 Two tiers of end-to-end coverage. Per-crate integration tests are under
 `crates/<crate>/tests/integration.rs`; this directory holds the
-top-level scripts that exercise the deployed binaries. See the
-[Rev.8 cutover acceptance report](../docs/REV8-CUTOVER-ACCEPTANCE.md)
-for the REST and live Lustre deployment checks.
+top-level scripts that exercise the deployed binaries.
 
 ## `e2e.sh` — no Lustre required
 
 Run against a disposable MariaDB reachable at `127.0.0.1:3306` as root
 without a password. The script creates a fresh schema, seeds the `lustre`
 catalog scope via SQL, and checks REST, `rbh find`, `rbh report`,
-`rbh undelete`, Rev.8 format rejection, metrics, graceful shutdown, and
-nonzero exit when the scheduler loses access to its table.
+`rbh undelete`, unsupported policy format rejection, metrics, and graceful
+shutdown. It also checks uninitialized startup rejection, catalog persistence
+across a restart, and nonzero exit on run queue failure.
 
 ```sh
 cargo build --locked --release -p robinhood-rs -p rbh-cli
@@ -62,8 +61,20 @@ stage of the pipeline broke.
 
 ## Per-crate integration tests
 
-Opt-in via `RBH_INTEGRATION=1`; all require a local MariaDB reachable
-as root:
+Enable these tests with `RBH_INTEGRATION=1`. The entry-store suite defaults
+to a disposable database named `rbh_entries_test` on local MariaDB. It imports
+the baseline and recreates its test tables before each case. For another test
+server, set `RBH_ENTRY_STORE_TEST_DATABASE_URL` to a dedicated `rbh_entries_test` database.
+
+Other MariaDB-backed suites use databases provisioned before running the tests.
+For the REST examples below, initialize each disposable database referenced by
+`RBH_TEST_DATABASE_URL` with [schema.sql](../crates/rbh-entry-store/schema.sql).
+For example:
+
+```sh
+mariadb --execute 'CREATE DATABASE rbh_preview_test'
+mariadb rbh_preview_test < crates/rbh-entry-store/schema.sql
+```
 
 ```sh
 RBH_INTEGRATION=1 cargo test -p rbh-entry-store --test integration -- --test-threads=1
@@ -72,7 +83,7 @@ RBH_INTEGRATION=1 RBH_TEST_CHANGELOG_USER=cl3 \
 RBH_INTEGRATION=1 cargo test -p lustre-api --test integration -- --test-threads=1
 ```
 
-### Rev.8 directory scope preview
+### Directory scope preview
 
 Run the REST scenario with a fresh MariaDB database and a Lustre
 mount with non-empty `hot` and `cold` pools. The scenario seeds indexed
@@ -84,14 +95,13 @@ RBH_TEST_DATABASE_URL=mysql://root@127.0.0.1/rbh_preview_test \
   cargo test --locked -p rbh-api scoped_draft_preview_evaluates_all_links_without_creating_a_policy_or_run -- --ignored
 ```
 
-The draft endpoint is `POST /api/policies/preview` and accepts a Rev.8 Policy
-pool migration document. `spec.target.directoryScope` accepts a root
+The draft endpoint is `POST /api/policies/preview` and accepts a pool migration policy document. `spec.target.directoryScope` accepts a root
 path such as `/team` and optional `excludedSubtrees` such as
 `["/team/archive"]`. Paths are relative to the registered Lustre root and
 begin with `/`. The response returns a null policy revision, the resolved
 resource revisions, and FID counts and logical bytes. The scoped result
 also includes the exact decimal text as `estimatedBytesExact`. Directory reason
-counts cover objects that match the indexed pool and Rev.8 rules or are
+counts cover objects that match the indexed pool and policy rules or are
 pending a heat observation. The candidate estimate covers the catalog's
 indexed files before execution budgets and live admission checks. Saved
 policies use `POST /api/policies/{id}/preview` with their pinned resource
@@ -122,7 +132,7 @@ live, isolated daemon with a disposable database. Register a Lustre fixture
 root with writable `hot` and `cold` pools. Index three files on `hot` under
 `/team` with logical sizes of 100, 200, and 300 bytes and mtimes at least one
 second in the past. Link the 300-byte file outside `/team`. Configure an
-existing Rev.8 writer with `RBH_REV8_WRITERS_FILE` and provide its fixture
+existing policy writer with `RBH_POLICY_WRITERS_FILE` and provide its fixture
 token and registration ID to Playwright as `RBH_CONSOLE_WIZARD_TEST_TOKEN`
 and `RBH_CONSOLE_WIZARD_TEST_FS`. Set `RBH_CONSOLE_TEST_URL` to the test
 daemon and run `npm --prefix web run test:e2e`.
@@ -140,7 +150,7 @@ RBH_TEST_LUSTRE_MOUNT=/mnt/lustre \
 
 For the bundled console test, register the full Lustre mount with HSM,
 stripe and OST capabilities in a daemon with a disposable database. Set
-`RBH_REV8_HSM_PRINCIPAL_FILE` to a workload identity with service account
+`RBH_HSM_PRINCIPAL_FILE` to a workload identity with service account
 `tiering-daemon` and configure a test writer. Give Playwright a new empty
 test directory beneath the mount in `RBH_CONSOLE_EXECUTION_TEST_ROOT`,
 the mount in `RBH_CONSOLE_EXECUTION_TEST_MOUNT`, the registration ID in
@@ -176,4 +186,4 @@ encode the SETTLE budget and fail loudly.
 
 For narrower coverage of one crate: add a `#[tokio::test]` function to
 the relevant `crates/<crate>/tests/integration.rs`. The reset-per-test
-pattern (drop tables, let migrations recreate) keeps tests isolated.
+fixture imports the same schema as Compose into its disposable database.

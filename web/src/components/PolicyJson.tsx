@@ -10,9 +10,9 @@ export default function PolicyJson({ id, revision }: { id: string; revision: str
     return <Alert showIcon type="error" message="读取定义失败" description={state.message}
       action={<Button onClick={refresh}>重试</Button>} />;
   }
-  if (state.status === 'loading') return <Typography.Text role="status">正在读取 Rev.8 原文</Typography.Text>;
+  if (state.status === 'loading') return <Typography.Text role="status">正在读取 策略原文</Typography.Text>;
   return (
-    <Card size="small" title="Rev.8 原文">
+    <Card size="small" title="策略原文">
       <pre className="console-mono" style={{ maxHeight: 500, overflow: 'auto', whiteSpace: 'pre-wrap', margin: 0 }}>
         {state.data}
       </pre>

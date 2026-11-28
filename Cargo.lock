@@ -2716,7 +2716,6 @@ dependencies = [
  "cron",
  "serde",
  "serde_json",
- "sqlx",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -2964,7 +2963,6 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -3045,7 +3043,6 @@ dependencies = [
  "stringprep",
  "thiserror",
  "tracing",
- "uuid",
  "whoami",
 ]
 
@@ -3084,7 +3081,6 @@ dependencies = [
  "stringprep",
  "thiserror",
  "tracing",
- "uuid",
  "whoami",
 ]
 
@@ -3111,7 +3107,6 @@ dependencies = [
  "thiserror",
  "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]

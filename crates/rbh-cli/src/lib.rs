@@ -41,13 +41,13 @@ pub enum Command {
         id: u64,
     },
 
-    /// Queue a manual run of the saved Rev.8 policy.
+    /// Queue a manual run of the saved policy.
     #[command(name = "policy-run")]
     PolicyRun {
         /// Policy ID.
         id: u64,
-        /// File containing an authenticated Rev.8 writer's bearer token.
-        #[arg(long, env = "RBH_REV8_TOKEN_FILE", required_unless_present = "dry_run")]
+        /// File containing an authenticated policy writer's bearer token.
+        #[arg(long, env = "RBH_POLICY_TOKEN_FILE", required_unless_present = "dry_run")]
         token_file: Option<std::path::PathBuf>,
         /// Evaluate candidates immediately without submitting actions.
         #[arg(long)]
@@ -286,7 +286,7 @@ pub async fn run() -> Result<()> {
                 let token = tokio::fs::read_to_string(&path).await.map_err(|error| {
                     std::io::Error::new(
                         error.kind(),
-                        format!("read Rev.8 writer token file {}: {error}", path.display()),
+                        format!("read policy writer token file {}: {error}", path.display()),
                     )
                 })?;
                 request = request.bearer_auth(token.trim());

@@ -1,8 +1,8 @@
 //! Integration tests for `rbh-entry-store` against local MariaDB.
 //!
-//! Requires `RBH_INTEGRATION=1` and MariaDB on localhost accessible as root
-//! with no password. Uses the `rbh_entries_test` database (dropped and
-//! recreated per test run).
+//! Requires `RBH_INTEGRATION=1` and an empty, disposable MariaDB database.
+//! Defaults to local `rbh_entries_test` as root. The fixture recreates
+//! Robinhood tables before each test. Run serially against a dedicated database.
 //!
 //! ```sh
 //! RBH_INTEGRATION=1 cargo test -p rbh-entry-store --test integration -- --test-threads=1 --nocapture
@@ -11,24 +11,117 @@
 use bytes::Bytes;
 use lustre_api::LuFid;
 use lustre_changelog::CursorStore;
+use rbh_entry_store::error::StoreError;
 use rbh_entry_store::model::{
     BackendCapabilities, BackendKind, BaselineState, EntryKey, EntryKind, EntryRow, FileSystemConfig, FileSystemId,
     ObjectId, ScopedEntryRow, ScopedNamespaceEdge,
 };
 use rbh_entry_store::store::{EntryStore, MariaDbCursorStore};
-use sqlx::MySql;
-use sqlx::mysql::MySqlPoolOptions;
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+use sqlx::{MySql, Pool};
 
+const TEST_DB_NAME: &str = "rbh_entries_test";
 const TEST_DB_URL: &str = "mysql://root@localhost/rbh_entries_test";
 
 fn integration_enabled() -> bool {
     matches!(std::env::var("RBH_INTEGRATION"), Ok(v) if !v.is_empty() && v != "0")
 }
 
-/// Reset the test database: drop all tables, let migrations recreate them.
-async fn reset_db(pool: &sqlx::Pool<MySql>) {
-    // Drop tables in reverse dependency order (policies has no FK deps).
-    for table in &[
+fn test_db_url() -> String {
+    let url = std::env::var("RBH_ENTRY_STORE_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_owned());
+    let options = url.parse::<MySqlConnectOptions>().expect("test database URL");
+    assert_eq!(
+        options.get_database(),
+        Some(TEST_DB_NAME),
+        "the resettable fixture must use the dedicated {TEST_DB_NAME} database"
+    );
+    url
+}
+
+#[tokio::test]
+async fn connection_requires_a_completed_current_schema() {
+    if !integration_enabled() {
+        return;
+    }
+    let url = test_db_url();
+    let pool = MySqlPoolOptions::new().connect(&url).await.expect("test DB");
+    clear_schema(&pool).await;
+
+    // An uninitialized database and a catalog from the old layout both lack a completion marker.
+    assert!(matches!(
+        EntryStore::connect(&url).await,
+        Err(StoreError::SchemaMissing)
+    ));
+    sqlx::query("CREATE TABLE policies (id BIGINT UNSIGNED PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        EntryStore::connect(&url).await,
+        Err(StoreError::SchemaMissing)
+    ));
+
+    sqlx::query("CREATE TABLE rbh_schema (id TINYINT UNSIGNED PRIMARY KEY, version INT UNSIGNED NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        EntryStore::connect(&url).await,
+        Err(StoreError::SchemaMissing)
+    ));
+    sqlx::query("INSERT INTO rbh_schema (id, version) VALUES (1, 999)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        EntryStore::connect(&url).await,
+        Err(StoreError::SchemaVersion {
+            actual: 999,
+            expected: 1
+        })
+    ));
+
+    clear_schema(&pool).await;
+    sqlx::raw_sql(include_str!("../schema.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    EntryStore::connect(&url).await.expect("completed schema");
+
+    sqlx::query("DELETE FROM policy_worker_lock WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        EntryStore::connect(&url).await,
+        Err(StoreError::SchemaLockMissing("policy_worker_lock"))
+    ));
+
+    sqlx::query("DROP TABLE policy_operations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        EntryStore::connect(&url).await,
+        Err(StoreError::SchemaTableMissing("policy_operations"))
+    ));
+}
+
+/// Only called against the explicitly enabled disposable test database.
+async fn clear_schema(pool: &Pool<MySql>) {
+    for table in [
+        "rbh_schema",
+        "policy_operations",
+        "policy_runs",
+        "policy_breakers",
+        "policy_worker_lock",
+        "policy_resource_revisions",
+        "policy_resource_heads",
+        "policy_configuration_lock",
+        "policy_revisions",
+        "policies",
+        "lustre_read_heat",
+        "filesystem_resource_snapshots",
         "filesystem_baselines",
         "scoped_removed_entries",
         "scoped_stripe_items",
@@ -40,77 +133,24 @@ async fn reset_db(pool: &sqlx::Pool<MySql>) {
         "removed_entries",
         "changelog_cursor",
         "entries",
-        "policies",
         "classifiers",
-        "_sqlx_migrations",
     ] {
-        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
             .execute(pool)
-            .await;
+            .await
+            .expect("clear test table");
     }
 }
 
-#[tokio::test]
-async fn scope_catalog_migration_is_retry_safe() {
-    if !integration_enabled() {
-        return;
-    }
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
+async fn test_store() -> EntryStore {
+    let url = test_db_url();
+    let pool = MySqlPoolOptions::new().connect(&url).await.expect("test DB");
+    clear_schema(&pool).await;
+    sqlx::raw_sql(include_str!("../schema.sql"))
+        .execute(&pool)
         .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
-    let migration = include_str!("../migrations/008_scope_catalog_consumers.sql");
-    sqlx::raw_sql(migration)
-        .execute(store.pool())
-        .await
-        .expect("first retry");
-    sqlx::raw_sql(migration)
-        .execute(store.pool())
-        .await
-        .expect("second retry");
-}
-
-#[tokio::test]
-async fn policy_filesystem_migration_backfills_legacy_rows_and_is_retry_safe() {
-    if !integration_enabled() {
-        return;
-    }
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
-    sqlx::query("INSERT INTO policies (name, kind, definition, enabled) VALUES (?, ?, ?, TRUE)")
-        .bind("legacy-policy")
-        .bind("alert")
-        .bind(r#"{"name":"legacy-policy","kind":"alert","trigger":"1h"}"#)
-        .execute(store.pool())
-        .await
-        .expect("insert legacy policy");
-
-    let migration = include_str!("../migrations/009_scope_policies.sql");
-    sqlx::raw_sql(migration)
-        .execute(store.pool())
-        .await
-        .expect("first retry");
-    sqlx::raw_sql(migration)
-        .execute(store.pool())
-        .await
-        .expect("second retry");
-
-    let filesystem: Option<String> = sqlx::query_scalar(
-        "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(definition, '$.filesystem')) AS CHAR) FROM policies WHERE name = ?",
-    )
-    .bind("legacy-policy")
-    .fetch_one(store.pool())
-    .await
-    .expect("read migrated policy");
-    assert_eq!(filesystem.as_deref(), Some("__legacy_lustre__"));
+        .expect("install schema");
+    EntryStore::connect(&url).await.expect("store connect")
 }
 
 #[tokio::test]
@@ -119,13 +159,7 @@ async fn juicefs_baseline_state_and_hardlink_edges_are_durable_and_idempotent() 
         eprintln!("skipping (set RBH_INTEGRATION=1)");
         return;
     }
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
     let filesystem = FileSystemId::new("juice-baseline").unwrap();
     store
         .register_filesystem(&FileSystemConfig {
@@ -174,13 +208,7 @@ async fn scoped_identities_isolate_the_same_native_object_id() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
 
     let first_id = FileSystemId::new("juicefs-a").unwrap();
     let second_id = FileSystemId::new("juicefs-b").unwrap();
@@ -246,7 +274,7 @@ async fn scoped_identities_isolate_the_same_native_object_id() {
     assert_eq!(config.backend, BackendKind::JuiceFs);
     assert!(config.capabilities.changelog);
 
-    // The expand migration must leave the legacy Lustre catalog path usable.
+    // The separate Lustre compatibility catalog remains usable.
     let legacy = make_entry(0x200000401, 0x42, "legacy-lustre.txt");
     store
         .legacy_lustre_upsert_entry(&legacy)
@@ -265,13 +293,7 @@ async fn scoped_queries_and_removed_entries_isolate_the_same_native_object_id() 
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
     let first_id = FileSystemId::new("query-a").unwrap();
     let second_id = FileSystemId::new("query-b").unwrap();
     for id in [&first_id, &second_id] {
@@ -423,13 +445,7 @@ async fn lustre_scan_batch_populates_filesystem_scoped_baseline() {
         eprintln!("skipping (set RBH_INTEGRATION=1)");
         return;
     }
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
     let filesystem = FileSystemId::new("lustre-archive").unwrap();
     store
         .register_filesystem(&FileSystemConfig {
@@ -459,13 +475,7 @@ async fn lustre_writes_keep_identical_fids_scoped_without_legacy_side_effects() 
     if !integration_enabled() {
         return;
     }
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.unwrap();
+    let store = test_store().await;
     let first_id = FileSystemId::new("lustre-a").unwrap();
     let second_id = FileSystemId::new("lustre-b").unwrap();
     for id in [&first_id, &second_id] {
@@ -659,13 +669,7 @@ async fn upsert_and_get_roundtrip() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
 
     let entry = make_entry(0x200000401, 0x42, "test_file.txt");
     store.legacy_lustre_upsert_entry(&entry).await.expect("upsert");
@@ -691,13 +695,7 @@ async fn upsert_batch_and_count() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
 
     let entries: Vec<EntryRow> = (0..100u32)
         .map(|i| make_entry(0x200000401, i + 100, &format!("batch_{i}.dat")))
@@ -719,13 +717,7 @@ async fn remove_entry_moves_to_removed_entries() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
 
     let entry = make_entry(0x200000401, 0x99, "doomed.txt");
     store.legacy_lustre_upsert_entry(&entry).await.expect("upsert");
@@ -760,13 +752,7 @@ async fn rename_entry_atomically_replaces_destination() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
     let parent = LuFid::new(0x200000401, 1, 0);
     let mut source = make_entry(0x200000401, 2, "source");
     source.parent_fid = Some(parent);
@@ -799,36 +785,11 @@ async fn cursor_store_mariadb_roundtrip() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    // Run migrations so the changelog_cursor table exists.
-    let _store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
-
-    // The migration is retry-safe, including after its DDL has fully applied.
-    let migration = include_str!("../migrations/010_scope_changelog_cursor.sql");
-    sqlx::raw_sql(migration).execute(&pool).await.expect("first retry");
-    sqlx::raw_sql(migration).execute(&pool).await.expect("second retry");
-
-    sqlx::query(
-        "INSERT INTO changelog_cursor (filesystem_id, mdt_name, last_rec, updated_at) VALUES ('__legacy_lustre__', 'legacy-MDT0000', 88, 1)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    _store
-        .bind_legacy_lustre_cursors(&FileSystemId::new("lustre-a").unwrap())
-        .await
-        .unwrap();
-
+    let store = test_store().await;
     let first_filesystem = FileSystemId::new("lustre-a").unwrap();
     let second_filesystem = FileSystemId::new("lustre-b").unwrap();
-    let cursor = MariaDbCursorStore::new(pool.clone(), first_filesystem);
-    let second_cursor = MariaDbCursorStore::new(pool, second_filesystem);
-    assert_eq!(cursor.get("legacy-MDT0000").await.unwrap(), Some(88));
+    let cursor = MariaDbCursorStore::new(store.pool().clone(), first_filesystem);
+    let second_cursor = MariaDbCursorStore::new(store.pool().clone(), second_filesystem);
 
     // Initially empty.
     assert_eq!(cursor.get("testfs-MDT0000").await.unwrap(), None);
@@ -862,13 +823,7 @@ async fn upsert_is_idempotent() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
 
     let mut entry = make_entry(0x200000401, 0x55, "idempotent.txt");
     store.legacy_lustre_upsert_entry(&entry).await.expect("first upsert");
@@ -894,13 +849,7 @@ async fn sweep_orphans_moves_stale_files() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
 
     let fresh_ts = 1_900_000_000; // very future
     let stale_ts = 1_700_000_000; // well before fresh
@@ -963,13 +912,7 @@ async fn subtree_totals_walks_parent_edge() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
 
     // Build a tiny tree:
     //   root (dir)
@@ -1034,13 +977,7 @@ async fn depth_field_roundtrips() {
         return;
     }
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(TEST_DB_URL)
-        .await
-        .expect("connect");
-    reset_db(&pool).await;
-    let store = EntryStore::connect(TEST_DB_URL).await.expect("store connect");
+    let store = test_store().await;
 
     let mut entry = make_entry(0x200000501, 0x01, "deep_file.txt");
     entry.depth = 7;

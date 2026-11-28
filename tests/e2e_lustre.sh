@@ -4,9 +4,9 @@
 # Scope — what this covers that `tests/e2e.sh` does not:
 #   1. Changelog ingest: create / rename / unlink events round-trip
 #      Lustre → listener → DB.
-#   2. Initial `rbh scan` populates the catalog; orphan sweep trims stale rows.
+#   2. An explicit scan populates the catalog. Compatibility sweep trims stale rows.
 #   3. Catalog dump/restore round-trip preserves entries.
-#   4. Legacy policy rejection. See the Rev.8 acceptance report for native runs.
+#   4. Unsupported policy format rejection.
 #
 # Not covered (would need lhsmtool_cmd running):
 #   * HSM archive / release state transitions
@@ -24,7 +24,8 @@
 #   RBH_CHANGELOG_USER     — required; e.g. cl7
 #   RBH_MDTS               — optional comma list; defaults to testfs-MDT0000
 #   RBH_E2E_PORT           — HTTP port (default 8089)
-#   RBH_E2E_DB             — DB name (default rbh_e2e_lustre)
+#   RBH_E2E_DB_PORT        — local MariaDB TCP port (default 3306)
+#   RBH_E2E_DB             — DB name (default rbh_e2e_lustre_<pid>)
 #   RBH_E2E_CHANGELOG_SETTLE — seconds to wait for an event to reach the DB
 #                             after an fs mutation (default 6)
 #   RBH_E2E_KEEP_DB=1      — don't drop the DB on exit (debugging)
@@ -36,7 +37,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT=${RBH_E2E_PORT:-8089}
-DB=${RBH_E2E_DB:-rbh_e2e_lustre}
+DB_PORT=${RBH_E2E_DB_PORT:-3306}
+DB=${RBH_E2E_DB:-rbh_e2e_lustre_${BASHPID}}
+FILESYSTEM=lustre
 API="http://127.0.0.1:$PORT"
 LOG="/tmp/rbh-e2e-lustre.log"
 BIN_DAEMON="$ROOT/target/release/robinhood"
@@ -48,6 +51,11 @@ SETTLE=${RBH_E2E_CHANGELOG_SETTLE:-6}
 
 PID=""
 TEST_DIR=""
+DB_CREATED=0
+
+test_sql() {
+    mysql --no-defaults --host=127.0.0.1 --port="$DB_PORT" --user=root --skip-password "$@"
+}
 
 cleanup() {
     if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
@@ -62,8 +70,8 @@ cleanup() {
     if [[ -n "$TEST_DIR" && -d "$TEST_DIR" ]]; then
         rm -rf "$TEST_DIR" || true
     fi
-    if [[ "${RBH_E2E_KEEP_DB:-0}" != "1" ]]; then
-        mysql -u root -e "DROP DATABASE IF EXISTS $DB;" 2>/dev/null || true
+    if [[ "$DB_CREATED" == 1 && "${RBH_E2E_KEEP_DB:-0}" != "1" ]]; then
+        test_sql -e "DROP DATABASE IF EXISTS $DB;" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -86,11 +94,11 @@ assert_contains() {
 # Wait up to $SETTLE seconds for the DB row to satisfy a predicate.
 # Usage: wait_for_entry <sql predicate>
 wait_for_entry() {
-    local sql="SELECT COUNT(*) FROM entries WHERE $1"
+    local sql="SELECT COUNT(*) FROM scoped_entries WHERE filesystem_id = '$FILESYSTEM' AND ($1)"
     local deadline=$((SECONDS + SETTLE))
     while [[ $SECONDS -lt $deadline ]]; do
         local n
-        n=$(mysql -u root -N -B "$DB" -e "$sql" 2>/dev/null || echo 0)
+        n=$(test_sql -N -B "$DB" -e "$sql" 2>/dev/null || echo 0)
         if [[ "$n" -gt 0 ]]; then
             return 0
         fi
@@ -100,11 +108,11 @@ wait_for_entry() {
 }
 
 wait_for_absence() {
-    local sql="SELECT COUNT(*) FROM entries WHERE $1"
+    local sql="SELECT COUNT(*) FROM scoped_entries WHERE filesystem_id = '$FILESYSTEM' AND ($1)"
     local deadline=$((SECONDS + SETTLE))
     while [[ $SECONDS -lt $deadline ]]; do
         local n
-        n=$(mysql -u root -N -B "$DB" -e "$sql" 2>/dev/null || echo 1)
+        n=$(test_sql -N -B "$DB" -e "$sql" 2>/dev/null || echo 1)
         if [[ "$n" == 0 ]]; then
             return 0
         fi
@@ -119,18 +127,23 @@ wait_for_absence() {
 command -v mysql >/dev/null 2>&1 || die "mysql CLI not found on PATH"
 [[ -d "$MOUNT" ]] || die "Lustre mount $MOUNT does not exist"
 [[ -n "${RBH_CHANGELOG_USER:-}" ]] || die "RBH_CHANGELOG_USER not set (e.g. cl7)"
+[[ "$DB" =~ ^[a-zA-Z_][a-zA-Z0-9_]{0,63}$ ]] || die "invalid test database name: $DB"
+[[ "$DB_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( DB_PORT <= 65535 )) || die "invalid test database port: $DB_PORT"
 
 TEST_DIR=$(mktemp -d "$MOUNT/rbh-e2e-XXXXXX") || die "cannot mktemp under $MOUNT"
 note "workspace: $TEST_DIR"
 
 # ---- 1. fresh DB ----
 note "creating fresh DB $DB"
-mysql -u root -e "DROP DATABASE IF EXISTS $DB; CREATE DATABASE $DB;" \
-    || die "cannot create DB $DB"
+test_sql -e "CREATE DATABASE $DB;" || die "cannot create disposable DB $DB"
+DB_CREATED=1
+test_sql "$DB" < "$ROOT/crates/rbh-entry-store/schema.sql" || die "cannot initialize DB $DB"
 
 # ---- 2. launch daemon with changelog enabled ----
 note "launching daemon on :$PORT (mount=$MOUNT, mdts=$MDTS, user=$RBH_CHANGELOG_USER)"
-RBH_DATABASE_URL="mysql://root@127.0.0.1/$DB" \
+RBH_DATABASE_URL="mysql://root@127.0.0.1:$DB_PORT/$DB" \
+RBH_FILESYSTEMS_JSON="" \
+RBH_FILESYSTEM_ID="$FILESYSTEM" \
 RBH_LUSTRE_MOUNT="$MOUNT" \
 RBH_MDTS="$MDTS" \
 RBH_CHANGELOG_USER="$RBH_CHANGELOG_USER" \
@@ -163,7 +176,7 @@ note "  -> entry observed for $NAME (fid=$FID)"
 note "scenario 2: rewrite changes size"
 dd if=/dev/zero of="$SRC" bs=1k count=16 2>/dev/null
 sleep "$SETTLE"
-SIZE=$(mysql -u root -N -B "$DB" -e "SELECT size FROM entries WHERE name='$NAME'")
+SIZE=$(test_sql -N -B "$DB" -e "SELECT size FROM scoped_entries WHERE filesystem_id='$FILESYSTEM' AND name='$NAME'")
 assert_ge "$SIZE" "16384" "rewrite updated size"
 note "  -> size updated to $SIZE bytes"
 
@@ -173,14 +186,16 @@ mv "$SRC" "$DST"
 NEWNAME=$(basename "$DST")
 wait_for_entry "name = '$NEWNAME'"
 wait_for_absence "name = '$NAME'"
+OBJECT_HEX=$(test_sql -N -B "$DB" -e "SELECT HEX(object_id) FROM scoped_entries WHERE filesystem_id='$FILESYSTEM' AND name='$NEWNAME'")
+[[ "$OBJECT_HEX" =~ ^[0-9A-F]{32}$ ]] || die "missing object ID for $NEWNAME"
 note "  -> rename observed ($NAME -> $NEWNAME)"
 
 note "scenario 4: unlink"
 rm "$DST"
 wait_for_absence "name = '$NEWNAME'"
-RM_COUNT=$(mysql -u root -N -B "$DB" -e "SELECT COUNT(*) FROM removed_entries WHERE name='$NEWNAME'")
-assert_ge "$RM_COUNT" "1" "unlinked entry persisted in removed_entries"
-note "  -> removed_entries has the FID"
+RM_COUNT=$(test_sql -N -B "$DB" -e "SELECT COUNT(*) FROM scoped_removed_entries WHERE filesystem_id='$FILESYSTEM' AND object_id=UNHEX('$OBJECT_HEX')")
+assert_ge "$RM_COUNT" "1" "unlinked entry persisted in scoped_removed_entries"
+note "  -> scoped_removed_entries has the FID"
 
 # ---- 4. fs-scan + orphan sweep ----
 note "scenario 5: full scan populates catalog"
@@ -189,7 +204,7 @@ note "scenario 5: full scan populates catalog"
 for i in 1 2 3 4 5; do echo "x" > "$TEST_DIR/scan-$i.txt"; done
 SCAN_START=$(date +%s)
 SCAN_ID=$(curl -sf -X POST "$API/api/scans" -H 'content-type: application/json' \
-            -d "{\"root\":\"$TEST_DIR\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+            -d "$(python3 -c 'import json,sys; print(json.dumps({"root":sys.argv[1],"filesystem":sys.argv[2]}))' "$TEST_DIR" "$FILESYSTEM")" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 note "  -> scan id $SCAN_ID"
 # Poll for completion
 for _ in $(seq 1 30); do
@@ -201,32 +216,35 @@ done
 assert_eq "$STATUS" "completed" "scan state"
 note "  -> scan completed"
 
-note "scenario 6: orphan sweep (dry-run then real)"
-# Delete one file out-of-band so its last_seen stays in the past.
+note "scenario 6: compatibility orphan sweep (dry-run then real)"
+# The compatibility API uses a separate FID catalog. Seed its own test rows.
+test_sql "$DB" <<SQL
+INSERT INTO entries (fid, name, kind, size, last_seen)
+SELECT fid, name, kind, size,
+    IF(name = 'scan-1.txt', $SCAN_START - 1, $SCAN_START + 1)
+FROM scoped_entries WHERE filesystem_id = '$FILESYSTEM' AND name IN ('scan-1.txt', 'scan-2.txt');
+SQL
 rm "$TEST_DIR/scan-1.txt"
-# Give the daemon a moment; the changelog unlink may or may not have fired
-# depending on timing — that's fine, the sweep covers both paths.
-sleep 2
 # Record a dry-run count, then let the real sweep reconcile.
-DRY_JSON=$(curl -sf -X POST "$API/api/admin/sweep-orphans?before=$SCAN_START&dry_run=true")
+DRY_JSON=$(curl -sf -X POST "$API/api/compat/lustre/admin/sweep-orphans?before=$SCAN_START&dry_run=true")
 DRY=$(echo "$DRY_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["swept"])')
-note "  -> dry-run candidates: $DRY"
-REAL_JSON=$(curl -sf -X POST "$API/api/admin/sweep-orphans?before=$SCAN_START")
+assert_eq "$DRY" "1" "dry-run sweep candidates"
+REAL_JSON=$(curl -sf -X POST "$API/api/compat/lustre/admin/sweep-orphans?before=$SCAN_START")
 REAL=$(echo "$REAL_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["swept"])')
-note "  -> real sweep: $REAL"
+assert_eq "$REAL" "1" "real sweep candidates"
 
 # ---- 5. admin dump / restore round-trip ----
-note "scenario 7: catalog dump/restore round-trip"
+note "scenario 7: compatibility catalog dump/restore round-trip"
 DUMP=$(mktemp)
 "$BIN_CLI" --api-url "$API" admin dump --out "$DUMP"
 LINES=$(wc -l < "$DUMP")
 assert_ge "$LINES" "1" "dump non-empty"
-# Blow away half the catalog, then restore
-mysql -u root "$DB" -e "DELETE FROM entries LIMIT 100;" || true
-BEFORE=$(mysql -u root -N -B "$DB" -e "SELECT COUNT(*) FROM entries")
+# Clear the compatibility fixture, then restore it.
+test_sql "$DB" -e "DELETE FROM entries;"
+BEFORE=$(test_sql -N -B "$DB" -e "SELECT COUNT(*) FROM entries")
 "$BIN_CLI" --api-url "$API" admin restore --input "$DUMP"
-AFTER=$(mysql -u root -N -B "$DB" -e "SELECT COUNT(*) FROM entries")
-assert_ge "$AFTER" "$BEFORE" "restore filled rows back in"
+AFTER=$(test_sql -N -B "$DB" -e "SELECT COUNT(*) FROM entries")
+assert_eq "$AFTER" "$LINES" "restore filled rows back in"
 note "  -> dump=$LINES lines, restore ok ($BEFORE → $AFTER)"
 rm -f "$DUMP"
 
@@ -236,7 +254,7 @@ LEGACY_ERROR=$(curl -sS -X POST "$API/api/policies" -H 'Content-Type: applicatio
     -d '{"name":"e2e_purge","kind":"purge","filesystem":"lustre","trigger":"1h"}' \
     -w '\n%{http_code}')
 assert_eq "${LEGACY_ERROR##*$'\n'}" "400" "legacy policy rejected"
-assert_contains "$LEGACY_ERROR" "hsm.storage.io/v1alpha3" "policy format error identifies Rev.8"
+assert_contains "$LEGACY_ERROR" "hsm.storage.io/v1alpha3" "policy format error identifies the supported version"
 
 # ---- 7. metrics + health ----
 note "scenario 9: /api/metrics exposes families"
@@ -248,12 +266,12 @@ note "  -> metrics ok"
 
 # ---- 8. new reports ----
 note "scenario 10: stripe-distribution + du"
-STRIPE=$(curl -sf "$API/api/reports/stripe-distribution")
+STRIPE=$(curl -sf "$API/api/reports/stripe-distribution?filesystem=$FILESYSTEM")
 # OK even if empty on a fresh fs — what matters is that the endpoint works.
 echo "$STRIPE" | python3 -c 'import json,sys;json.load(sys.stdin)' >/dev/null
 
 DU_FID=$(lfs path2fid "$TEST_DIR" | tr -d '[]')
-DU=$(curl -sf "$API/api/reports/du?fid=${DU_FID}")
+DU=$(curl -sfG "$API/api/reports/du" --data-urlencode "filesystem=$FILESYSTEM" --data-urlencode "fid=$DU_FID")
 TOTAL=$(echo "$DU" | python3 -c 'import json,sys;print(json.load(sys.stdin)["total_bytes"])')
 note "  -> du under test_dir reports $TOTAL bytes"
 

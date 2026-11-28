@@ -30,11 +30,18 @@ install -m 0755 target/release/rbh       /usr/bin/rbh
 # Install assets.
 install -d -m 0755 /usr/share/robinhood/console
 cp -a web/dist/. /usr/share/robinhood/console/
+install -m 0644 crates/rbh-entry-store/schema.sql /usr/share/robinhood/schema.sql
 install -m 0644 packaging/systemd/rbh-daemon.service  /usr/lib/systemd/system/
 install -m 0644 packaging/systemd/rbh-daemon@.service /usr/lib/systemd/system/
 install -m 0640 packaging/sysconfig/rbh-daemon        /etc/sysconfig/rbh-daemon
 install -m 0644 packaging/tmpfiles.d/robinhood.conf   /usr/lib/tmpfiles.d/
 install -m 0644 packaging/logrotate/rbh-daemon        /etc/logrotate.d/
+
+# Initialize an empty MariaDB database as a database administrator.
+mariadb --execute 'CREATE DATABASE rbh_entries'
+mariadb rbh_entries < /usr/share/robinhood/schema.sql
+# Create the MariaDB service account and grant SELECT, INSERT, UPDATE, and DELETE
+# on rbh_entries.*. Use its credentials in RBH_DATABASE_URL below.
 
 # Create directories, start service.
 systemd-tmpfiles --create robinhood.conf
@@ -53,7 +60,7 @@ installation directory, such as the local `web/dist/` for development.
 The daemon only needs read access to the installed files. Node.js is a build
 dependency.
 
-For remote operators who use the existing Rev.8 writer, bind the daemon to
+For remote operators who use a configured policy writer, bind the daemon to
 a loopback listener such as `RBH_LISTEN_ADDR=127.0.0.1:8080` and terminate HTTPS
 at your reverse proxy. Forward both `/console/` and `/api/` from the same
 HTTPS origin to that listener. Preserve the request URI and the

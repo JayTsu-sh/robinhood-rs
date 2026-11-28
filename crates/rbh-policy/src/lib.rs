@@ -5,11 +5,11 @@
 //! attributes. Driven by periodic scheduler-rs runs and Lustre changelog events.
 //!
 //! **Layer 2 — Action Policies** (`/api/policies`):
-//! REST-managed Rev.8 policies select candidates and dispatch native actions.
+//! REST-managed policies select candidates and dispatch native actions.
 
 pub mod classifier;
 pub mod model;
-pub mod rev8;
+pub mod policy;
 pub mod store;
 pub mod task;
 pub mod trigger_parser;
@@ -18,7 +18,7 @@ pub use classifier::{ClassifierDef, ClassifierRow, ClassifierRule, ClassifierSto
 pub use model::TriggerSpec;
 pub use rbh_entry_store::FileSystemId;
 pub use store::PolicyStore;
-pub use task::{PolicyRuntime, Rev8TickTask, init_runtime};
+pub use task::{PolicyRuntime, PolicyTickTask, init_runtime};
 pub use trigger_parser::parse_trigger;
 
 /// Errors produced by the policy layer.
@@ -44,7 +44,7 @@ pub enum PolicyError {
     InvalidPolicyField { field: &'static str, message: String },
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
-    #[error("Rev.8 worker lock row is missing")]
+    #[error("policy worker lock row is missing")]
     WorkerLockMissing,
     #[error("migration error: {0}")]
     Migration(String),

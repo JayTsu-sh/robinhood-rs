@@ -23,8 +23,9 @@ services:
       - "3306:3306"
     volumes:
       - mariadb-data:/var/lib/mysql
+      - ../../crates/rbh-entry-store/schema.sql:/docker-entrypoint-initdb.d/01-robinhood.sql:ro
     healthcheck:
-      test: ["CMD", "mariadb-admin", "ping", "-prbhdev"]
+      test: ["CMD", "mariadb-admin", "--protocol=tcp", "--host=127.0.0.1", "ping", "-prbhdev"]
       interval: 5s
       timeout: 3s
       retries: 12

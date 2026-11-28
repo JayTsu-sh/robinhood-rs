@@ -215,9 +215,9 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
       if (response?.status === 401) {
         if (writerTransportAllowed()) {
           setWriterPrompt(true);
-          if (token) setFailure({ message: 'Rev.8 writer 凭据未获后端接受' });
+          if (token) setFailure({ message: '策略写入凭据未获后端接受' });
         } else {
-          setFailure({ message: '请通过本机回环地址或 HTTPS 连接后使用 Rev.8 writer。' });
+          setFailure({ message: '请通过本机回环地址或 HTTPS 连接后提交策略写入请求。' });
         }
       } else {
         setWriterPrompt(false);
@@ -305,12 +305,12 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
           </Col>
         )}
       </Row>
-      <Modal title="Rev.8 writer 凭据" open={writerPrompt} confirmLoading={saving} okText="提交保存"
+      <Modal title="策略写入凭据" open={writerPrompt} confirmLoading={saving} okText="提交保存"
         onCancel={() => { if (!saving) { setWriterPrompt(false); setWriterToken(''); } }}
         okButtonProps={{ disabled: !writerToken.trim() }}
         onOk={() => submit(writerToken.trim())} destroyOnHidden>
         <Typography.Paragraph>输入部署配置中已有的 writer token。凭据用于本次提交。</Typography.Paragraph>
-        <Input.Password aria-label="Rev.8 writer token" autoComplete="off" value={writerToken}
+        <Input.Password aria-label="策略写入令牌" autoComplete="off" value={writerToken}
           onChange={({ target }) => setWriterToken(target.value)} />
         {failure && <Typography.Paragraph type="danger" role="alert">{failure.message}</Typography.Paragraph>}
       </Modal>

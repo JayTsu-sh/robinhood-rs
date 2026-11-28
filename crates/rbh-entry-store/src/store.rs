@@ -95,14 +95,12 @@ pub struct EntryStore {
 }
 
 impl EntryStore {
-    /// Connect to MariaDB and run migrations.
-    #[tracing::instrument(name = "store.connect", skip_all, fields(url = %url))]
+    /// Connect to MariaDB and verify the installed schema before serving any requests.
+    #[tracing::instrument(name = "store.connect", skip_all)]
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = MySqlPoolOptions::new().max_connections(10).connect(url).await?;
-
-        // Run embedded migrations.
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        info!("entry store connected and migrated");
+        crate::schema::validate(&pool).await?;
+        info!("entry store connected");
 
         Ok(Self { pool })
     }
@@ -2197,44 +2195,6 @@ pub struct MariaDbCursorStore {
 impl MariaDbCursorStore {
     pub fn new(pool: Pool<MySql>, filesystem: FileSystemId) -> Self {
         Self { pool, filesystem }
-    }
-}
-
-impl EntryStore {
-    /// Bind pre-filesystem cursor rows to the sole configured Lustre runtime.
-    ///
-    /// Callers must only use this compatibility migration when the runtime
-    /// registry contains exactly one Lustre filesystem; otherwise the legacy
-    /// rows are intentionally left untouched rather than guessed.
-    pub async fn bind_legacy_lustre_cursors(&self, filesystem: &FileSystemId) -> Result<u64> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            r"UPDATE changelog_cursor AS scoped
-              JOIN changelog_cursor AS legacy
-                ON legacy.filesystem_id = '__legacy_lustre__'
-               AND scoped.filesystem_id = ?
-               AND scoped.mdt_name = legacy.mdt_name
-              SET scoped.last_rec = GREATEST(scoped.last_rec, legacy.last_rec),
-                  scoped.updated_at = GREATEST(scoped.updated_at, legacy.updated_at),
-                  scoped.reader_id = COALESCE(scoped.reader_id, legacy.reader_id)",
-        )
-        .bind(filesystem.as_str())
-        .execute(&mut *tx)
-        .await?;
-        let result = sqlx::query(
-            r"INSERT IGNORE INTO changelog_cursor
-                (filesystem_id, mdt_name, reader_id, last_rec, updated_at)
-              SELECT ?, mdt_name, reader_id, last_rec, updated_at
-              FROM changelog_cursor WHERE filesystem_id = '__legacy_lustre__'",
-        )
-        .bind(filesystem.as_str())
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM changelog_cursor WHERE filesystem_id = '__legacy_lustre__'")
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(result.rows_affected())
     }
 }
 

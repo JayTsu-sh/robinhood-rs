@@ -43,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /tmp/fake-mount
 COPY --from=build /src/target/release/robinhood /usr/sbin/robinhood
 COPY --from=build /src/target/release/rbh /usr/bin/rbh
+COPY --from=build /src/crates/rbh-entry-store/schema.sql /usr/share/robinhood/schema.sql
 COPY --from=console /web/dist/ /usr/share/robinhood/console/
 COPY --from=build /usr/lib/liblustreapi.so.1.0.0 /usr/local/lib/liblustreapi.so.1
 COPY --from=build /usr/lib/liblnetconfig.so.4.0.0 /usr/local/lib/liblnetconfig.so.4

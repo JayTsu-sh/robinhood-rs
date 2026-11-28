@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use rbh_entry_store::FileSystemId;
-use rbh_policy::{PolicyStore, rev8::heat::HeatSampler};
+use rbh_policy::{PolicyStore, policy::heat::HeatSampler};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 

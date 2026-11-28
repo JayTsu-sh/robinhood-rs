@@ -16,7 +16,11 @@ cd dev/compose
 docker compose up -d --build
 ```
 
-After the first build and database migration:
+The first start imports the project schema into the new MariaDB volume. If
+you have a volume from an earlier schema, use a different Compose project
+name and free the configured host ports before starting the new stack.
+
+After the daemon starts:
 
 | Service | URL |
 |---------|-----|
@@ -46,7 +50,7 @@ daemon restarts with a seeded catalog.
 ## Seeding fake data
 
 Add one synthetic 2 GiB catalog file to the isolated development database.
-It matches the archive preview in the Rev.8 REST example.
+It matches the archive preview in the native Lustre HSM example.
 
 ```bash
 docker compose exec -T mariadb mariadb -uroot -prbhdev rbh_entries <<'SQL'
@@ -72,11 +76,11 @@ SQL
 curl -fsS 'http://localhost:8080/api/entries/0x200000042:0x2a:0x0?filesystem=lustre'
 ```
 
-## Previewing a Rev.8 policy
+## Previewing a policy
 
 From `dev/compose`, save the archive policy example as
 `archive-preview.json` and add a writer to the local daemon.
-These commands use `openssl` and `jq`. [Rev.8 REST example](../../README.md#rev8-native-lustre-hsm)
+These commands use `openssl` and `jq`. [Native Lustre HSM example](../../README.md#native-lustre-hsm)
 
 ```bash
 dev_auth=$(mktemp -d)
@@ -87,7 +91,7 @@ cat > "$dev_auth/auth.yml" <<EOF
 services:
   rbh-daemon:
     environment:
-      RBH_REV8_WRITERS_FILE: /run/rbh-writers.json
+      RBH_POLICY_WRITERS_FILE: /run/rbh-writers.json
     volumes:
       - "$dev_auth/writers.json:/run/rbh-writers.json:ro"
 EOF
