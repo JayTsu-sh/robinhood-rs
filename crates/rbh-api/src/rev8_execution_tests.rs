@@ -48,6 +48,9 @@ struct HsmFixture {
     hold_submission: AtomicBool,
     submission_started: Notify,
     resume_submission: Notify,
+    hold_response: AtomicBool,
+    response_held: Notify,
+    resume_response: Notify,
     missing_on_other_source: AtomicBool,
 }
 
@@ -118,6 +121,10 @@ impl NativeHsm for HsmFixture {
             .unwrap()
             .push((fid, invocation.kind, invocation.archive_id));
         self.sent.notify_one();
+        if self.hold_response.swap(false, Ordering::SeqCst) {
+            self.response_held.notify_one();
+            self.resume_response.notified().await;
+        }
         if self.interrupt_request.load(Ordering::SeqCst) {
             std::future::pending().await
         } else if self.reject_request.load(Ordering::SeqCst) {
@@ -827,6 +834,132 @@ async fn rev8_enforced_runs_check_governance_record_acceptance_and_recover_after
     assert_eq!(terminal["reason"], "hsm_target_state_not_reached");
     assert_eq!(terminal["completionEvidence"]["source"], "lustre_hsm_current_action");
     assert!(terminal["acceptedAt"].is_string());
+
+    let changed_run = env.queue(budgeted_id).await;
+    env.hsm.hold_response.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        tokio::join!(env.tick(), env.hsm.response_held.notified());
+    })
+    .await
+    .expect("a claimed HSM request must stop holding the worker past its budget");
+    let timed_out = &env.operations(budgeted_id, changed_run).await[0];
+    assert_eq!(timed_out["state"], "unknown");
+    assert_eq!(timed_out["reason"], "native_hsm_submission_pending");
+    assert_eq!(timed_out["attempted"], true);
+    {
+        let mut files = env.hsm.files.lock().unwrap();
+        let changed = files.get_mut(&late).unwrap();
+        changed.generation.mtime += 1;
+        changed.state.in_progress_action = HUA_ARCHIVE;
+    }
+    env.hsm.resume_response.notify_one();
+    env.reconcile_until(&env.stores, async || {
+        env.operations(budgeted_id, changed_run).await[0]["state"] == "submitted"
+    })
+    .await;
+    let pending = &env.operations(budgeted_id, changed_run).await[0];
+    env.reconcile_until(&fresh, async || env.checked(pending).await).await;
+    assert_eq!(env.operations(budgeted_id, changed_run).await[0]["state"], "submitted");
+    env.hsm
+        .files
+        .lock()
+        .unwrap()
+        .get_mut(&late)
+        .unwrap()
+        .state
+        .in_progress_action = HUA_NONE;
+    env.reconcile_until(&fresh, async || {
+        env.operations(budgeted_id, changed_run).await[0]["state"] == "failed"
+    })
+    .await;
+    let changed = &env.operations(budgeted_id, changed_run).await[0];
+    assert_eq!(changed["reason"], "hsm_source_generation_changed");
+    assert_eq!(changed["completionEvidence"]["source"], "lustre_hsm_current_action");
+    env.hsm.files.lock().unwrap().get_mut(&late).unwrap().generation.mtime -= 1;
+
+    let journal_run = env.queue(budgeted_id).await;
+    sqlx::query(&format!(
+        "CREATE TRIGGER reject_native_timeout BEFORE UPDATE ON rev8_operations FOR EACH ROW
+         BEGIN
+             IF OLD.run_id = {journal_run} AND NEW.reason = 'native_hsm_submission_pending' THEN
+                 SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fixture timeout journal unavailable';
+             END IF;
+         END"
+    ))
+    .execute(env.entries.pool())
+    .await
+    .unwrap();
+    env.hsm.hold_response.store(true, Ordering::SeqCst);
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(4), async {
+        tokio::join!(env.stores.process_rev8(&env.entries), env.hsm.response_held.notified())
+    })
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    sqlx::query("DROP TRIGGER reject_native_timeout")
+        .execute(env.entries.pool())
+        .await
+        .unwrap();
+    assert_eq!(env.operations(budgeted_id, journal_run).await[0]["state"], "submitting");
+    {
+        let mut files = env.hsm.files.lock().unwrap();
+        let state = &mut files.get_mut(&late).unwrap().state;
+        state.states = copies;
+        state.archive_id = 17;
+    }
+    // The initiating worker can prove completion while the ioctl response
+    // is still pending.
+    env.reconcile_until(&env.stores, async || {
+        env.operations(budgeted_id, journal_run).await[0]["state"] == "completed"
+    })
+    .await;
+    assert!(env.operations(budgeted_id, journal_run).await[0]["acceptedAt"].is_null());
+    sqlx::query(&format!(
+        "CREATE TRIGGER reject_late_native_acceptance BEFORE UPDATE ON rev8_operations FOR EACH ROW
+         BEGIN
+             IF OLD.run_id = {journal_run} AND OLD.state = 'completed' AND NEW.accepted_at IS NOT NULL THEN
+                 SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'fixture late acceptance write unavailable';
+             END IF;
+         END"
+    ))
+    .execute(env.entries.pool())
+    .await
+    .unwrap();
+    let preview_id = env
+        .create(&rev8_archive_policy(
+            &env.filesystem.to_string(),
+            "independent-of-journal-retry",
+        ))
+        .await;
+    let preview_run = env.queue(preview_id).await;
+    env.hsm.resume_response.notify_one();
+    env.reconcile_until(&env.stores, async || {
+        server
+            .get(&format!("/api/policies/{preview_id}/runs"))
+            .await
+            .json::<Vec<Value>>()
+            .iter()
+            .any(|run| run["id"] == preview_run && run["state"] == "previewed")
+    })
+    .await;
+    assert!(env.operations(budgeted_id, journal_run).await[0]["acceptedAt"].is_null());
+    sqlx::query("DROP TRIGGER reject_late_native_acceptance")
+        .execute(env.entries.pool())
+        .await
+        .unwrap();
+    env.reconcile_until(&env.stores, async || {
+        env.operations(budgeted_id, journal_run).await[0]["acceptedAt"].is_string()
+    })
+    .await;
+    let settled = &env.operations(budgeted_id, journal_run).await[0];
+    assert_eq!(settled["state"], "completed");
+    assert_eq!(settled["completionEvidence"]["source"], "lustre_hsm_state");
+    {
+        let mut files = env.hsm.files.lock().unwrap();
+        let state = &mut files.get_mut(&late).unwrap().state;
+        state.states = HsmState::empty();
+        state.archive_id = 0;
+    }
 
     let retry = env.queue(budgeted_id).await;
     env.tick().await;

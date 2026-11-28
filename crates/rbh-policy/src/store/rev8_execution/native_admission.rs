@@ -6,10 +6,11 @@ use std::{
 
 use chrono::Utc;
 use rbh_entry_store::FileSystemId;
-use sqlx::{MySql, Transaction};
+use sqlx::{MySql, MySqlExecutor, Transaction};
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
-    Candidate, Dispatch, PolicyStore, current_revision, decode_fid, elapsed_ms, lock_permit,
+    BATCH_SIZE, Candidate, Dispatch, PolicyStore, current_revision, decode_fid, elapsed_ms, lock_permit,
     preflight::{PreflightKey, PreflightRequest, PreflightResult, PreflightWait},
     short_reason, verify_worker_permit,
 };
@@ -18,8 +19,8 @@ use crate::{
     rev8::{
         ActionKind, BudgetLimits, Invocation,
         execution::{
-            Admission, Decision, FidObservation, NativeHsm, Observation, Submission, SubmissionDeferral,
-            SubmissionGate, SubmissionOwner,
+            Admission, Decision, FidObservation, NativeHsm, NativeSubmissionSlot, Observation, Submission,
+            SubmissionDeferral, SubmissionGate, SubmissionOwner,
         },
         invalid,
         resources::safety_matches,
@@ -29,6 +30,8 @@ use crate::{
 // Give a fresh verification its own bounded wait after the initial reads
 // crossed a turn. A verification slower than this cannot authorize an ioctl.
 const FINAL_LOOKUP_LIMIT: Duration = Rev8TickTask::INTERVAL.saturating_mul(2);
+const SUBMISSION_WAIT_LIMIT: Duration = Rev8TickTask::INTERVAL.saturating_mul(2);
+const SUBMISSION_PENDING: &str = "native_hsm_submission_pending";
 
 pub(in crate::store) type NativePreflight = Result<VerifiedNativeCandidate, String>;
 
@@ -36,6 +39,19 @@ pub(in crate::store) struct VerifiedNativeCandidate {
     invocation: Invocation,
     snapshot: Observation,
     checked_at: Instant,
+}
+
+pub(in crate::store) enum NativeSubmissionJob {
+    Running(JoinHandle<Submission>),
+    Finished(Submission),
+}
+
+impl Drop for NativeSubmissionJob {
+    fn drop(&mut self) {
+        if let Self::Running(task) = self {
+            task.abort();
+        }
+    }
 }
 
 impl PolicyStore {
@@ -117,6 +133,41 @@ impl PolicyStore {
                 }
             }
         };
+        let Some(slot) = NativeSubmissionSlot::acquire(&verified.snapshot.generation.filesystem_name) else {
+            let reason = SubmissionDeferral::ActuatorBusy.reason();
+            if dispatch.policy.one_shot {
+                return Ok(ControlFlow::Break(reason));
+            }
+            return self
+                .record_deferred(dispatch, candidate, &invocation, reason)
+                .await
+                .map(ControlFlow::Continue);
+        };
+        let mut tx = self.pool.begin().await?;
+        let active = current_revision(&mut tx, dispatch.run).await?;
+        // Revoke the gate before releasing the locked policy revision.
+        let (gate, owner) = deadline.gate(&dispatch.admission, run_deadline);
+        let gate = gate.holding(slot);
+        let early_deferral = if !active {
+            Some(SubmissionDeferral::PolicyInactive)
+        } else if let ControlFlow::Break(reason) = gate.status() {
+            Some(reason)
+        } else {
+            None
+        };
+        if let Some(reason) = early_deferral {
+            tx.commit().await?;
+            return self
+                .record_deferred(dispatch, candidate, &invocation, reason.reason())
+                .await
+                .map(ControlFlow::Continue);
+        }
+
+        let mut jobs = self.native_submissions.lock().await;
+        if jobs.len() >= BATCH_SIZE {
+            return Ok(ControlFlow::Break(SubmissionDeferral::ActuatorBusy.reason()));
+        }
+        let mut intent = self.pool.begin().await?;
         let operation = self
             .reserve_operation(
                 dispatch,
@@ -124,61 +175,162 @@ impl PolicyStore {
                 &verified.invocation,
                 &verified.snapshot.generation,
                 None,
+                &mut *intent,
             )
             .await?;
-        let mut tx = self.pool.begin().await?;
-        let active = current_revision(&mut tx, dispatch.run).await?;
-        // Drop the owner before releasing the policy row lock if this future
-        // is cancelled while blocked in the submission backend.
-        let (gate, _owner) = deadline.gate(&dispatch.admission, run_deadline);
+        let backend = Arc::clone(backend);
+        let mount = dispatch.config.mount_path.clone();
+        let (allow, permit) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let Ok(gate) = permit.await else {
+                return Submission::Deferred(SubmissionDeferral::DispatchCancelled);
+            };
+            backend
+                .submit(&mount, fid, verified.invocation, &verified.snapshot.generation, gate)
+                .await
+        });
+        let NativeSubmissionJob::Running(task) = jobs.entry(operation).or_insert(NativeSubmissionJob::Running(task))
+        else {
+            unreachable!("the operation was just reserved");
+        };
+        // The job can report cancellation even if the commit's outcome is
+        // ambiguous. The kernel request cannot start until the intent commits.
+        intent.commit().await?;
         if !lock_permit(&mut tx, operation).await? {
+            jobs.remove(&operation);
             return Ok(ControlFlow::Continue(()));
         }
-        let (state, attempted, reason, terminal_class) = if !active {
-            ("deferred", false, Some("policy_revision_inactive".into()), None)
-        } else if let ControlFlow::Break(reason) = gate.status() {
-            ("deferred", false, Some(reason.reason().into()), None)
-        } else if !verify_worker_permit(worker).await? {
-            (
-                "deferred",
-                false,
-                Some("permit_store_requires_synchronous_commit".into()),
-                None,
-            )
+
+        let mut pending = false;
+        let mut yielded = None;
+        let submission = if !verify_worker_permit(worker).await? {
+            Submission::Deferred(SubmissionDeferral::PermitStoreNotSynchronous)
         } else {
-            match backend
-                .submit(
-                    &dispatch.config.mount_path,
-                    fid,
-                    verified.invocation,
-                    &verified.snapshot.generation,
-                    gate,
-                )
-                .await
-            {
-                Submission::Accepted => ("submitted", true, None, None),
-                Submission::Deferred(reason) => ("deferred", false, Some(reason.reason().into()), None),
-                Submission::Rejected { error, class } => ("failed", true, Some(error), class.map(|class| class.name())),
-                Submission::Unknown(error) => ("unknown", true, Some(error), None),
+            let wait_until = run_deadline.min(Instant::now() + SUBMISSION_WAIT_LIMIT);
+            allow
+                .send(gate)
+                .map_err(|_| PolicyError::Store("native HSM submission worker stopped before dispatch".into()))?;
+            match tokio::time::timeout_at(wait_until.into(), task).await {
+                Ok(Ok(submission)) => submission,
+                Ok(Err(error)) => Submission::Unknown(error.to_string()),
+                Err(_) => {
+                    let claimed = owner.revoke_unless_claimed();
+                    if claimed {
+                        pending = true;
+                        if wait_until < run_deadline {
+                            yielded = Some(SUBMISSION_PENDING);
+                        }
+                        Submission::Unknown(SUBMISSION_PENDING.into())
+                    } else {
+                        let reason = if !dispatch.admission.window_open(Utc::now()) {
+                            SubmissionDeferral::WindowClosed
+                        } else if wait_until == run_deadline {
+                            deadline.reason
+                        } else {
+                            yielded = Some(SubmissionDeferral::TickBudget.reason());
+                            SubmissionDeferral::TickBudget
+                        };
+                        Submission::Deferred(reason)
+                    }
+                }
             }
         };
-        sqlx::query(
-            "UPDATE rev8_operations SET state = ?, attempted = ?, reason = ?, terminal_error_class = ?,
-             accepted_at = CASE WHEN ? = 'submitted' THEN UTC_TIMESTAMP(6) ELSE NULL END,
-             finished_at = CASE WHEN ? = 'failed' THEN UTC_TIMESTAMP(6) ELSE NULL END WHERE id = ? AND state = 'submitting'",
-        )
-        .bind(state)
-        .bind(attempted)
-        .bind(reason.as_deref().map(short_reason))
-        .bind(terminal_class)
-        .bind(state)
-        .bind(state)
-        .bind(operation)
-        .execute(&mut *tx)
-        .await?;
+        if !pending && let Some(job) = jobs.get_mut(&operation) {
+            *job = NativeSubmissionJob::Finished(submission.clone());
+        }
+        record_submission(&mut *tx, operation, &submission, JournalUpdate::Dispatch).await?;
         tx.commit().await?;
+        if !pending {
+            jobs.remove(&operation);
+        }
+        if let Some(reason) = yielded {
+            return Ok(ControlFlow::Break(reason));
+        }
         Ok(ControlFlow::Continue(()))
     }
+
+    pub(super) async fn finish_native_submissions(&self) {
+        let mut active = self.native_submissions.lock().await;
+        let mut committed = Vec::new();
+        for (&operation, job) in active.iter_mut() {
+            if let NativeSubmissionJob::Running(task) = job {
+                if !task.is_finished() {
+                    continue;
+                }
+                let result = task
+                    .await
+                    .unwrap_or_else(|error| Submission::Unknown(error.to_string()));
+                *job = NativeSubmissionJob::Finished(result);
+            }
+            let NativeSubmissionJob::Finished(submission) = job else {
+                unreachable!("a finished task has a submission result");
+            };
+            match self.publish_late_submission(operation, submission).await {
+                Ok(()) => committed.push(operation),
+                Err(error) => {
+                    tracing::warn!(operation_id = operation, %error, "will retry recording HSM submission result");
+                }
+            }
+        }
+        for operation in committed {
+            active.remove(&operation);
+        }
+    }
+
+    async fn publish_late_submission(&self, operation: u64, submission: &Submission) -> Result<(), PolicyError> {
+        let mut tx = self.pool.begin().await?;
+        record_submission(&mut *tx, operation, submission, JournalUpdate::LateResponse).await?;
+        if matches!(submission, Submission::Accepted) {
+            // A recovery worker may already have confirmed the target
+            // state. Preserve that evidence and add actual acceptance.
+            sqlx::query(
+                "UPDATE rev8_operations SET accepted_at = UTC_TIMESTAMP(6)
+                 WHERE id = ? AND state = 'completed' AND accepted_at IS NULL",
+            )
+            .bind(operation)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+enum JournalUpdate {
+    Dispatch,
+    LateResponse,
+}
+
+async fn record_submission(
+    store: impl MySqlExecutor<'_>, operation: u64, submission: &Submission, update: JournalUpdate,
+) -> Result<(), PolicyError> {
+    let (state, attempted, reason, terminal_class) = match submission {
+        Submission::Accepted => ("submitted", true, None, None),
+        Submission::Deferred(reason) => ("deferred", false, Some(reason.reason()), None),
+        Submission::Rejected { error, class } => {
+            ("failed", true, Some(error.as_str()), class.map(|class| class.name()))
+        }
+        Submission::Unknown(error) => ("unknown", true, Some(error.as_str()), None),
+    };
+    sqlx::query(
+        "UPDATE rev8_operations SET state = ?, attempted = ?, reason = ?, terminal_error_class = ?,
+             accepted_at = CASE WHEN ? = 'submitted' THEN UTC_TIMESTAMP(6) ELSE NULL END,
+             finished_at = CASE WHEN ? = 'failed' THEN UTC_TIMESTAMP(6) ELSE NULL END
+             WHERE id = ? AND (state = 'submitting'
+                OR (? AND state = 'unknown' AND reason IN (?, 'interrupted_submission')))",
+    )
+    .bind(state)
+    .bind(attempted)
+    .bind(reason.map(short_reason))
+    .bind(terminal_class)
+    .bind(state)
+    .bind(state)
+    .bind(operation)
+    .bind(matches!(update, JournalUpdate::LateResponse))
+    .bind(SUBMISSION_PENDING)
+    .execute(store)
+    .await?;
+    Ok(())
 }
 
 async fn observe_native_candidate(
@@ -261,14 +413,15 @@ impl NativeDeadline {
         Ok(Self { at, reason })
     }
 
-    fn gate(self, admission: &Admission, retained_deadline: Instant) -> (SubmissionGate, SubmissionOwner) {
+    fn gate(&self, admission: &Admission, retained_deadline: Instant) -> (SubmissionGate, SubmissionOwner) {
         let window_open = admission.window_check();
+        let reason = self.reason;
         SubmissionGate::owned(move || {
             if !window_open() {
                 return ControlFlow::Break(SubmissionDeferral::WindowClosed);
             }
             if Instant::now() >= retained_deadline {
-                return ControlFlow::Break(self.reason);
+                return ControlFlow::Break(reason);
             }
             ControlFlow::Continue(())
         })

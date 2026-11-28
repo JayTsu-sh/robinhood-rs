@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use scheduler_rs::prelude::*;
+use scheduler_rs::store::{DataStore, MemoryStore, MysqlStore};
 use tokio_util::sync::CancellationToken;
 
 /// Run the robinhood-rs daemon.
@@ -360,16 +361,20 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    // 6. Set up scheduler-rs.
-    let scheduler_store = Arc::new(
-        scheduler_rs::store::MysqlStore::new(pool.clone())
-            .await
-            .context("failed to initialize scheduler store")?,
-    );
+    // Retain old schedule history and run the wakeup in each daemon.
+    let persisted_schedules = MysqlStore::new(pool.clone())
+        .await
+        .context("failed to initialize scheduler store")?;
+    retire_persisted_schedules(&persisted_schedules).await?;
+
+    // Rev.8 policies, due times and execution state live in the catalog.
+    // An in-memory trigger avoids sharing scheduler rows with daemons
+    // that have no trigger registered for those rows.
     let scheduler = Scheduler::builder()
-        .data_store(scheduler_store)
+        .data_store(Arc::new(MemoryStore::new()))
         .executor(Arc::new(scheduler_rs::executor::TokioExecutor::new()))
         .poll_interval(std::time::Duration::from_secs(1))
+        .execution_retention(chrono::Duration::minutes(5))
         .build()
         .context("failed to build scheduler")?;
 
@@ -382,9 +387,7 @@ pub async fn run() -> anyhow::Result<()> {
         entry_store: entry_store.clone(),
     }));
 
-    retire_legacy_schedules(&scheduler).await?;
-
-    ensure_rev8_schedule(&scheduler)
+    register_rev8_wakeup(&scheduler)
         .await
         .context("register Rev.8 scheduler wakeup")?;
 
@@ -709,52 +712,37 @@ async fn run_juicefs_baseline(
 }
 
 /// Pause obsolete tasks before polling the queue, retaining their execution history.
-async fn retire_legacy_schedules(scheduler: &Scheduler) -> Result<(), SchedulerError> {
-    for schedule in scheduler.list_schedules().await? {
-        if schedule.type_name == "rbh.policy_run" && schedule.state == ScheduleState::Active {
-            scheduler.pause(&schedule.id).await?;
+async fn retire_persisted_schedules(store: &MysqlStore) -> Result<(), SchedulerError> {
+    for mut schedule in store.list_schedules().await? {
+        if matches!(
+            schedule.type_name.as_str(),
+            "rbh.policy_run" | rbh_policy::Rev8TickTask::TYPE_NAME
+        ) && schedule.state == ScheduleState::Active
+        {
+            schedule.state = ScheduleState::Paused;
+            schedule.updated_at = chrono::Utc::now();
+            store.update_schedule(&schedule).await?;
         }
     }
     Ok(())
 }
 
-/// Reinstall the wakeup trigger, which scheduler-rs holds in memory.
-async fn ensure_rev8_schedule(scheduler: &Scheduler) -> Result<(), SchedulerError> {
+async fn register_rev8_wakeup(scheduler: &Scheduler) -> Result<(), SchedulerError> {
     use scheduler_rs::trigger::IntervalTrigger;
 
-    const NAME: &str = "rbh.rev8.tick";
-    for schedule in scheduler.list_schedules_by_name_prefix(NAME).await? {
-        if schedule.name.as_deref() == Some(NAME) {
-            scheduler.remove(&schedule.id).await?;
-        }
-    }
     let config = ScheduleConfig {
         misfire_policy: MisfirePolicy::Coalesce,
         max_instances: 1,
         ..Default::default()
     };
-    let result = scheduler
+    scheduler
         .add_raw(
             rbh_policy::Rev8TickTask::TYPE_NAME.to_owned(),
             serde_json::Value::Null,
             Box::new(IntervalTrigger::every(rbh_policy::Rev8TickTask::INTERVAL)),
             config,
-            Some(NAME.to_owned()),
+            Some("rbh.rev8.tick".into()),
         )
-        .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            if scheduler
-                .list_schedules_by_name_prefix(NAME)
-                .await?
-                .iter()
-                .any(|schedule| schedule.name.as_deref() == Some(NAME))
-            {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-    }
+        .await?;
+    Ok(())
 }

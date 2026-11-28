@@ -304,15 +304,14 @@ impl LustreApi {
         ) {
             return Err(MigrationError::Deferred("volatile_layout_mismatch"));
         }
-        if FileVersion::from(&src.metadata()?) != expected {
+        let final_source = src.metadata()?;
+        if FileVersion::from(&final_source) != expected {
             return Err(MigrationError::Deferred("source_generation_changed"));
         }
+        check_access_time(&final_source, limits.expected_access)?;
         eligible_hsm(self, mount, fid)?;
         if !(limits.before_swap)() {
             return Err(MigrationError::Deferred("admission_window_closed"));
-        }
-        if limits.expected_access.is_some() {
-            check_access_time(&src.metadata()?, limits.expected_access)?;
         }
         check_deadline(deadline)?;
 

@@ -193,7 +193,7 @@ impl EntryStore {
     pub async fn get_scoped_entry(&self, key: &EntryKey) -> Result<Option<ScopedEntryRow>> {
         let (kind, bytes) = encode_object_id(*key.object());
         let row = sqlx::query(
-            r"SELECT entry_data
+            r"SELECT entry_data, atime
               FROM scoped_entries
               WHERE filesystem_id = ? AND object_kind = ? AND object_id = ?",
         )
@@ -340,7 +340,7 @@ impl EntryStore {
             ));
         }
         let row = sqlx::query(
-            "SELECT entry_data FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
+            "SELECT entry_data, atime FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
         )
         .bind(edge.filesystem.as_str())
         .bind(object_kind)
@@ -348,7 +348,7 @@ impl EntryStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(StoreError::InvalidObjectIdentity("hard link object is not cataloged"))?;
-        let mut entry: ScopedEntryRow = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("entry_data")?)?;
+        let mut entry = scoped_entry_from_row(&row)?;
         entry.nlink = entry.nlink.saturating_add(1);
         entry.last_seen = observed_at;
         sqlx::query(
@@ -405,7 +405,7 @@ impl EntryStore {
             return Ok(());
         }
         let row = sqlx::query(
-            "SELECT entry_data FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
+            "SELECT entry_data, atime FROM scoped_entries WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
         )
         .bind(key.filesystem().as_str())
         .bind(object_kind)
@@ -413,7 +413,7 @@ impl EntryStore {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(row) = row {
-            let mut entry: ScopedEntryRow = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("entry_data")?)?;
+            let mut entry = scoped_entry_from_row(&row)?;
             if !directory && entry.nlink > 1 {
                 entry.nlink -= 1;
                 entry.last_seen = observed_at;
@@ -581,7 +581,7 @@ impl EntryStore {
             _ => String::new(),
         };
         let sql = format!(
-            "SELECT entry_data FROM scoped_entries AS entries \
+            "SELECT entry_data, atime FROM scoped_entries AS entries \
              WHERE filesystem_id = ? AND ({where_clause}){order_clause} LIMIT ? OFFSET ?"
         );
         let mut query = sqlx::query(&sql).bind(filesystem.as_str());
@@ -596,9 +596,7 @@ impl EntryStore {
             .bind(offset as i64)
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter()
-            .map(|row| serde_json::from_slice(&row.try_get::<Vec<u8>, _>("entry_data")?).map_err(StoreError::from))
-            .collect()
+        rows.iter().map(scoped_entry_from_row).collect()
     }
 
     /// Page removed objects belonging to exactly one filesystem.
@@ -1188,6 +1186,14 @@ impl EntryStore {
             let mut observation = entry.layout_observed_at;
             let mut replace_stripes = true;
             if let Some((existing, previous_observation)) = lock_scoped_entry(&mut tx, &scoped.key).await? {
+                if scoped.kind == EntryKind::File
+                    && existing.kind == EntryKind::File
+                    && (scoped.size, scoped.mtime, scoped.ctime) == (existing.size, existing.mtime, existing.ctime)
+                {
+                    // A buffered scan can predate an atime observation
+                    // that has already committed for this generation.
+                    scoped.atime = scoped.atime.max(existing.atime);
+                }
                 scoped.sm_status = existing.sm_status;
                 replace_stripes = observation > previous_observation;
                 if !replace_stripes {
@@ -1230,15 +1236,17 @@ impl EntryStore {
     }
 
     /// Advance only atime for an existing FID whose catalog generation still matches.
+    #[tracing::instrument(skip(self), fields(%filesystem, %fid))]
     pub async fn advance_lustre_atime(
         &self, filesystem: &FileSystemId, fid: &LuFid, atime: i64, mtime: i64, ctime: i64,
     ) -> Result<bool> {
         let fid = fid_codec::encode(fid);
         let result = sqlx::query(
-            "UPDATE scoped_entries SET atime = ?
+            "UPDATE scoped_entries SET atime = ?, entry_data = JSON_SET(entry_data, '$.atime', ?)
              WHERE filesystem_id = ? AND object_kind = 0 AND object_id = ?
                AND kind = ? AND mtime = ? AND ctime = ? AND atime < ?",
         )
+        .bind(atime)
         .bind(atime)
         .bind(filesystem.as_str())
         .bind(fid.as_slice())
@@ -1856,8 +1864,7 @@ impl EntryStore {
 }
 
 fn decode_scoped_entry(row: sqlx::mysql::MySqlRow, key: &EntryKey) -> Result<ScopedEntryRow> {
-    let entry_data: Vec<u8> = row.try_get("entry_data")?;
-    let entry: ScopedEntryRow = serde_json::from_slice(&entry_data)?;
+    let entry = scoped_entry_from_row(&row)?;
     if entry.key != *key {
         return Err(StoreError::InvalidObjectIdentity(
             "scoped entry key does not match its primary key",
@@ -1866,12 +1873,19 @@ fn decode_scoped_entry(row: sqlx::mysql::MySqlRow, key: &EntryKey) -> Result<Sco
     Ok(entry)
 }
 
+fn scoped_entry_from_row(row: &sqlx::mysql::MySqlRow) -> Result<ScopedEntryRow> {
+    let mut entry: ScopedEntryRow = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("entry_data")?)?;
+    // The indexed timestamp may be ahead in catalogs written by older builds.
+    entry.atime = row.try_get("atime")?;
+    Ok(entry)
+}
+
 async fn lock_scoped_entry(
     tx: &mut sqlx::Transaction<'_, MySql>, key: &EntryKey,
 ) -> Result<Option<(ScopedEntryRow, Option<i64>)>> {
     let (kind, id) = encode_object_id(*key.object());
     let row = sqlx::query(
-        "SELECT entry_data, layout_observed_at FROM scoped_entries \
+        "SELECT entry_data, atime, layout_observed_at FROM scoped_entries \
          WHERE filesystem_id = ? AND object_kind = ? AND object_id = ? FOR UPDATE",
     )
     .bind(key.filesystem().as_str())

@@ -29,7 +29,7 @@ use crate::{
     Rev8TickTask,
     rev8::{
         ActionKind, BudgetLimits,
-        execution::{Decision, FidObservation, NativeHsm, read_only_lustre},
+        execution::{Decision, FidObservation, NativeHsm, SubmissionDeferral, SubmissionGate, lustre_call},
         heat, push_expression,
         resources::safety_matches,
     },
@@ -177,7 +177,7 @@ impl PolicyStore {
             }
         };
         let operation = self
-            .reserve_operation(dispatch, candidate, invocation, &generation, Some(&plan))
+            .reserve_operation(dispatch, candidate, invocation, &generation, Some(&plan), &self.pool)
             .await?;
         let mut tx = self.pool.begin().await?;
         let active = current_revision(&mut tx, dispatch.run).await?;
@@ -195,16 +195,23 @@ impl PolicyStore {
         } else if Instant::now() < deadline {
             let expected = file_version(&generation);
             let mount = dispatch.config.mount_path.clone();
+            let window_open = dispatch.admission.window_check();
+            let (swap_gate, _owner) = SubmissionGate::owned(move || {
+                if window_open() {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(SubmissionDeferral::WindowClosed)
+                }
+            });
             let limits = MigrationLimits {
                 deadline,
                 expected_access,
-                before_swap: dispatch.admission.window_check(),
+                before_swap: move || swap_gate.check().is_continue(),
             };
             // Moving this guard into the closure retains ownership for the
             // real blocking operation, even after the run budget expires.
-            let migration = tokio::task::spawn_blocking(move || {
-                LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, ownership)
-            });
+            let migration =
+                lustre_call(move || LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, ownership));
             match tokio::time::timeout_at(deadline.into(), migration).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => Err(MigrationError::Uncertain(error.to_string())),
@@ -437,7 +444,7 @@ async fn observe_pool_source(
     if Instant::now() >= deadline {
         return Err(PreflightWait::TimedOut.migration_reason().into());
     }
-    let layout = read_only_lustre(move || LustreApi.migration_source_layout(&mount, &fid))
+    let layout = lustre_call(move || LustreApi.migration_source_layout(&mount, &fid))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;

@@ -3,13 +3,14 @@
 mod governance;
 
 use std::{
+    collections::BTreeSet,
     io,
     ops::ControlFlow,
     os::unix::fs::MetadataExt,
     path::Path,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
     },
     thread,
 };
@@ -61,6 +62,12 @@ impl Generation {
             && self.mtime == current.mtime
             && self.mtime_nanos == current.mtime_nanos
     }
+
+    pub(crate) fn same_mount(&self, current: &Self) -> bool {
+        self.filesystem_name == current.filesystem_name
+            && self.mount_source_id.is_some()
+            && self.mount_source_id == current.mount_source_id
+    }
 }
 
 pub enum FidObservation {
@@ -75,7 +82,7 @@ pub struct Observation {
     pub state: HsmUserStateInfo,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Submission {
     Accepted,
     Deferred(SubmissionDeferral),
@@ -95,6 +102,10 @@ pub enum SubmissionDeferral {
     MountChanged,
     MountIdentityUnavailable,
     DispatchCancelled,
+    TickBudget,
+    ActuatorBusy,
+    PolicyInactive,
+    PermitStoreNotSynchronous,
 }
 
 impl SubmissionDeferral {
@@ -106,6 +117,10 @@ impl SubmissionDeferral {
             Self::MountChanged => "hsm_mount_changed",
             Self::MountIdentityUnavailable => "hsm_mount_identity_unavailable",
             Self::DispatchCancelled => "native_hsm_dispatch_cancelled",
+            Self::TickBudget => "native_hsm_submission_tick_budget",
+            Self::ActuatorBusy => "native_hsm_actuator_busy",
+            Self::PolicyInactive => "policy_revision_inactive",
+            Self::PermitStoreNotSynchronous => "permit_store_requires_synchronous_commit",
         }
     }
 }
@@ -113,14 +128,28 @@ impl SubmissionDeferral {
 /// Checks admission and claims the request at the ioctl boundary.
 pub struct SubmissionGate {
     status: Box<dyn Fn() -> ControlFlow<SubmissionDeferral> + Send>,
-    open: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
+    _slot: Option<NativeSubmissionSlot>,
 }
 
-pub(crate) struct SubmissionOwner(Arc<AtomicBool>);
+const OPEN: u8 = 0;
+const CLAIMED: u8 = 1;
+const CANCELLED: u8 = 2;
+
+pub(crate) struct SubmissionOwner(Arc<AtomicU8>);
+
+impl SubmissionOwner {
+    /// Revoke the request, returning whether it has already reached the ioctl boundary.
+    pub(crate) fn revoke_unless_claimed(&self) -> bool {
+        self.0
+            .compare_exchange(OPEN, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+            == Err(CLAIMED)
+    }
+}
 
 impl Drop for SubmissionOwner {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.revoke_unless_claimed();
     }
 }
 
@@ -128,19 +157,25 @@ impl SubmissionGate {
     pub(crate) fn owned(
         status: impl Fn() -> ControlFlow<SubmissionDeferral> + Send + 'static,
     ) -> (Self, SubmissionOwner) {
-        let open = Arc::new(AtomicBool::new(true));
-        let owner = SubmissionOwner(Arc::clone(&open));
+        let state = Arc::new(AtomicU8::new(OPEN));
+        let owner = SubmissionOwner(Arc::clone(&state));
         (
             Self {
                 status: Box::new(status),
-                open,
+                state,
+                _slot: None,
             },
             owner,
         )
     }
 
+    pub(crate) fn holding(mut self, slot: NativeSubmissionSlot) -> Self {
+        self._slot = Some(slot);
+        self
+    }
+
     pub(crate) fn status(&self) -> ControlFlow<SubmissionDeferral> {
-        if !self.open.load(Ordering::Acquire) {
+        if self.state.load(Ordering::Acquire) != OPEN {
             return ControlFlow::Break(SubmissionDeferral::DispatchCancelled);
         }
         (self.status)()
@@ -149,11 +184,15 @@ impl SubmissionGate {
     /// Claim a single request. A successful claim is the handoff to the
     /// ioctl. Losing the owner before the claim prevents that handoff.
     pub fn check(&self) -> ControlFlow<SubmissionDeferral> {
-        if self.open.swap(false, Ordering::AcqRel) {
-            (self.status)()
-        } else {
-            ControlFlow::Break(SubmissionDeferral::DispatchCancelled)
+        self.status()?;
+        if self
+            .state
+            .compare_exchange(OPEN, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return ControlFlow::Break(SubmissionDeferral::DispatchCancelled);
         }
+        ControlFlow::Continue(())
     }
 }
 
@@ -199,17 +238,38 @@ pub trait NativeHsm: Send + Sync {
 
 pub struct LustreHsm;
 
-// A cancelled async worker can leave a blocking ioctl alive. Retain
-// serialization in the local actuator until the actual system call returns.
-static NATIVE_SUBMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// Keep a slot occupied until the system call returns, including after a timeout.
+static NATIVE_SUBMISSIONS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+const MAX_NATIVE_SUBMISSIONS: usize = 64;
 
-pub(crate) async fn read_only_lustre<T: Send + 'static>(read: impl FnOnce() -> T + Send + 'static) -> io::Result<T> {
+pub(crate) struct NativeSubmissionSlot(String);
+
+impl NativeSubmissionSlot {
+    pub(crate) fn acquire(filesystem: &str) -> Option<Self> {
+        let mut active = NATIVE_SUBMISSIONS.lock().ok()?;
+        if active.len() >= MAX_NATIVE_SUBMISSIONS || active.contains(filesystem) {
+            return None;
+        }
+        active.insert(filesystem.to_owned());
+        Some(Self(filesystem.to_owned()))
+    }
+}
+
+impl Drop for NativeSubmissionSlot {
+    fn drop(&mut self) {
+        if let Ok(mut active) = NATIVE_SUBMISSIONS.lock() {
+            active.remove(&self.0);
+        }
+    }
+}
+
+pub(crate) async fn lustre_call<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static) -> io::Result<T> {
     let (result, pending) = tokio::sync::oneshot::channel();
-    // Use a dedicated read-only worker so a stalled Lustre syscall cannot
-    // keep the Tokio runtime open when the daemon stops.
-    thread::Builder::new().name("rev8-lustre-read".into()).spawn(move || {
-        if result.send(read()).is_err() {
-            tracing::debug!("discarding observation after the background worker stopped");
+    // A stalled syscall may outlive its async waiter and must not keep the
+    // runtime open. Mutation callers retain their durable operation intent.
+    thread::Builder::new().name("rev8-lustre".into()).spawn(move || {
+        if result.send(call()).is_err() {
+            tracing::debug!("Lustre call returned after its waiter stopped");
         }
     })?;
     pending.await.map_err(io::Error::other)
@@ -263,7 +323,7 @@ impl NativeHsm for LustreHsm {
     #[tracing::instrument(skip_all, fields(mount = %mount.display(), %fid))]
     async fn observe_in_background(&self, mount: &Path, fid: LuFid) -> Result<FidObservation, String> {
         let mount = mount.to_owned();
-        read_only_lustre(move || observe_fid(&mount, fid))
+        lustre_call(move || observe_fid(&mount, fid))
             .await
             .map_err(|error| error.to_string())?
     }
@@ -278,13 +338,7 @@ impl NativeHsm for LustreHsm {
 
         let mount = mount.to_owned();
         let expected_source_id = expected.mount_source_id.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let Ok(_guard) = NATIVE_SUBMISSION.try_lock() else {
-                return Submission::Rejected {
-                    error: "local actuator is unavailable or still submitting an earlier request".into(),
-                    class: None,
-                };
-            };
+        let result = lustre_call(move || {
             if let Err(error) = LustreApi.hsm_filesystem(&mount) {
                 let class = match &error {
                     Io(error) if error.raw_os_error() == Some(libc::EIO) => TerminalError::TransientIo,

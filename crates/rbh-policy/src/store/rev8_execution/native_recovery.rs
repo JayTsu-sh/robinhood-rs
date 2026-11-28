@@ -35,6 +35,7 @@ pub(in crate::store) struct NativeRecovery {
 enum Settlement {
     Completed(Json<Value>),
     TargetNotReached(Json<Value>),
+    SourceGenerationChanged(Json<Value>),
     FidMissing(Json<Value>),
 }
 
@@ -72,7 +73,10 @@ impl PolicyStore {
         for operation in pending {
             let filesystem =
                 FileSystemId::new(&operation.filesystem).map_err(|error| PolicyError::Store(error.to_string()))?;
-            self.start_native_recovery(entries, filesystem, operation).await?;
+            let id = operation.id;
+            if let Err(error) = self.start_native_recovery(entries, filesystem, operation).await {
+                tracing::warn!(operation_id = id, %error, "will retry starting HSM recovery");
+            }
         }
         Ok(())
     }
@@ -150,10 +154,9 @@ impl PolicyStore {
             let mut observation = observe().await;
             let confirmed_idle = if accepted
                 && let (Some(generation), Some(FidObservation::Present(observed))) = (&generation, &observation)
-                && generation.mount_source_id.is_some()
-                && generation.same_content(&observed.generation)
+                && generation.same_mount(&observed.generation)
                 && observed.state.coordinator_idle()
-                && !invocation.completed(&observed.state)
+                && !(generation.same_content(&observed.generation) && invocation.completed(&observed.state))
             {
                 // The first flags may predate completion because the current
                 // action is queried last. Reread flags after observing idle.
@@ -176,7 +179,7 @@ impl PolicyStore {
         Ok(())
     }
 
-    pub(super) async fn finish_native_recoveries(&self) -> Result<(), PolicyError> {
+    pub(super) async fn finish_native_recoveries(&self) {
         // Harvest only completed observations under the catalog worker permit.
         let finished: Vec<_> = self
             .native_recoveries
@@ -195,10 +198,13 @@ impl PolicyStore {
                 tracing::warn!(operation_id = id, %error, "native HSM recovery worker failed");
                 None
             });
-            self.settle_native_recovery(&recovery.operation, settlement, Some(&recovery.mount))
-                .await?;
+            if let Err(error) = self
+                .settle_native_recovery(&recovery.operation, settlement, Some(&recovery.mount))
+                .await
+            {
+                tracing::warn!(operation_id = id, %error, "will retry publishing HSM recovery");
+            }
         }
-        Ok(())
     }
 
     async fn settle_native_recovery(
@@ -211,6 +217,9 @@ impl PolicyStore {
             Some(Settlement::Completed(evidence)) => ("completed", None, Some(evidence)),
             Some(Settlement::TargetNotReached(evidence)) => {
                 ("failed", Some("hsm_target_state_not_reached"), Some(evidence))
+            }
+            Some(Settlement::SourceGenerationChanged(evidence)) => {
+                ("failed", Some("hsm_source_generation_changed"), Some(evidence))
             }
             Some(Settlement::FidMissing(evidence)) => ("failed", Some("fid_missing"), Some(evidence)),
             // An interrupted ioctl can still be in progress even if the coordinator is idle.
@@ -273,11 +282,15 @@ fn native_settlement(
 ) -> Option<Settlement> {
     let generation = generation?;
     match observation? {
-        FidObservation::Present(observed) if generation.same_content(&observed.generation) => {
-            let completed = invocation.completed(&observed.state);
+        FidObservation::Present(observed) => {
+            let same_content = generation.same_content(&observed.generation);
+            let completed = same_content && invocation.completed(&observed.state);
             let source = if completed {
                 "lustre_hsm_state"
-            } else if confirmed_idle && observed.state.coordinator_idle() && consistent_hsm_flags(observed.state.states)
+            } else if confirmed_idle
+                && generation.same_mount(&observed.generation)
+                && observed.state.coordinator_idle()
+                && consistent_hsm_flags(observed.state.states)
             {
                 "lustre_hsm_current_action"
             } else {
@@ -289,8 +302,10 @@ fn native_settlement(
             }));
             Some(if completed {
                 Settlement::Completed(evidence)
-            } else {
+            } else if same_content {
                 Settlement::TargetNotReached(evidence)
+            } else {
+                Settlement::SourceGenerationChanged(evidence)
             })
         }
         FidObservation::Missing { mount_source_id }

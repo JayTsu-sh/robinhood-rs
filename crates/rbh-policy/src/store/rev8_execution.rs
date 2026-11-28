@@ -3,7 +3,7 @@ mod native_admission;
 mod native_recovery;
 mod preflight;
 pub(super) use migration::{PoolPreflight, PoolRecovery};
-pub(super) use native_admission::NativePreflight;
+pub(super) use native_admission::{NativePreflight, NativeSubmissionJob};
 pub(super) use native_recovery::NativeRecovery;
 pub(super) use preflight::Preflights;
 
@@ -19,7 +19,7 @@ use lustre_api::{LuFid, migration::MigrationPlan};
 use rbh_entry_store::{EntryStore, FileSystemConfig, fid_codec};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::{MySql, QueryBuilder, Transaction, types::Json};
+use sqlx::{MySql, MySqlExecutor, QueryBuilder, Transaction, types::Json};
 
 use super::PolicyStore;
 use crate::{
@@ -776,7 +776,7 @@ impl PolicyStore {
 
     async fn reserve_operation(
         &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: &Invocation, generation: &Generation,
-        migration: Option<&MigrationPlan>,
+        migration: Option<&MigrationPlan>, store: impl MySqlExecutor<'_>,
     ) -> Result<u64, PolicyError> {
         let runtime = self.runtime.as_ref().expect("dispatch requires a runtime");
         Ok(sqlx::query(
@@ -794,7 +794,7 @@ impl PolicyStore {
         .bind(Json(&runtime.principal))
         .bind(&dispatch.admission.profile.name)
         .bind(migration.map(Json))
-        .execute(&self.pool)
+        .execute(store)
         .await?
         .last_insert_id())
     }
@@ -819,8 +819,9 @@ impl PolicyStore {
     }
 
     async fn reconcile_operations(&self, entries: &EntryStore) -> Result<(), PolicyError> {
+        self.finish_native_submissions().await;
         self.finish_pool_recoveries(entries).await?;
-        self.finish_native_recoveries().await?;
+        self.finish_native_recoveries().await;
         self.start_pending_pool_recoveries(entries).await?;
         self.start_pending_native_recoveries(entries).await
     }
