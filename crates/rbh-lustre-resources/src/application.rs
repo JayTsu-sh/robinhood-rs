@@ -4,10 +4,10 @@ use std::{
     time::Duration,
 };
 
-use futures_util::future::join_all;
+use futures_util::{Stream, future::join_all, stream};
 use rbh_entry_store::{BackendKind, FileSystemConfig, FileSystemId};
 use sqlx::MySqlPool;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::{
     capacity::CapacityHistory,
@@ -18,12 +18,20 @@ use crate::{
 
 type RefreshResult = watch::Receiver<Option<Result<(), String>>>;
 
+#[derive(Clone)]
+pub enum ResourceUpdate {
+    Snapshot(FileSystemId),
+    Management(Option<FileSystemId>),
+    Resync,
+}
+
 /// Daemon registration, read access to saved observations, and collection on demand.
 #[derive(Clone)]
 pub struct ResourceObservations {
     snapshots: SnapshotRepository,
     probes: Arc<RwLock<BTreeMap<FileSystemId, Arc<RegisteredResource>>>>,
     boot_id: Option<Arc<str>>,
+    updates: broadcast::Sender<ResourceUpdate>,
     stopping: watch::Sender<bool>,
 }
 
@@ -64,6 +72,7 @@ impl ResourceObservations {
             snapshots: SnapshotRepository::new(pool, observer_id),
             probes: Arc::new(RwLock::new(probes)),
             boot_id,
+            updates: broadcast::channel(128).0,
             stopping: watch::channel(false).0,
         }
     }
@@ -74,6 +83,35 @@ impl ResourceObservations {
 
     pub fn stop(&self) {
         self.stopping.send_replace(true);
+    }
+
+    /// Subscribe to invalidations for this daemon until resource observation stops.
+    pub fn updates(&self) -> impl Stream<Item = ResourceUpdate> + use<> {
+        stream::unfold(
+            (self.updates.subscribe(), self.stopping.subscribe()),
+            |(mut updates, mut stopping)| async move {
+                let update = tokio::select! {
+                    biased;
+                    _ = stopping.wait_for(|stopping| *stopping) => return None,
+                    update = updates.recv() => match update {
+                        Ok(update) => update,
+                        Err(broadcast::error::RecvError::Lagged(_)) => ResourceUpdate::Resync,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    },
+                };
+                Some((update, (updates, stopping)))
+            },
+        )
+    }
+
+    /// Invalidate a registration, or the live mount inventory when no ID is supplied.
+    pub fn management_changed(&self, id: Option<FileSystemId>) {
+        self.publish(ResourceUpdate::Management(id));
+    }
+
+    fn publish(&self, update: ResourceUpdate) {
+        // Browsers can read current state on connect even if nobody was subscribed at write time.
+        let _ = self.updates.send(update);
     }
 
     fn probe(&self, id: &FileSystemId) -> Option<Arc<RegisteredResource>> {
@@ -221,6 +259,7 @@ impl ResourceObservations {
                     .await
                     .map_err(|error| error.to_string())?
                 {
+                    self.publish(ResourceUpdate::Snapshot(config.id.clone()));
                     return Ok(());
                 }
             }

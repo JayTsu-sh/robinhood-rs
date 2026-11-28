@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import type { FilesystemResource } from '../src/services/tiering';
+import { controlResourceEvents } from './resource-events';
 
 test('sidebar groups Lustre resources above data tiering', async ({ page }) => {
   await page.goto('/console/');
@@ -188,6 +189,8 @@ test('policies show saved values and distinguish empty, filtered, and failed req
 });
 
 test('Lustre resource list shows the prototype columns, pool counts and collection failures', async ({ page }) => {
+  const send = await controlResourceEvents(page);
+  let name = '测试集群';
   let mountMissing = false;
   let managementFails = false;
   await page.route('**/api/filesystems/management', (route) => managementFails
@@ -196,15 +199,14 @@ test('Lustre resource list shows the prototype columns, pool counts and collecti
       json: {
         canCreateMount: false, availableMounts: [],
         resources: [{
-          id: 'lab-a', name: '测试集群', owner: 'external', source: '10.1.2.3@tcp:/oldlab',
+          id: 'lab-a', name, owner: 'external', source: '10.1.2.3@tcp:/oldlab',
           lastMountError: '连接超时',
         }],
       },
     }));
-  await page.route('**/api/filesystems/refresh', (route) => {
-    expect(route.request().method()).toBe('POST');
-    mountMissing = true;
-    return route.fulfill({ status: 204 });
+  const collections: string[] = [];
+  page.on('request', (request) => {
+    if (new URL(request.url()).pathname === '/api/filesystems/refresh') collections.push(request.method());
   });
   await page.route('**/api/filesystems', (route) => route.fulfill({
     json: [{
@@ -244,9 +246,10 @@ test('Lustre resource list shows the prototype columns, pool counts and collecti
   await expect(row).toContainText('部分采集');
   await row.getByRole('button', { name: '查看原因' }).click();
   await expect(page.getByText('unknown · 采集失败')).toBeVisible();
-  await page.getByRole('button', { name: '刷新资源' }).click();
+  await expect(page.getByRole('button', { name: '刷新资源' })).toHaveCount(0);
+  mountMissing = true;
+  await send('snapshot', 'lab-a');
   await expect(row).toContainText('未挂载');
-  await expect(page.getByText('资源已刷新', { exact: true })).toBeVisible();
   await expect(row.getByRole('cell').nth(0)).toHaveText('测试集群oldlab · lab-a');
   await expect(row.getByRole('cell').nth(4)).toHaveText('—');
   await expect(row).toContainText('配置路径未挂载 Lustre');
@@ -254,11 +257,16 @@ test('Lustre resource list shows the prototype columns, pool counts and collecti
   await expect(page.getByText('连接超时', { exact: true })).toBeVisible();
 
   managementFails = true;
-  await page.getByRole('button', { name: '刷新资源' }).click();
+  await send('management', '*');
   await expect(page.getByRole('alert')).toContainText('无法读取注册信息');
   await expect(row).toContainText('外部管理');
   await expect(page.getByRole('button', { name: '添加集群' })).toHaveCount(0);
-  await expect(page.getByText('资源已刷新', { exact: true })).toHaveCount(0, { timeout: 1_000 });
+  managementFails = false;
+  name = '恢复连接后更新的集群';
+  await send('disconnect');
+  await expect(page.getByRole('link', { name })).toBeVisible({ timeout: 8_000 });
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  expect(collections).toEqual([]);
 });
 
 test('an unsaved tiering preview uses the selected pool pair and invalidates old results', async ({ page }) => {

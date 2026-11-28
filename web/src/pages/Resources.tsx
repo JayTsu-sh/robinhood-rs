@@ -1,6 +1,6 @@
 import { Link, history } from '@umijs/max';
-import { Alert, Button, message, Popover, Select, Table, type TableColumnsType } from 'antd';
-import { useEffect, useRef, useState } from 'react';
+import { Alert, Button, Popover, Select, Table, type TableColumnsType } from 'antd';
+import { useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
 import ResourceManagement, { useResourceManagement } from '@/components/ResourceManagement';
 import {
@@ -8,8 +8,9 @@ import {
   formatObservationTime, formatUsage, useObservationClock,
 } from '@/components/ResourceStatus';
 import { resourceOwnerLabels, type ResourceRegistration } from '@/services/resourceManagement';
-import { filesystemDetailsPath, listFilesystems, refreshFilesystems, type FilesystemResource } from '@/services/tiering';
+import { filesystemDetailsPath, listFilesystems, type FilesystemResource } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
+import { useResourceEvents } from '@/services/useResourceEvents';
 import './resources.css';
 
 function resourceColumns(
@@ -134,19 +135,12 @@ function resourceColumns(
 }
 
 export default function Resources() {
-  const { state, refresh } = useInventory(listFilesystems, refreshFilesystems);
-  const { management, error: managementError, refresh: reloadManagement, refreshing: reloadingManagement } =
-    useResourceManagement({ keepPrevious: true });
-  const [notifications, notificationContext] = message.useMessage();
-  const refreshRequested = useRef(false);
+  const { state, refresh } = useInventory(listFilesystems, listFilesystems, { keepPrevious: true, queueRefresh: true });
+  const { management, error: managementError, refresh: reloadManagement } = useResourceManagement();
+  useResourceEvents(refresh, reloadManagement);
   const registrations = new Map(management?.resources.map((resource) => [resource.id, resource]));
   const now = useObservationClock();
   const [availability, setAvailability] = useState('all');
-  useEffect(() => {
-    if (!refreshRequested.current || state.status === 'loading' || reloadingManagement) return;
-    refreshRequested.current = false;
-    if (state.status === 'ready' && !managementError) void notifications.success('资源已刷新');
-  }, [managementError, notifications, reloadingManagement, state.status]);
 
   const allRows = state.status === 'ready' ? state.data : [];
   const rows = allRows.filter(
@@ -171,31 +165,26 @@ export default function Resources() {
   ];
 
   function refreshResources() {
-    notifications.destroy();
     refresh();
     reloadManagement();
   }
 
   return (
     <div className="lustre-resources">
-      {notificationContext}
       <InventoryPage
         title="Lustre 集群"
         description="管理本机客户端接入的 Lustre 文件系统、挂载及分层所需资源。"
         status={state.status}
         error={state.status === 'error' ? state.message : undefined}
-        refresh={() => {
-          refreshRequested.current = true;
-          refreshResources();
-        }}
-        refreshLabel="刷新资源"
-        refreshing={reloadingManagement}
-        primaryAction={management && !managementError && !reloadingManagement && (
-          <ResourceManagement management={management} onRefresh={refreshResources} />
+        refreshError={state.status === 'ready' ? state.refreshError : undefined}
+        retry={refreshResources}
+        primaryAction={management && (
+          <ResourceManagement management={management} canAdd={!managementError} onRefresh={refreshResources} />
         )}
       >
         {managementError && (
-          <Alert type="warning" showIcon message="集群接入信息读取失败" description={managementError} />
+          <Alert type="warning" showIcon message="集群接入信息读取失败" description={managementError}
+            action={<Button onClick={reloadManagement}>重试</Button>} />
         )}
         <dl className="lustre-metrics">
           {metrics.map(({ label, value, caption, color }) => (

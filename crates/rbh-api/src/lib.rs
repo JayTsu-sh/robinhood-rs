@@ -16,6 +16,7 @@
 //! * `POST /api/scans` — start a filesystem scan
 //! * `GET /api/filesystems` — registered Lustre inventory on the daemon router
 //! * `GET /api/filesystems/detail?filesystem=ID` — read one saved resource snapshot
+//! * `GET /api/filesystems/events` — subscribe to Lustre resource updates
 //! * `POST /api/filesystems/refresh` — collect and save all or one registered Lustre resource
 //!
 //! Policy configuration writes use server-configured writer identities.

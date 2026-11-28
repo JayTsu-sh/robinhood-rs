@@ -7,13 +7,14 @@ import {
 import { writeError, writerTransportAllowed } from '@/services/policies';
 import { requestError, useInventory } from '@/services/useInventory';
 
-export function useResourceManagement({ keepPrevious = false } = {}) {
-  const { state, refresh, refreshing } = useInventory(listResourceManagement, listResourceManagement, { keepPrevious });
+export function useResourceManagement() {
+  const { state, refresh } = useInventory(listResourceManagement, listResourceManagement, {
+    keepPrevious: true, queueRefresh: true,
+  });
   return {
     management: state.status === 'ready' ? state.data : undefined,
     error: state.status === 'error' ? state.message : state.status === 'ready' ? state.refreshError : undefined,
     refresh,
-    refreshing,
   };
 }
 
@@ -44,9 +45,13 @@ interface Props {
   pools?: string[];
   mounted?: boolean;
   onRefresh: (removed?: boolean) => void;
+  canAdd?: boolean;
+  onRemoving?: (resource: ResourceRegistration | undefined) => void;
 }
 
-export default function ResourceManagement({ management, resource, pools = [], mounted, onRefresh }: Props) {
+export default function ResourceManagement({
+  management, resource, pools = [], mounted, onRefresh, canAdd = true, onRemoving,
+}: Props) {
   const [form] = Form.useForm<Values>();
   const mode = Form.useWatch('mode', form) ?? 'existing';
   const [action, setAction] = useState<Action>();
@@ -97,6 +102,7 @@ export default function ResourceManagement({ management, resource, pools = [], m
     };
     const request = new AbortController();
     pending.current = request;
+    if (action === 'remove') onRemoving?.(resource);
     setOperation(command);
     setNotice(undefined);
     setError(undefined);
@@ -122,7 +128,10 @@ export default function ResourceManagement({ management, resource, pools = [], m
       }
     } finally {
       pending.current = undefined;
-      if (!request.signal.aborted) setOperation(undefined);
+      if (!request.signal.aborted) {
+        if (action === 'remove') onRemoving?.(undefined);
+        setOperation(undefined);
+      }
     }
   }
 
@@ -136,7 +145,7 @@ export default function ResourceManagement({ management, resource, pools = [], m
           <Button onClick={() => open(mounted ? 'unmount' : 'mount')}>{mounted ? labels.unmount : labels.mount}</Button>
         </>}
         {resource.owner !== 'deployment' && <Button danger onClick={() => open('remove')}>{labels.remove}</Button>}
-      </Space> : <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={() => open('add')}>添加集群</Button>}
+      </Space> : canAdd && <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={() => open('add')}>添加集群</Button>}
       <Modal title={action && labels[action]} open={action !== undefined} onCancel={close}
         closable={!operation} maskClosable={false} keyboard={!operation} destroyOnHidden
         footer={<Flex align="center" gap={8} justify="end">

@@ -1,12 +1,58 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use axum_test::TestServer;
 use rbh_entry_store::store::EntryStore;
 use rbh_entry_store::{BackendCapabilities, BackendKind, FileSystemConfig, FileSystemId};
 use rbh_lustre_resources::ResourceObservations;
 use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    time::timeout,
+};
 
 use crate::{PolicyWriters, handlers::scoped_api_tests::state_without_database_connection};
+
+async fn read_event_line(stream: &mut BufReader<TcpStream>, expected: &str) {
+    timeout(Duration::from_secs(5), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(stream.read_line(&mut line).await.unwrap(), 0, "missing {expected}");
+            if line.trim_end() == expected {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected}"));
+}
+
+async fn open_resource_events(server: &TestServer) -> BufReader<TcpStream> {
+    let address = server.server_address().unwrap();
+    let mut socket = TcpStream::connect((address.host_str().unwrap(), address.port().unwrap()))
+        .await
+        .unwrap();
+    socket
+        .write_all(b"GET /api/filesystems/events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut stream = BufReader::new(socket);
+    read_event_line(&mut stream, "HTTP/1.1 200 OK").await;
+    read_event_line(&mut stream, "content-type: text/event-stream").await;
+    read_event_line(&mut stream, ": connected").await;
+    stream
+}
+
+async fn expect_resource_event(stream: &mut BufReader<TcpStream>, kind: &str, filesystem: &str) {
+    read_event_line(stream, &format!("event: {kind}")).await;
+    let mut data = String::new();
+    timeout(Duration::from_secs(5), stream.read_line(&mut data))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.trim_end(), format!("data: {filesystem}"));
+}
 
 #[tokio::test]
 #[ignore = "requires isolated MariaDB"]
@@ -32,7 +78,15 @@ async fn console_registration_is_authorized_and_restored_without_mounting() {
     )
     .unwrap();
     let initial = resources();
-    let mut server = TestServer::new(admin(initial.clone()).routes(writer.clone())).unwrap();
+    let mut server = TestServer::builder()
+        .http_transport()
+        .build(
+            admin(initial.clone())
+                .routes(writer.clone())
+                .merge(crate::console::router(initial.clone(), directory.path().to_owned())),
+        )
+        .unwrap();
+    let mut events = open_resource_events(&server).await;
     let id = FileSystemId::new(format!("mount-{}", &observer[..12])).unwrap();
     let endpoint = "/api/filesystems/management";
     let request = json!({
@@ -62,12 +116,17 @@ async fn console_registration_is_authorized_and_restored_without_mounting() {
         .assert_status(StatusCode::CREATED);
     assert!(initial.contains(&id));
     assert!(!root.join(id.as_str()).exists());
+    expect_resource_event(&mut events, "management", id.as_str()).await;
+    expect_resource_event(&mut events, "snapshot", id.as_str()).await;
     let resource = format!("{endpoint}/{id}");
     server
         .post(&resource)
         .json(&json!({"action":"rename","name":"已改名"}))
         .await
         .assert_status(StatusCode::NO_CONTENT);
+    expect_resource_event(&mut events, "management", id.as_str()).await;
+    let view = server.get(endpoint).await.json::<Value>();
+    assert_eq!(view["resources"][0]["name"], "已改名");
     server
         .post(&resource)
         .json(&json!({"action":"set_tier","pool":"cold","tier":"cold"}))
@@ -88,6 +147,31 @@ async fn console_registration_is_authorized_and_restored_without_mounting() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
     assert!(!next.contains(&id));
+}
+
+#[tokio::test]
+async fn console_resource_stream_publishes_mount_updates_without_registrations_and_closes_on_shutdown() {
+    let assets = tempfile::tempdir().unwrap();
+    let state = state_without_database_connection();
+    let resources = ResourceObservations::new(state.entry_store.pool().clone(), "test".to_owned(), Vec::new());
+    let server = TestServer::builder()
+        .http_transport()
+        .build(crate::router_with_console(
+            state,
+            PolicyWriters::default(),
+            resources.clone(),
+            assets.path().to_owned(),
+        ))
+        .unwrap();
+
+    let mut events = open_resource_events(&server).await;
+    resources.management_changed(None);
+    expect_resource_event(&mut events, "management", "*").await;
+    resources.stop();
+    timeout(Duration::from_secs(5), events.read_to_end(&mut Vec::new()))
+        .await
+        .expect("stopping resource observations must close the stream")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -144,13 +228,16 @@ async fn resource_inventory_reads_saved_snapshots_and_refreshes_only_the_selecte
     let other_observer = ResourceObservations::new(store.pool().clone(), "observer-b".to_owned(), configs.clone());
     let restarted = ResourceObservations::new(store.pool().clone(), "observer-a".to_owned(), configs.clone());
     let resources = ResourceObservations::new(store.pool().clone(), "observer-a".to_owned(), configs);
-    let server = TestServer::new(crate::router_with_console(
-        state_without_database_connection(),
-        PolicyWriters::default(),
-        resources,
-        temp.path().to_owned(),
-    ))
-    .unwrap();
+    let server = TestServer::builder()
+        .http_transport()
+        .build(crate::router_with_console(
+            state_without_database_connection(),
+            PolicyWriters::default(),
+            resources,
+            temp.path().to_owned(),
+        ))
+        .unwrap();
+    let mut events = open_resource_events(&server).await;
 
     let target = "/api/filesystems/detail?filesystem=missing";
     let before = server.get(target).await.json::<Value>();
@@ -160,6 +247,7 @@ async fn resource_inventory_reads_saved_snapshots_and_refreshes_only_the_selecte
         .post("/api/filesystems/refresh?filesystem=missing")
         .await
         .assert_status(axum::http::StatusCode::NO_CONTENT);
+    expect_resource_event(&mut events, "snapshot", "missing").await;
     let saved = server.get(target).await.json::<Value>();
     assert_eq!(saved["collectionStatus"], "unavailable");
     let same_filesystem = FileSystemId::new("missing").unwrap();

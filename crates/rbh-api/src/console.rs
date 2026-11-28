@@ -1,17 +1,21 @@
 //! Same-origin console assets and Lustre resource snapshot endpoints.
 
-use std::path::PathBuf;
+use std::{convert::Infallible, path::PathBuf};
 
 use axum::{
     Json, Router,
     extract::{Query, State},
     http::{HeaderValue, StatusCode, header},
     middleware,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::{get, post},
 };
+use futures_util::{StreamExt, future, stream};
 use rbh_entry_store::FileSystemId;
-use rbh_lustre_resources::ResourceObservations;
+use rbh_lustre_resources::{ResourceObservations, ResourceUpdate};
 use serde::Deserialize;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
@@ -21,6 +25,7 @@ pub(crate) fn router(resources: ResourceObservations, assets_dir: PathBuf) -> Ro
     let resources = Router::new()
         .route("/api/filesystems", get(list_filesystems))
         .route("/api/filesystems/detail", get(get_filesystem))
+        .route("/api/filesystems/events", get(resource_events))
         .route("/api/filesystems/refresh", post(refresh_filesystems))
         .with_state(resources);
     let assets = Router::new()
@@ -32,6 +37,24 @@ pub(crate) fn router(resources: ResourceObservations, assets_dir: PathBuf) -> Ro
             response
         }));
     resources.merge(assets).layer(TraceLayer::new_for_http())
+}
+
+#[tracing::instrument(skip_all)]
+async fn resource_events(State(resources): State<ResourceObservations>) -> impl IntoResponse {
+    let updates = resources.updates().map(|update| match update {
+        ResourceUpdate::Snapshot(id) => Event::default().event("snapshot").data(id.as_str()),
+        ResourceUpdate::Management(id) => Event::default()
+            .event("management")
+            .data(id.as_ref().map_or("*", FileSystemId::as_str)),
+        ResourceUpdate::Resync => Event::default().event("resync").data("*"),
+    });
+    let events = stream::once(future::ready(Event::default().comment("connected")))
+        .chain(updates)
+        .map(Ok::<_, Infallible>);
+    (
+        [("x-accel-buffering", "no")],
+        Sse::new(events).keep_alive(KeepAlive::default()),
+    )
 }
 
 #[tracing::instrument(skip_all)]
