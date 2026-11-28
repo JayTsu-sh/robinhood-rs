@@ -469,8 +469,9 @@ impl ResourceAdministration {
             if let Err(error) = execute(command).await
                 && mounted(resource, &read_mounts()?)
             {
-                // A failed fresh request leaves the previous auto-mount intent in place.
-                if !previous.unmount_pending {
+                // A definitive failure, such as a busy mount, leaves the previous intent in place.
+                // A timeout may still be completing in the kernel. Keep that intent recoverable.
+                if !previous.unmount_pending && matches!(error, ApiError::BadRequest(_)) {
                     self.save(&previous).await?;
                     *resource = previous;
                 }
