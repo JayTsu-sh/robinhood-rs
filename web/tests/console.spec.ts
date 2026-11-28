@@ -282,9 +282,11 @@ test('Lustre resource list shows separate cluster and filesystem columns, pool c
   await expect(page.getByRole('button', { name: '添加集群' })).toHaveCount(0);
   managementFails = false;
   externalMount = true;
+  mountMissing = false;
   await send('disconnect');
   await expect(page.getByText('/mnt/external', { exact: true })).toBeVisible({ timeout: 8_000 });
-  await expect(metrics.locator('dd')).toHaveText(['1', '1', '2', '0']);
+  await expect(cells.nth(4)).toHaveText('部分采集快照已过期查看原因');
+  await expect(metrics.locator('dd')).toHaveText(['2', '0', '2', '0']);
   await expect(page.getByRole('alert')).toHaveCount(0);
   expect(collections).toEqual([]);
 });
