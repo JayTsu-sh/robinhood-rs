@@ -15,7 +15,7 @@ pub use tiering::PoolMigration;
 
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use rbh_entry_store::store::{EntryStore, QueryParam};
-use rbh_entry_store::{BackendKind, EntryKind, FileSystemId};
+use rbh_entry_store::{EntryKind, FileSystemId};
 use rbh_predicate::{CmpOp, Field, Predicate, SqlParam, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -255,7 +255,7 @@ pub(crate) async fn validate_filesystem(
         .await
         .map_err(|error| PolicyError::Store(error.to_string()))?
         .ok_or_else(|| invalid(format!("spec.target.filesystem is not registered: {}", filesystem)))?;
-    if config.backend != BackendKind::Lustre || !config.capabilities.hsm {
+    if !config.supports_lustre_hsm() {
         return Err(invalid(format!(
             "spec.target.filesystem does not support Lustre HSM: {}",
             filesystem
@@ -297,7 +297,7 @@ impl CompiledPolicy {
     }
 
     pub(crate) fn validate_capabilities(&self, config: &rbh_entry_store::FileSystemConfig) -> Result<(), PolicyError> {
-        if self.pool_migration().is_some() && !(config.capabilities.stripe && config.capabilities.ost) {
+        if self.pool_migration().is_some() && !config.supports_lustre_pool_migration() {
             return Err(invalid(
                 "lustre.pool_migrate requires filesystem stripe and OST capabilities",
             ));

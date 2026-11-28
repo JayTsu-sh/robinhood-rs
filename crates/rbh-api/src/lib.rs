@@ -2,7 +2,7 @@
 //!
 //! Endpoints:
 //! * `POST /api/policies` — create a policy
-//! * `GET /api/policies` — list all policies
+//! * `GET /api/policies` — list policies, optionally with `?configuredOnly=true`
 //! * `GET /api/policies/:id` — get policy by id
 //! * `PUT /api/policies/:id` — update policy
 //! * `POST /api/policies/:id/preview` — evaluate Rev.8 candidates
@@ -10,10 +10,14 @@
 //! * `GET /api/entries/count` — entry catalog count
 //! * `GET /api/entries/{object_id}?filesystem=ID` — look up one catalog entry
 //! * `POST /api/scans` — start a filesystem scan
+//! * `GET /api/filesystems` — registered Lustre inventory on the daemon router
 //!
 //! Rev.8 configuration writes use server-configured writer identities.
 
 mod classifier_handlers;
+mod console;
+#[cfg(test)]
+mod console_tests;
 mod handlers;
 mod rev8_auth;
 #[cfg(test)]
@@ -27,6 +31,8 @@ pub use rev8_auth::Rev8Writers;
 pub use state::AppState;
 
 use axum::Router;
+use rbh_entry_store::FileSystemConfig;
+use std::path::PathBuf;
 use tower_http::trace::TraceLayer;
 
 /// Build the application router with all endpoints.
@@ -41,4 +47,11 @@ pub fn router_with_writers(state: AppState, writers: Rev8Writers) -> Router {
         .layer(axum::Extension(writers))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Build the daemon router with its registered resources and installed console assets.
+pub fn router_with_console(
+    state: AppState, writers: Rev8Writers, filesystems: Vec<FileSystemConfig>, assets_dir: PathBuf,
+) -> Router {
+    router_with_writers(state, writers).merge(console::router(filesystems, assets_dir))
 }

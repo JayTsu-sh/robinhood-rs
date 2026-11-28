@@ -113,6 +113,16 @@ pub struct FileSystemConfig {
     pub capabilities: BackendCapabilities,
 }
 
+impl FileSystemConfig {
+    pub fn supports_lustre_hsm(&self) -> bool {
+        self.backend == BackendKind::Lustre && self.capabilities.hsm
+    }
+
+    pub fn supports_lustre_pool_migration(&self) -> bool {
+        self.supports_lustre_hsm() && self.capabilities.stripe && self.capabilities.ost
+    }
+}
+
 /// A backend-native object identity. Variants must never be converted into
 /// each other merely to fit an existing storage format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

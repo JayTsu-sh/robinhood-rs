@@ -194,6 +194,16 @@ SQL
 body="$(curl -fsS "$API/api/health")"
 assert_contains "$body" '"ok"' "health"
 
+if [[ "${RBH_TEST_CONSOLE:-0}" == 1 ]]; then
+    console="$(curl -fsS "$API/console/")"
+    assets="$(sed -nE 's/.*<script[^>]+src="(\/console\/[^"]+\.js)".*/\1/p' <<<"$console")"
+    [[ -n "$assets" ]] || die "console HTML has no compiled JavaScript URL"
+    while IFS= read -r asset; do
+        curl -fsS "$API$asset" >/dev/null
+    done <<<"$assets"
+    assert_contains "$(curl -fsS "$API/api/filesystems")" '"mountStatus":"unmounted"' "Lustre inventory"
+fi
+
 count_resp="$(curl -fsS "$API/api/entries/count?filesystem=$FILESYSTEM")"
 assert_contains "$count_resp" '"count":8' "entry count 8"
 

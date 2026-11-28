@@ -1,3 +1,13 @@
+# Build the console once for the same image that ships the daemon.
+FROM node:22-bookworm-slim AS console
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/config config
+COPY web/src src
+COPY web/tsconfig.json ./
+RUN npm run build
+
 # Debian trixie can load the Ubuntu 24.04 Lustre userspace libraries.
 FROM rust:trixie AS build
 WORKDIR /src
@@ -33,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /tmp/fake-mount
 COPY --from=build /src/target/release/robinhood /usr/sbin/robinhood
 COPY --from=build /src/target/release/rbh /usr/bin/rbh
+COPY --from=console /web/dist/ /usr/share/robinhood/console/
 COPY --from=build /usr/lib/liblustreapi.so.1.0.0 /usr/local/lib/liblustreapi.so.1
 COPY --from=build /usr/lib/liblnetconfig.so.4.0.0 /usr/local/lib/liblnetconfig.so.4
 RUN ldconfig

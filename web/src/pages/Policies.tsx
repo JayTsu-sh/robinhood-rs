@@ -1,0 +1,95 @@
+import { SearchOutlined } from '@ant-design/icons';
+import { ProTable, type ProColumns } from '@ant-design/pro-components';
+import { Button, Empty, Input, Select, Tag } from 'antd';
+import { useState } from 'react';
+import InventoryPage from '@/components/InventoryPage';
+import { listTieringPolicies, type TieringPolicy } from '@/services/tiering';
+import { useInventory } from '@/services/useInventory';
+
+const columns: ProColumns<TieringPolicy>[] = [
+  { title: '策略名称', dataIndex: 'name', width: 220 },
+  { title: '策略 ID', dataIndex: 'id', width: 105 },
+  { title: '当前修订', dataIndex: 'revision', width: 110 },
+  {
+    title: '文件系统',
+    dataIndex: 'filesystem',
+    width: 145,
+    renderText: (value) => <span className="console-mono">{value}</span>,
+  },
+  {
+    title: '源池 → 目标池',
+    width: 210,
+    render: (_, row) => <span className="console-mono">{row.sourcePool} → {row.targetPool}</span>,
+  },
+  {
+    title: '启用状态',
+    width: 120,
+    render: (_, row) => <Tag color={row.enabled ? 'success' : 'default'}>{row.enabled ? '已启用' : '已停用'}</Tag>,
+  },
+];
+
+export default function Policies() {
+  const { state, refresh } = useInventory(listTieringPolicies);
+  const [search, setSearch] = useState('');
+  const [enabled, setEnabled] = useState('all');
+  const allRows = state.status === 'ready' ? state.rows : [];
+  const query = search.trim().toLowerCase();
+  const rows = allRows.filter((row) =>
+    (enabled === 'all' || row.enabled === (enabled === 'enabled')) &&
+    [row.name, String(row.id), row.filesystem, row.sourcePool, row.targetPool]
+      .some((value) => value.toLowerCase().includes(query)),
+  );
+
+  return (
+    <InventoryPage
+      title="分层策略"
+      status={state.status}
+      error={state.status === 'error' ? state.message : undefined}
+      refresh={refresh}
+    >
+      <div className="console-table">
+        <div className="console-controls">
+          <Input
+            className="console-search"
+            aria-label="搜索策略"
+            type="search"
+            prefix={<SearchOutlined />}
+            placeholder="搜索名称、ID、文件系统或池"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+          <Select
+            aria-label="策略启用状态"
+            value={enabled}
+            onChange={setEnabled}
+            options={[
+              { value: 'all', label: '全部状态' },
+              { value: 'enabled', label: '已启用' },
+              { value: 'disabled', label: '已停用' },
+            ]}
+          />
+          <Button
+            disabled={!search && enabled === 'all'}
+            onClick={() => { setSearch(''); setEnabled('all'); }}
+          >
+            重置筛选
+          </Button>
+        </div>
+        <ProTable
+          columns={columns}
+          dataSource={rows}
+          rowKey="id"
+          search={false}
+          toolBarRender={false}
+          pagination={rows.length > 10 ? { defaultPageSize: 10 } : false}
+          scroll={{ x: 830 }}
+          locale={{
+            emptyText: <Empty className="console-empty" image={Empty.PRESENTED_IMAGE_SIMPLE} description={
+              allRows.length ? '没有符合筛选条件的策略' : '暂无分层策略'
+            } />,
+          }}
+        />
+      </div>
+    </InventoryPage>
+  );
+}

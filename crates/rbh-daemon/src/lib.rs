@@ -446,7 +446,24 @@ pub async fn run() -> anyhow::Result<()> {
         entry_store,
         scans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
-    let app = rbh_api::router_with_writers(state, writers);
+    let console_dir = std::env::var_os("RBH_CONSOLE_DIR")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|path| {
+            if path.is_absolute() {
+                true
+            } else {
+                tracing::warn!("RBH_CONSOLE_DIR must be absolute; using the packaged console directory");
+                false
+            }
+        })
+        .unwrap_or_else(|| "/usr/share/robinhood/console".into());
+    let app = rbh_api::router_with_console(
+        state,
+        writers,
+        runtime_registry.iter().map(|runtime| runtime.config.clone()).collect(),
+        console_dir,
+    );
 
     // 8. Start HTTP server with graceful shutdown on `daemon_cancel`.
     let listen_addr = std::env::var("RBH_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

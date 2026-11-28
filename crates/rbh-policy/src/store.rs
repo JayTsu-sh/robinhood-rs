@@ -209,6 +209,21 @@ impl PolicyStore {
         ).fetch_all(&self.pool).await?)
     }
 
+    /// List current revisions whose target belongs to this deployment's registry.
+    #[tracing::instrument(skip(self))]
+    pub async fn list_configured_rev8(&self) -> Result<Vec<Rev8PolicyRow>, PolicyError> {
+        let mut rows = self.list_rev8().await?;
+        if let Some(configured) = &self.configured_filesystems {
+            rows.retain(|row| {
+                row.definition["spec"]["target"]["filesystem"]
+                    .as_str()
+                    .and_then(|id| FileSystemId::new(id).ok())
+                    .is_some_and(|id| configured.contains(&id))
+            });
+        }
+        Ok(rows)
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn get_rev8_revision(&self, id: u64, revision: u64) -> Result<Rev8PolicyRow, PolicyError> {
         sqlx::query_as(

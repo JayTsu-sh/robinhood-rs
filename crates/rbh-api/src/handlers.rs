@@ -118,9 +118,23 @@ async fn create_policy(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolicyListQuery {
+    #[serde(default)]
+    configured_only: bool,
+}
+
 #[tracing::instrument(skip(state))]
-async fn list_policies(State(state): State<AppState>) -> Result<Json<Vec<Rev8PolicyRow>>, ApiError> {
-    Ok(Json(state.policy_store.list_rev8().await?))
+async fn list_policies(
+    State(state): State<AppState>, axum::extract::Query(query): axum::extract::Query<PolicyListQuery>,
+) -> Result<Json<Vec<Rev8PolicyRow>>, ApiError> {
+    let rows = if query.configured_only {
+        state.policy_store.list_configured_rev8().await?
+    } else {
+        state.policy_store.list_rev8().await?
+    };
+    Ok(Json(rows))
 }
 
 #[tracing::instrument(skip(state))]

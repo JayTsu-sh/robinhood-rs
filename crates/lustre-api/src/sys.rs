@@ -165,9 +165,6 @@ unsafe extern "C" {
 
     // Online pool migration -------------------------------------------------
 
-    pub(crate) fn llapi_get_poolmembers(
-        pool: *const c_char, list: *mut *mut c_char, count: c_int, buffer: *mut c_char, size: c_int,
-    ) -> c_int;
     pub(crate) fn llapi_file_fget_mdtidx(fd: c_int, index: *mut c_int) -> c_int;
     pub(crate) fn llapi_create_volatile_param(
         directory: *const c_char, mdt: c_int, flags: c_int, mode: libc::mode_t,

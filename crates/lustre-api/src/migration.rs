@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeSet,
-    ffi::{CStr, CString},
+    ffi::CString,
     fs::{File, Metadata},
     io::{self, Read},
     os::{
@@ -24,6 +24,8 @@ use crate::{
     error::{LustreApiError, check_rc},
     stripe::{OstLayout, StripeInfo, layout_read_time, open_by_fid, simple_layout},
 };
+
+pub use crate::pools::valid_pool_name;
 
 // Public lustre_user.h flag. Bindgen omits the macro expression.
 const SWAP_LAYOUTS_CHECK_DV1: u64 = 1;
@@ -164,63 +166,7 @@ impl Drop for GroupLock<'_> {
     }
 }
 
-pub fn valid_pool_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 15
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        && !matches!(name, "ignore" | "inherit" | "none")
-}
-
 impl LustreApi {
-    /// Enumerate concrete OST members of an unqualified pool on this mount.
-    pub fn pool_members(&self, mount: &Path, pool: &str) -> crate::error::Result<BTreeSet<u32>> {
-        if !valid_pool_name(pool) {
-            return Err(LustreApiError::RecordParse("invalid Lustre pool name"));
-        }
-        let fs = self.hsm_filesystem(mount)?;
-        self.qualified_pool_members(&fs, pool)
-    }
-
-    fn qualified_pool_members(&self, filesystem: &str, pool: &str) -> crate::error::Result<BTreeSet<u32>> {
-        let qualified = CString::new(format!("{filesystem}.{pool}"))?;
-        let mut capacity = 64;
-        loop {
-            let mut list = vec![std::ptr::null_mut(); capacity];
-            let mut buffer = vec![0 as libc::c_char; capacity * 64];
-            // SAFETY: both buffers are writable and the C API fills list with
-            // pointers into buffer. Sizes are bounded by the loop.
-            let rc = unsafe {
-                crate::sys::llapi_get_poolmembers(
-                    qualified.as_ptr(),
-                    list.as_mut_ptr(),
-                    capacity as i32,
-                    buffer.as_mut_ptr(),
-                    buffer.len() as i32,
-                )
-            };
-            if rc == -libc::EOVERFLOW && capacity < 65536 {
-                capacity *= 2;
-                continue;
-            }
-            check_rc(rc, "llapi_get_poolmembers")?;
-            let prefix = format!("{filesystem}-OST");
-            return list[..rc as usize]
-                .iter()
-                .map(|&member| {
-                    // SAFETY: a returned member is a NUL-terminated string in buffer.
-                    let name = unsafe { CStr::from_ptr(member) }.to_str()?;
-                    let index = name
-                        .strip_prefix(&prefix)
-                        .map(|value| value.strip_suffix("_UUID").unwrap_or(value))
-                        .and_then(|value| u32::from_str_radix(value, 16).ok());
-                    index.ok_or(LustreApiError::RecordParse("unexpected Lustre OST pool member"))
-                })
-                .collect();
-        }
-    }
-
     /// Read a supported source layout without moving the file.
     pub fn migration_source_layout(&self, mount: &Path, fid: &LuFid) -> Result<StripeInfo, MigrationError> {
         let fd = open_by_fid(mount, fid, libc::O_RDONLY | libc::O_NONBLOCK)?
@@ -276,11 +222,12 @@ impl LustreApi {
         eligible_hsm(self, mount, fid)?;
         let current =
             simple_layout(src.as_raw_fd())?.ok_or(MigrationError::Deferred("unsupported_or_unallocated_layout"))?;
-        let source_members = self.pool_members(mount, &plan.source_pool)?;
+        let pools = crate::pools::PoolMount::from_file(&src, mount)?;
+        let source_members = pools.pool_members(&plan.source_pool)?;
         if !is_in_pool(&current, &plan.source_pool, &source_members) {
             return Err(MigrationError::Deferred("source_pool_changed"));
         }
-        let target_members = self.pool_members(mount, &plan.target_pool)?;
+        let target_members = pools.pool_members(&plan.target_pool)?;
         if target_members.len() < usize::from(plan.stripe_count) {
             return Err(MigrationError::Deferred("target_pool_has_insufficient_osts"));
         }
@@ -297,11 +244,7 @@ impl LustreApi {
         dst.sync_all()?;
         let destination =
             simple_layout(dst.as_raw_fd())?.ok_or(MigrationError::Deferred("target_layout_not_allocated"))?;
-        if !matches_target(
-            &destination,
-            plan,
-            &self.qualified_pool_members(&ownership.0, &plan.target_pool)?,
-        ) {
+        if !matches_target(&destination, plan, &pools.pool_members(&plan.target_pool)?) {
             return Err(MigrationError::Deferred("volatile_layout_mismatch"));
         }
         let final_source = src.metadata()?;
@@ -344,7 +287,7 @@ impl LustreApi {
             let observed = layout_read_time();
             let current =
                 simple_layout(fd.as_raw_fd())?.ok_or(MigrationError::Deferred("unsupported_destination_layout"))?;
-            let members = self.pool_members(mount, &plan.target_pool)?;
+            let members = crate::pools::PoolMount::from_file(&fd, mount)?.pool_members(&plan.target_pool)?;
             if &current != expected || !matches_target(&current, plan, &members) {
                 return Err(MigrationError::Deferred("reopened_fid_layout_mismatch"));
             }
@@ -382,18 +325,15 @@ impl LustreApi {
             return Ok(MigrationPlacement::Unresolved);
         };
         let metadata = src.metadata()?;
-        let members = self.pool_members(mount, &plan.target_pool)?;
+        let pools = crate::pools::PoolMount::from_file(&src, mount)?;
+        let members = pools.pool_members(&plan.target_pool)?;
         if matches_target(&layout, plan, &members) {
             return Ok(MigrationPlacement::Target(Box::new(VerifiedPlacement {
                 layout: layout.observation(observed)?,
                 metadata,
             })));
         }
-        if is_in_pool(
-            &layout,
-            &plan.source_pool,
-            &self.pool_members(mount, &plan.source_pool)?,
-        ) {
+        if is_in_pool(&layout, &plan.source_pool, &pools.pool_members(&plan.source_pool)?) {
             return Ok(if FileVersion::from(&metadata) == expected {
                 MigrationPlacement::SourceUnchanged
             } else {

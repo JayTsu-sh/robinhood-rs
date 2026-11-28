@@ -28,6 +28,8 @@ install -m 0755 target/release/robinhood /usr/sbin/robinhood
 install -m 0755 target/release/rbh       /usr/bin/rbh
 
 # Install assets.
+install -d -m 0755 /usr/share/robinhood/console
+cp -a web/dist/. /usr/share/robinhood/console/
 install -m 0644 packaging/systemd/rbh-daemon.service  /usr/lib/systemd/system/
 install -m 0644 packaging/systemd/rbh-daemon@.service /usr/lib/systemd/system/
 install -m 0640 packaging/sysconfig/rbh-daemon        /etc/sysconfig/rbh-daemon
@@ -40,6 +42,22 @@ editor /etc/sysconfig/rbh-daemon   # set RBH_DATABASE_URL, RBH_MDTS, ...
 systemctl daemon-reload
 systemctl enable --now rbh-daemon
 ```
+
+## Build and serve the web console
+
+Run `npm ci` and `npm run build` in `web/` with Node.js 22 before packaging.
+Package the generated `web/dist/` files with the daemon. The Compose image
+does this automatically. Open `/console/` on the daemon's existing HTTP
+listener. Set `RBH_CONSOLE_DIR` to an absolute path to serve a different
+installation directory, such as the local `web/dist/` for development.
+The daemon only needs read access to the installed files. Node.js is a build
+dependency.
+
+To exercise the browser flows against a running daemon with built assets,
+run `npx playwright install chromium` and `npm run test:e2e` in `web/`.
+`RBH_CONSOLE_TEST_URL` defaults to `http://127.0.0.1:8080`.
+For live-data acceptance, set `RBH_CONSOLE_REQUIRE_LIVE_DATA=1` and use a
+daemon with two eligible Lustre pools and a saved policy with an explicit pool pair.
 
 ## Enable pool migration under systemd
 
