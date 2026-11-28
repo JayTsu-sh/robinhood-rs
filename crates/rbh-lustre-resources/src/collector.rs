@@ -62,6 +62,7 @@ const OST_CONCURRENCY: usize = 8;
 pub(crate) struct FilesystemProbe {
     inventory_slot: Arc<Mutex<()>>,
     capacity_slot: Arc<Mutex<()>>,
+    mdt_slot: Arc<Mutex<()>>,
     ost_slots: Mutex<BTreeMap<u32, Weak<Mutex<()>>>>,
     ost_concurrency: Arc<Semaphore>,
 }
@@ -71,6 +72,7 @@ impl Default for FilesystemProbe {
         Self {
             inventory_slot: Arc::default(),
             capacity_slot: Arc::default(),
+            mdt_slot: Arc::default(),
             ost_slots: Mutex::default(),
             ost_concurrency: Arc::new(Semaphore::new(OST_CONCURRENCY)),
         }
@@ -123,7 +125,14 @@ impl FilesystemProbe {
                 .flatten()
                 .copied()
                 .collect();
-            let (measurements, probe_error) = self.measure_capacity(mount, indices).await;
+            let mount = Arc::new(mount);
+            let mdt_mount = mount.clone();
+            let (measurements, mdts) = tokio::join!(
+                self.measure_capacity(mount, indices),
+                run_probe(self.mdt_slot.clone(), "rbh-lustre-mdt", move || mdt_mount
+                    .active_mdt_names()),
+            );
+            let (measurements, probe_error) = measurements;
             let (capacity, targets) = capacity::summarize(
                 measurements,
                 inventory.pools.as_deref_mut().unwrap_or_default(),
@@ -131,6 +140,8 @@ impl FilesystemProbe {
                 observed_at,
             );
             inventory.capacity = capacity;
+            inventory.ost_indices = targets.clone();
+            inventory.mdt_names = mdts.ok().and_then(Result::ok);
             observed_targets = targets;
             if matches!(inventory.collection_status, CollectionStatus::Collected)
                 && (!inventory.capacity.is_collected()
@@ -155,7 +166,7 @@ impl FilesystemProbe {
         }
     }
     async fn measure_capacity(
-        &self, mount: PoolMount, mut indices: BTreeSet<u32>,
+        &self, mount: Arc<PoolMount>, mut indices: BTreeSet<u32>,
     ) -> (Vec<CapacityProgress>, Option<ProbeFailure>) {
         let deadline = Instant::now() + PROBE_LIMIT;
         let setup = run_probe(self.capacity_slot.clone(), "rbh-lustre-targets", move || {
@@ -289,6 +300,8 @@ fn probe_filesystem(config: &FileSystemConfig) -> (FilesystemInventory, Option<(
                     capacity: Capacity::pending(),
                     collection_status: CollectionStatus::Error,
                     pools: None,
+                    ost_indices: None,
+                    mdt_names: None,
                     tiering_available: false,
                     reason: Some(lustre_error_message(&error)),
                 },
@@ -320,6 +333,8 @@ fn probe_filesystem(config: &FileSystemConfig) -> (FilesystemInventory, Option<(
             capacity: Capacity::pending(),
             collection_status,
             pools: Some(pools),
+            ost_indices: None,
+            mdt_names: None,
             tiering_available: reason.is_none(),
             reason: reason.map(str::to_owned),
         },

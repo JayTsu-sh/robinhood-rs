@@ -64,6 +64,10 @@ pub(crate) struct FilesystemInventory {
     pub(crate) mount: Option<MountResource>,
     pub(crate) capacity: Capacity,
     pub(crate) pools: Option<Vec<PoolResource>>,
+    #[serde(default)]
+    pub(crate) ost_indices: Option<BTreeSet<u32>>,
+    #[serde(default)]
+    pub(crate) mdt_names: Option<Vec<String>>,
     pub(crate) tiering_available: bool,
     pub(crate) reason: Option<String>,
 }
@@ -97,6 +101,8 @@ impl ResourceSnapshot {
                 mount: None,
                 capacity: Capacity::pending(),
                 pools: None,
+                ost_indices: None,
+                mdt_names: None,
                 tiering_available: false,
                 reason: Some("collection_pending".to_owned()),
             },
@@ -116,6 +122,8 @@ impl FilesystemInventory {
             mount: None,
             capacity: Capacity::unavailable(capacity_status, reason.clone()),
             pools: None,
+            ost_indices: None,
+            mdt_names: None,
             tiering_available: false,
             reason: Some(reason),
         }

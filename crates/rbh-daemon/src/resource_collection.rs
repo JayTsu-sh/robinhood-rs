@@ -26,9 +26,6 @@ impl Task for CollectLustreResources {
 
 #[tracing::instrument(skip(scheduler, resources))]
 pub(crate) async fn register(scheduler: &Scheduler, resources: ResourceObservations, interval: Duration) -> TaskResult {
-    if resources.is_empty() {
-        return Ok(());
-    }
     RESOURCES
         .set(resources)
         .map_err(|_| SchedulerError::ExecutionError("console collection already registered".into()))?;

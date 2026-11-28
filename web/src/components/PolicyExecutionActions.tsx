@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { runDetailsPath, type LatestRun } from '@/services/executions';
 import { requestPolicyRun, setPolicyEnabled, writeError, writerTransportAllowed } from '@/services/policies';
 import { requestError } from '@/services/useInventory';
+import { isActiveRun } from './ExecutionStatus';
 
 const labels = { enable: '启用策略', disable: '停用策略', run: '立即运行' };
 type Action = keyof typeof labels;
@@ -32,7 +33,7 @@ export default function PolicyExecutionActions(
   const navigate = useNavigate();
   useEffect(() => () => pending.current?.abort(), []);
 
-  const active = latestRun?.revision === revision && (latestRun.state === 'queued' || latestRun.state === 'running');
+  const active = latestRun?.revision === revision && isActiveRun(latestRun.state);
   const explanation = action === 'disable'
     ? '停用后，旧修订将停止派发新操作。已提交的操作会继续核对。'
     : action === 'enable'

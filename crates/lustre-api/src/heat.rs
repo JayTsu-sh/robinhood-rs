@@ -109,7 +109,7 @@ impl HeatMount {
     pub fn sample(&self, fid: LuFid) -> crate::Result<Option<ReadHeat>> {
         // These optional symbols are resolved on use so older liblustreapi
         // installations can still serve deployments without heat conditions.
-        let Some((open, get_heat)) = heat_functions() else {
+        let (Some(open), Some(get_heat)) = (crate::stripe::fid_open_at(), heat_get()) else {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Lustre heat API unavailable").into());
         };
         use std::os::fd::FromRawFd;
@@ -172,26 +172,16 @@ const _: () =
     assert!(std::mem::offset_of!(HeatBuffer, values) == std::mem::offset_of!(sys::bindings::lu_heat, lh_heat));
 
 #[cfg(lustre_heat_abi)]
-type FidOpen = unsafe extern "C" fn(c_int, *const sys::lu_fid, c_int) -> c_int;
-#[cfg(lustre_heat_abi)]
 type HeatGet = unsafe extern "C" fn(c_int, *mut sys::bindings::lu_heat) -> c_int;
 
 #[cfg(lustre_heat_abi)]
-fn heat_functions() -> Option<(FidOpen, HeatGet)> {
-    static FUNCTIONS: std::sync::OnceLock<Option<(FidOpen, HeatGet)>> = std::sync::OnceLock::new();
-    *FUNCTIONS.get_or_init(|| {
-        // SAFETY: these are the documented Lustre C functions from the
-        // process-linked liblustreapi. Their ABI matches the two types above.
+fn heat_get() -> Option<HeatGet> {
+    static GET: std::sync::OnceLock<Option<HeatGet>> = std::sync::OnceLock::new();
+    *GET.get_or_init(|| {
+        // SAFETY: liblustreapi remains loaded and this is the published ABI.
         unsafe {
-            let open = libc::dlsym(libc::RTLD_DEFAULT, c"llapi_open_by_fid_at".as_ptr());
             let get = libc::dlsym(libc::RTLD_DEFAULT, c"llapi_heat_get".as_ptr());
-            if open.is_null() || get.is_null() {
-                return None;
-            }
-            Some((
-                std::mem::transmute::<*mut libc::c_void, FidOpen>(open),
-                std::mem::transmute::<*mut libc::c_void, HeatGet>(get),
-            ))
+            (!get.is_null()).then(|| std::mem::transmute::<*mut libc::c_void, HeatGet>(get))
         }
     })
 }

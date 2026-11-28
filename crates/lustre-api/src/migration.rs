@@ -38,6 +38,14 @@ pub struct MigrationPlan {
     pub target_pool: String,
     pub stripe_count: u16,
     pub stripe_size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_second: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_target_free_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_concurrency: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_mount_source: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,9 +116,10 @@ pub struct VerifiedPlacement {
 
 /// Local ownership persists inside the blocking task even if its async waiter
 /// is cancelled. The policy store also maintains ownership across restarts.
-static ACTIVE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+static ACTIVE: std::sync::LazyLock<Mutex<std::collections::HashSet<(String, LuFid)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
-pub struct MigrationOwnership(String);
+pub struct MigrationOwnership((String, LuFid));
 
 /// Limits checked by the blocking migration while it owns the source lock.
 pub struct MigrationLimits<F, G> {
@@ -121,14 +130,15 @@ pub struct MigrationLimits<F, G> {
 }
 
 impl MigrationOwnership {
-    pub fn acquire(filesystem: &str) -> Result<Self, MigrationError> {
+    pub fn acquire(filesystem: &str, fid: LuFid) -> Result<Self, MigrationError> {
         let mut active = ACTIVE
             .lock()
             .map_err(|_| MigrationError::Deferred("migration_lock_unavailable"))?;
-        if !active.insert(filesystem.to_owned()) {
-            return Err(MigrationError::Deferred("filesystem_migration_busy"));
+        let key = (filesystem.to_owned(), fid);
+        if !active.insert(key.clone()) {
+            return Err(MigrationError::Deferred("file_migration_busy"));
         }
-        Ok(Self(filesystem.to_owned()))
+        Ok(Self(key))
     }
 }
 
@@ -138,6 +148,21 @@ impl Drop for MigrationOwnership {
             active.remove(&self.0);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn distinct_fids_share_a_filesystem_without_sharing_ownership() {
+    let first = LuFid::new(0x200000401, 1, 0);
+    let second = LuFid::new(0x200000401, 2, 0);
+    let held = MigrationOwnership::acquire("parallel-migration-test", first).unwrap();
+    let _other = MigrationOwnership::acquire("parallel-migration-test", second).unwrap();
+    assert!(matches!(
+        MigrationOwnership::acquire("parallel-migration-test", first),
+        Err(MigrationError::Deferred("file_migration_busy"))
+    ));
+    drop(held);
+    assert!(MigrationOwnership::acquire("parallel-migration-test", first).is_ok());
 }
 
 struct GroupLock<'a> {
@@ -181,7 +206,7 @@ impl LustreApi {
         &self, mount: &Path, fid: &LuFid, plan: &MigrationPlan, expected: FileVersion, deadline: Instant,
     ) -> Result<VerifiedPlacement, MigrationError> {
         let fs = self.hsm_filesystem(mount)?;
-        let ownership = MigrationOwnership::acquire(&fs)?;
+        let ownership = MigrationOwnership::acquire(&fs, *fid)?;
         let limits = MigrationLimits {
             deadline,
             expected_access: None,
@@ -205,10 +230,12 @@ impl LustreApi {
             || plan.stripe_count == 0
             || plan.stripe_size == 0
             || !plan.stripe_size.is_multiple_of(65536)
+            || plan.max_bytes_per_second == Some(0)
+            || plan.min_target_free_percent.is_some_and(|percent| percent > 100)
         {
             return Err(MigrationError::Deferred("invalid_pool_migration_plan"));
         }
-        if self.hsm_filesystem(mount)? != ownership.0 {
+        if self.hsm_filesystem(mount)? != ownership.0.0 || *fid != ownership.0.1 {
             return Err(MigrationError::Deferred("filesystem_identity_changed"));
         }
         check_deadline(deadline)?;
@@ -227,6 +254,13 @@ impl LustreApi {
         let current =
             simple_layout(src.as_raw_fd())?.ok_or(MigrationError::Deferred("unsupported_or_unallocated_layout"))?;
         let pools = crate::pools::PoolMount::from_file(&src, mount)?;
+        if plan
+            .expected_mount_source
+            .as_deref()
+            .is_some_and(|source| source != pools.source())
+        {
+            return Err(MigrationError::Deferred("registered_mount_source_changed"));
+        }
         let source_members = pools.pool_members(&plan.source_pool)?;
         if !is_in_pool(&current, &plan.source_pool, &source_members) {
             return Err(MigrationError::Deferred("source_pool_changed"));
@@ -234,6 +268,26 @@ impl LustreApi {
         let target_members = pools.pool_members(&plan.target_pool)?;
         if target_members.len() < usize::from(plan.stripe_count) {
             return Err(MigrationError::Deferred("target_pool_has_insufficient_osts"));
+        }
+        if let Some(percent) = plan.min_target_free_percent.filter(|percent| *percent > 0) {
+            let reader = pools.ost_space_reader()?;
+            let mut total = 0u128;
+            let mut available = 0u128;
+            for index in target_members {
+                check_deadline(deadline)?;
+                let crate::pools::OstCapacity::Measured(usage) = reader.usage(index)? else {
+                    return Err(MigrationError::Deferred("target_pool_capacity_unavailable"));
+                };
+                total += u128::from(usage.total_bytes);
+                available += u128::from(usage.available_bytes);
+            }
+            if total == 0
+                || available
+                    .checked_sub(u128::from(expected.size))
+                    .is_none_or(|remaining| remaining * 100 < total * u128::from(percent))
+            {
+                return Err(MigrationError::Deferred("target_pool_free_space_below_minimum"));
+            }
         }
         let dst = volatile_file(mount, &src, &source, plan)?;
         let mut version = 0;
@@ -243,7 +297,7 @@ impl LustreApi {
             unsafe { crate::sys::llapi_get_data_version(src.as_raw_fd(), &mut version, 0) },
             "llapi_get_data_version",
         )?;
-        copy_sparse(&src, &dst, expected.size, deadline)?;
+        copy_sparse(&src, &dst, expected.size, deadline, plan.max_bytes_per_second)?;
         set_times(&dst, &source)?;
         dst.sync_all()?;
         let destination =
@@ -312,7 +366,7 @@ impl LustreApi {
     pub fn reconcile_pool_migration(
         &self, mount: &Path, fid: &LuFid, plan: &MigrationPlan, expected: FileVersion, filesystem_name: &str,
     ) -> Result<MigrationPlacement, MigrationError> {
-        let ownership = MigrationOwnership::acquire(filesystem_name)?;
+        let ownership = MigrationOwnership::acquire(filesystem_name, *fid)?;
         self.reconcile_reserved_pool_migration(mount, fid, plan, expected, &ownership)
     }
 
@@ -320,7 +374,7 @@ impl LustreApi {
     pub fn reconcile_reserved_pool_migration(
         &self, mount: &Path, fid: &LuFid, plan: &MigrationPlan, expected: FileVersion, ownership: &MigrationOwnership,
     ) -> Result<MigrationPlacement, MigrationError> {
-        if self.hsm_filesystem(mount)? != ownership.0 {
+        if self.hsm_filesystem(mount)? != ownership.0.0 || *fid != ownership.0.1 {
             return Err(MigrationError::Deferred("filesystem_identity_changed"));
         }
         let Some(src) = open_source(mount, fid)? else {
@@ -333,6 +387,13 @@ impl LustreApi {
         };
         let metadata = src.metadata()?;
         let pools = crate::pools::PoolMount::from_file(&src, mount)?;
+        if plan
+            .expected_mount_source
+            .as_deref()
+            .is_some_and(|source| source != pools.source())
+        {
+            return Err(MigrationError::Deferred("registered_mount_source_changed"));
+        }
         let members = pools.pool_members(&plan.target_pool)?;
         if matches_target(&layout, plan, &members) {
             return Ok(MigrationPlacement::Target(Box::new(VerifiedPlacement {
@@ -456,8 +517,13 @@ fn set_times(file: &File, metadata: &Metadata) -> io::Result<()> {
     }
 }
 
-fn copy_sparse(src: &File, dst: &File, size: u64, deadline: Instant) -> Result<(), MigrationError> {
+fn copy_sparse(
+    src: &File, dst: &File, size: u64, deadline: Instant, max_bytes: Option<u64>,
+) -> Result<(), MigrationError> {
     let mut buffer = vec![0; 1024 * 1024];
+    let bytes_per_second = max_bytes.map(|limit| limit as f64);
+    let started_at = Instant::now();
+    let mut copied = 0u64;
     let mut cursor = 0;
     while cursor < size {
         check_deadline(deadline)?;
@@ -471,6 +537,15 @@ fn copy_sparse(src: &File, dst: &File, size: u64, deadline: Instant) -> Result<(
         while data < hole {
             check_deadline(deadline)?;
             let len = (hole - data).min(buffer.len() as u64) as usize;
+            copied += len as u64;
+            if let Some(rate) = bytes_per_second {
+                let paced = std::time::Duration::from_secs_f64(copied as f64 / rate);
+                if paced >= deadline.saturating_duration_since(started_at) {
+                    return Err(MigrationError::Deferred("migration_deadline_elapsed"));
+                }
+                std::thread::sleep(paced.saturating_sub(started_at.elapsed()));
+                check_deadline(deadline)?;
+            }
             src.read_exact_at(&mut buffer[..len], data)?;
             dst.write_all_at(&buffer[..len], data)?;
             data += len as u64;

@@ -20,6 +20,7 @@ export interface PolicyPreview {
   estimatedBytesExact?: string;
   resourceBindings: { kind: string; name: string; revision: number }[];
   directoryScope?: DirectoryScopeSummary;
+  sampleFiles?: { fid: string; paths: string[]; rule: string | null; outcome: string }[];
 }
 
 export function previewPolicyDocument(document: object, signal: AbortSignal) {

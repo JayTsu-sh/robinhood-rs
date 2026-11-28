@@ -13,6 +13,7 @@ export interface PolicyRevision {
   resourceBindings: PolicyPreview['resourceBindings'] | null;
   modifiedBy: string | null;
   latestRun?: LatestRun;
+  nextRun?: string | null;
 }
 
 export interface ResourceRevision {
@@ -62,7 +63,7 @@ export function writerTransportAllowed() {
     (hostname === 'localhost' || hostname === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(hostname)));
 }
 
-function policyWriteHeaders(base?: SavedRevision, token?: string) {
+export function policyWriteHeaders(base?: SavedRevision, token?: string) {
   if (token && !writerTransportAllowed()) {
     throw new Error('请通过本机回环地址或 HTTPS 连接后提交策略写入请求。');
   }

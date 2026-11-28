@@ -33,12 +33,14 @@ mod policy_preview_tests;
 mod policy_resource_handlers;
 #[cfg(test)]
 mod read_heat_tests;
+mod resource_management;
 mod run_history;
 #[cfg(test)]
 mod run_history_tests;
 pub mod state;
 
 pub use policy_auth::PolicyWriters;
+pub use resource_management::{ResourceAdministration, ResourceAdministrationError};
 pub use state::AppState;
 
 use axum::Router;

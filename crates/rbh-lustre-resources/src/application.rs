@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use futures_util::future::join_all;
 use rbh_entry_store::{BackendKind, FileSystemConfig, FileSystemId};
@@ -18,7 +22,7 @@ type RefreshResult = watch::Receiver<Option<Result<(), String>>>;
 #[derive(Clone)]
 pub struct ResourceObservations {
     snapshots: SnapshotRepository,
-    probes: Arc<[Arc<RegisteredResource>]>,
+    probes: Arc<RwLock<BTreeMap<FileSystemId, Arc<RegisteredResource>>>>,
     boot_id: Option<Arc<str>>,
     stopping: watch::Sender<bool>,
 }
@@ -30,6 +34,14 @@ struct RegisteredResource {
 }
 
 impl RegisteredResource {
+    fn new(config: FileSystemConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(config),
+            probe: FilesystemProbe::default(),
+            refresh: Mutex::new(None),
+        })
+    }
+
     fn view(&self, saved: Option<Observation>) -> ResourceView {
         let snapshot = saved
             .filter(|saved| saved.config == *self.config)
@@ -41,42 +53,64 @@ impl RegisteredResource {
 impl ResourceObservations {
     pub fn new(pool: MySqlPool, observer_id: String, mut filesystems: Vec<FileSystemConfig>) -> Self {
         filesystems.retain(|fs| fs.backend == BackendKind::Lustre);
-        filesystems.sort_by(|a, b| a.id.cmp(&b.id));
         let probes = filesystems
             .into_iter()
-            .map(|config| {
-                Arc::new(RegisteredResource {
-                    config: Arc::new(config),
-                    probe: FilesystemProbe::default(),
-                    refresh: Mutex::new(None),
-                })
-            })
+            .map(|config| (config.id.clone(), RegisteredResource::new(config)))
             .collect();
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .ok()
             .map(|value| Arc::from(value.trim()));
         Self {
             snapshots: SnapshotRepository::new(pool, observer_id),
-            probes,
+            probes: Arc::new(RwLock::new(probes)),
             boot_id,
             stopping: watch::channel(false).0,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.probes.is_empty()
+        self.probes.read().expect("resource registry lock").is_empty()
     }
 
     pub fn stop(&self) {
         self.stopping.send_replace(true);
     }
 
-    fn probe(&self, id: &FileSystemId) -> Option<&Arc<RegisteredResource>> {
-        self.probes.iter().find(|probe| &probe.config.id == id)
+    fn probe(&self, id: &FileSystemId) -> Option<Arc<RegisteredResource>> {
+        self.probes.read().expect("resource registry lock").get(id).cloned()
+    }
+
+    pub fn register(&self, config: FileSystemConfig) {
+        let mut probes = self.probes.write().expect("resource registry lock");
+        probes
+            .entry(config.id.clone())
+            .or_insert_with(|| RegisteredResource::new(config));
+    }
+
+    pub fn unregister(&self, id: &FileSystemId) {
+        self.probes.write().expect("resource registry lock").remove(id);
+    }
+
+    fn probes(&self) -> Vec<Arc<RegisteredResource>> {
+        self.probes
+            .read()
+            .expect("resource registry lock")
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn contains(&self, id: &FileSystemId) -> bool {
         self.probe(id).is_some()
+    }
+
+    pub fn registered_ids(&self) -> Vec<FileSystemId> {
+        self.probes
+            .read()
+            .expect("resource registry lock")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     #[tracing::instrument(skip(self))]
@@ -90,13 +124,13 @@ impl ResourceObservations {
 
     #[tracing::instrument(skip(self))]
     pub async fn list(&self) -> Result<Vec<ResourceView>, sqlx::Error> {
-        if self.is_empty() {
+        let probes = self.probes();
+        if probes.is_empty() {
             return Ok(Vec::new());
         }
-        let ids = self.probes.iter().map(|probe| &probe.config.id);
+        let ids = probes.iter().map(|probe| &probe.config.id);
         let mut saved = self.snapshots.list(ids).await?;
-        Ok(self
-            .probes
+        Ok(probes
             .iter()
             .map(|probe| probe.view(saved.remove(&probe.config.id)))
             .collect())
@@ -109,9 +143,9 @@ impl ResourceObservations {
             let probe = self
                 .probe(id)
                 .ok_or_else(|| format!("unknown Lustre filesystem {id}"))?;
-            self.refresh_one(probe).await
+            self.refresh_one(&probe).await
         } else {
-            join_all(self.probes.iter().map(|probe| self.refresh_one(probe)))
+            join_all(self.probes().iter().map(|probe| self.refresh_one(probe)))
                 .await
                 .into_iter()
                 .collect()

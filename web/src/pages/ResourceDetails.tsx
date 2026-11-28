@@ -1,15 +1,17 @@
 import { ArrowLeftOutlined } from '@ant-design/icons';
 import { ProTable, type ProColumns } from '@ant-design/pro-components';
-import { Link, useSearchParams } from '@umijs/max';
+import { Link, useNavigate, useSearchParams } from '@umijs/max';
 import { Alert, Button, Descriptions, Empty, Result, Space, Spin, Tabs, Tag, Typography } from 'antd';
 import { useCallback } from 'react';
 import InventoryPage from '@/components/InventoryPage';
+import ResourceManagement, { useResourceManagement } from '@/components/ResourceManagement';
 import {
   Availability, CapacityStatus, CollectionStatus, MountStatus, Reason, formatBytes,
   formatObservationTime, formatUsage, useObservationClock,
 } from '@/components/ResourceStatus';
 import { getFilesystem, listTieringPolicies, refreshFilesystem, type FilesystemResource, type PoolResource } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
+import { poolTiers, type ResourceRegistration } from '@/services/resourceManagement';
 import './resource-details.css';
 
 function RelatedPolicies({ filesystem }: { filesystem: string }) {
@@ -73,13 +75,17 @@ function PoolMembers({ indices }: { indices: number[] | null }) {
   return <>{indices.length} 个 · <span className="console-mono">{names}</span></>;
 }
 
-function Storage({ resource, now }: { resource: FilesystemResource; now: number }) {
+function Storage({ resource, now, registration }: { resource: FilesystemResource; now: number; registration?: ResourceRegistration }) {
   const { pools } = resource;
   if (pools === null) {
     return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={<><div>未取得 OST 池信息</div><Reason reason={resource.reason} /></>} />;
   }
   const columns: ProColumns<PoolResource>[] = [
     { title: '池名称', dataIndex: 'name', width: 140, renderText: (value) => <span className="console-mono">{value}</span> },
+    ...(registration ? [{
+      title: '应用侧层级', width: 110,
+      render: (_: unknown, { name }: PoolResource) => poolTiers[registration.tiers[name]] ?? '未分类',
+    }] : []),
     { title: 'OST 成员', width: 235, render: (_, { ostIndices }) => <PoolMembers indices={ostIndices} /> },
     { title: '总容量', width: 100, render: (_, { capacity }) => formatBytes(capacity.sample?.totalBytes) },
     { title: '已用容量', width: 100, render: (_, { capacity }) => formatBytes(capacity.sample?.usedBytes) },
@@ -88,13 +94,21 @@ function Storage({ resource, now }: { resource: FilesystemResource; now: number 
     { title: '容量采集', width: 195, render: (_, { capacity }) => <CapacityStatus capacity={capacity} now={now} /> },
   ];
   return (
-    <ProTable columns={columns} dataSource={pools} rowKey="name" search={false} toolBarRender={false}
-      scroll={{ x: 955 }} pagination={pools.length > 10 ? { defaultPageSize: 10 } : false}
-      locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未发现 OST 池" /> }} />
+    <>
+      <ProTable columns={columns} dataSource={pools} rowKey="name" search={false} toolBarRender={false}
+        scroll={{ x: 955 }} pagination={pools.length > 10 ? { defaultPageSize: 10 } : false}
+        locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未发现 OST 池" /> }} />
+      <Typography.Title level={2} className="resource-subheading">OST / MDT 发现信息</Typography.Title>
+      <Descriptions column={1} items={[
+        { key: 'ost', label: 'OST', children: <PoolMembers indices={resource.ostIndices ?? null} /> },
+        { key: 'mdt', label: 'MDT', children: resource.mdtNames?.length
+          ? <span className="console-mono">{resource.mdtNames.join('、')}</span> : '未取得 MDT 列表' },
+      ]} />
+    </>
   );
 }
 
-function MountInformation({ resource }: { resource: FilesystemResource }) {
+function MountInformation({ resource, registration }: { resource: FilesystemResource; registration?: ResourceRegistration }) {
   const { id, mountPath, mountStatus, mount } = resource;
   return <Descriptions column={{ xs: 1, md: 2 }} items={[
     { key: 'id', label: '文件系统 ID', children: <span className="console-mono">{id}</span> },
@@ -102,6 +116,12 @@ function MountInformation({ resource }: { resource: FilesystemResource }) {
     { key: 'state', label: '挂载状态', children: <MountStatus status={mountStatus} /> },
     { key: 'source', label: '挂载来源', children: <span className="console-mono">{mount?.source ?? '未取得'}</span> },
     { key: 'mode', label: '访问模式', children: mount === null ? '未取得' : mount.readOnly ? '只读挂载' : '读写挂载' },
+    ...(registration ? [
+      { key: 'owner', label: '挂载所有权', children: { deployment: '部署管理', external: '外部管理', daemon: 'daemon 管理' }[registration.owner] },
+      { key: 'options', label: '挂载参数', children: registration.options.join(', ') || '默认' },
+      { key: 'auto', label: 'daemon 重启后恢复挂载', children: registration.owner === 'daemon' ?
+        registration.autoMount ? '开启' : '关闭' : '由外部负责' },
+    ] : []),
   ]} />;
 }
 
@@ -109,6 +129,9 @@ function ResourceDetails({ id }: { id: string }) {
   const load = useCallback((signal: AbortSignal) => getFilesystem(id, signal), [id]);
   const reload = useCallback((signal: AbortSignal) => refreshFilesystem(id, signal), [id]);
   const { state, refresh } = useInventory(load, reload);
+  const { management, refresh: reloadManagement } = useResourceManagement();
+  const registration = management?.resources.find((candidate) => candidate.id === id);
+  const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const requestedTab = params.get('tab');
   const tab = requestedTab === 'storage' || requestedTab === 'mount' ? requestedTab : 'overview';
@@ -118,14 +141,23 @@ function ResourceDetails({ id }: { id: string }) {
   return (
     <>
       <Link to="/resources" className="resource-back"><ArrowLeftOutlined /> 返回 Lustre 集群列表</Link>
-      <InventoryPage title={id} status={state.status}
-        error={state.status === 'error' ? state.message : undefined} refresh={refresh}>
+      <InventoryPage title={registration?.name || id} status={state.status}
+        error={state.status === 'error' ? state.message : undefined} refresh={() => { refresh(); reloadManagement(); }}
+        action={management && registration && <ResourceManagement management={management} resource={registration}
+          pools={resource?.pools?.map(({ name }) => name)}
+          mounted={resource?.mountStatus === 'mounted'}
+          onRefresh={(removed) => {
+            if (removed) navigate('/resources');
+            else { refresh(); reloadManagement(); }
+          }} />}>
         {resource && (
           <div className="resource-panel">
+            {registration?.lastMountError && <Alert type="warning" showIcon message="最近挂载失败"
+              description={registration.lastMountError} />}
             <Tabs activeKey={tab} onChange={(key) => setParams(key === 'overview' ? { filesystem: id } : { filesystem: id, tab: key })} items={[
               { key: 'overview', label: '集群概览', children: <Overview resource={resource} now={now} /> },
-              { key: 'storage', label: '存储资源', children: <Storage resource={resource} now={now} /> },
-              { key: 'mount', label: '挂载信息', children: <MountInformation resource={resource} /> },
+              { key: 'storage', label: '存储资源', children: <Storage resource={resource} now={now} registration={registration} /> },
+              { key: 'mount', label: '挂载信息', children: <MountInformation resource={resource} registration={registration} /> },
             ]} />
           </div>
         )}

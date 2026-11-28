@@ -1,9 +1,45 @@
-use lustre_api::{LuFid, migration::valid_pool_name, pools::PoolMount};
+use lustre_api::{
+    LuFid,
+    migration::valid_pool_name,
+    pools::{OstCapacity, PoolMount},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::{duration_millis, invalid, size_bytes};
 use crate::PolicyError;
+
+static CAPACITY_PROBES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// Capacity used for dispatch admission requires a complete, current member sample.
+pub(crate) async fn pool_capacity(mount: &std::path::Path, pool: &str) -> Option<(u128, u128, u128)> {
+    let permit = CAPACITY_PROBES.try_acquire().ok()?;
+    let path = mount.to_owned();
+    let pool = pool.to_owned();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        super::execution::lustre_call(move || {
+            let _permit = permit;
+            let mount = PoolMount::open(&path).ok()?;
+            let reader = mount.ost_space_reader().ok()?;
+            let mut total = 0u128;
+            let mut used = 0u128;
+            let mut available = 0u128;
+            for index in mount.pool_members(&pool).ok()? {
+                let OstCapacity::Measured(usage) = reader.usage(index).ok()? else {
+                    return None;
+                };
+                total += u128::from(usage.total_bytes);
+                used += u128::from(usage.used_bytes);
+                available += u128::from(usage.available_bytes);
+            }
+            (total > 0).then_some((total, used, available))
+        }),
+    )
+    .await
+    .ok()?
+    .ok()?
+}
 
 /// Resolved pool migration parameters. Per-file stripe defaults are fixed at admission.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -14,6 +50,14 @@ pub struct PoolMigration {
     pub(crate) stripe_count: Option<u16>,
     pub(crate) stripe_size: Option<u32>,
     pub(crate) max_file_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_mib_per_second: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) min_target_free_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retries: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_concurrency: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) min_residence_micros: Option<i64>,
 }
@@ -27,6 +71,10 @@ struct Parameters {
     stripe_size: Option<Value>,
     max_file_bytes: Option<Value>,
     min_residence: Option<String>,
+    max_mib_per_second: Option<u32>,
+    min_target_free_percent: Option<u8>,
+    retries: Option<u8>,
+    max_concurrency: Option<u16>,
 }
 
 pub(super) fn validate_parameter_names(params: &Map<String, Value>, path: &str) -> Result<(), PolicyError> {
@@ -87,6 +135,10 @@ impl PoolMigration {
             stripe_count: params.stripe_count,
             stripe_size,
             max_file_bytes: bytes,
+            max_mib_per_second: params.max_mib_per_second,
+            min_target_free_percent: params.min_target_free_percent,
+            retries: params.retries,
+            max_concurrency: params.max_concurrency,
             min_residence_micros,
         })
     }
@@ -159,6 +211,19 @@ fn read_parameters(params: Map<String, Value>, path: &str) -> Result<Parameters,
     }
     if params.stripe_count == Some(0) {
         return Err(invalid(format!("{path}.action.params.stripeCount must be positive")));
+    }
+    if params.max_mib_per_second == Some(0) {
+        return Err(invalid(format!(
+            "{path}.action.params.maxMibPerSecond must be positive"
+        )));
+    }
+    if params.max_concurrency.is_some_and(|limit| !(1..=64).contains(&limit)) {
+        return Err(invalid(format!("{path}.action.params.maxConcurrency must be 1–64")));
+    }
+    if params.min_target_free_percent.is_some_and(|percent| percent > 100) {
+        return Err(invalid(format!(
+            "{path}.action.params.minTargetFreePercent must be 0–100"
+        )));
     }
     Ok(params)
 }

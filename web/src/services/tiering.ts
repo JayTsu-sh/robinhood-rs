@@ -46,6 +46,8 @@ export interface FilesystemResource {
   mount: { source: string; readOnly: boolean } | null;
   capacity: Capacity;
   pools: PoolResource[] | null;
+  ostIndices?: number[] | null;
+  mdtNames?: string[] | null;
   tieringAvailable: boolean;
   previewAvailable: boolean;
   reason: string | null;

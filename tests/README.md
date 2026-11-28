@@ -36,6 +36,50 @@ The runner uses an isolated MariaDB container and its loopback interface.
 The check publishes no host ports, resolves linked symbols at process
 startup, and prints the daemon log on failure.
 
+## Console browser tests
+
+The PR workflow type-checks and builds the console, then runs the Playwright
+tests that mock the daemon API. Run the same browser tests locally with Node.js,
+Python 3, and Chromium installed through Playwright.
+
+```sh
+npm --prefix web ci
+npm --prefix web run typecheck
+npm --prefix web run build
+(cd web && npx playwright install chromium)
+bash tests/e2e-console.sh
+```
+
+Tests tagged `@daemon` require the backend or Lustre fixtures described below.
+
+## `e2e-console-lustre.sh` — container acceptance on real Lustre
+
+Run this on an x86-64 Linux Lustre client with rootful Docker, Compose,
+`/dev/lnet`, Python 3, `jq`, `curl`, and OpenSSL. The lab filesystem needs
+writable, non-empty `hot` and `cold` pools and an existing scratch directory.
+Pass the full Lustre mount source and the scratch directory relative to the
+filesystem root.
+
+```sh
+sudo env RBH_TEST_LUSTRE_SOURCE='<mgs-nid>:/<filesystem>' \
+  RBH_TEST_LUSTRE_PARENT='.rbh-tiering-lab' \
+  bash tests/e2e-console-lustre.sh
+```
+
+Set `RBH_CONTAINER_IMAGE` to an existing local image built from the checkout
+to reuse it. The runner uses the schema and Lustre client from that image
+and the Playwright version pinned in `web/package-lock.json`. It runs
+the policy wizard, manual and periodic migration, concurrent migration,
+run history and controls, and managed and existing mount lifecycles. It also
+checks that a busy unmount preserves automatic restoration and that a policy
+save queued behind removal rejects the removed registration.
+
+Each invocation creates an isolated MariaDB and a unique scratch subdirectory.
+The migration catalog starts with only the fixture's directory chain, and
+Playwright scans that fixture as it creates its files. The runner removes its
+containers, mounts, and fixture on exit. It prints the local results directory,
+which contains per-scenario logs, the image ID, and migration reports.
+
 ## `e2e_lustre.sh` — needs a real Lustre mount
 
 Covers what `e2e.sh` deliberately skips: the changelog listener,
@@ -155,12 +199,22 @@ stripe and OST capabilities in a daemon with a disposable database. Set
 test directory beneath the mount in `RBH_CONSOLE_EXECUTION_TEST_ROOT`,
 the mount in `RBH_CONSOLE_EXECUTION_TEST_MOUNT`, the registration ID in
 `RBH_CONSOLE_EXECUTION_TEST_FS`, and the test writer token in
-`RBH_CONSOLE_EXECUTION_TEST_TOKEN`. Run the test with
-`npm --prefix web run test:e2e -- policy-execution.spec.ts` against that
-daemon. The test creates fixtures, previews and saves a policy through the
+`RBH_CONSOLE_EXECUTION_TEST_TOKEN`. Point `RBH_CONSOLE_TEST_URL` to the test
+daemon and run `npm --prefix web run test:e2e -- policy-execution.spec.ts`.
+The test creates fixtures, previews and saves a policy through the
 six-step wizard, enables it, runs it, and downloads its execution report.
 It also verifies periodic scheduling and uses `lfs` to check the placement
-of migrated, excluded, and HSM-managed files.
+of migrated, excluded, and HSM-managed files. The parallel migration check
+observes two throttled operations in flight and verifies the target pool,
+FID, and contents of both files. Setting any `RBH_CONSOLE_EXECUTION_TEST_*`
+fixture variable opts into the test and makes missing settings fail setup.
+
+Use matching Lustre client tools and shared libraries for the test host.
+Check `lfs getname -n "$RBH_CONSOLE_EXECUTION_TEST_MOUNT"` before launching
+the browser. A symbol lookup error here indicates a client installation
+issue. For a containerized test database, use the isolated loopback setup
+described under [`e2e.sh`](#e2esh--no-lustre-required) if the host-forwarded
+port cannot connect.
 
 The final check reads the live link namespace immediately before the swap.
 Lustre group locking and the swap's data-version guard protect file I/O.

@@ -92,3 +92,17 @@ Detailed architectural decisions are persisted in `.claude/projects/-root-rust-r
 - `keep_discard_from_robinhood.md` — which C patterns to preserve vs discard
 - `phase_verification_rule.md` — every phase must pass build+unit+integration+smoke gates
 - `pre_phase_design_rule.md` — every phase starts with a design pass; never guess at unclear points
+
+## Agent skills
+
+### Issue tracker
+
+For specs, tickets, and issue dependencies in GitHub Issues, see [Issue tracker](docs/agents/issue-tracker.md).
+
+### Triage labels
+
+When a skill names a triage role, use the mapping in [Triage labels](docs/agents/triage-labels.md).
+
+### Domain docs
+
+For domain terms and architecture decisions, use the single-context layout in [Domain docs](docs/agents/domain.md).

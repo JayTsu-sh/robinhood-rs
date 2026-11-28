@@ -4,7 +4,14 @@
 #[cfg(test)]
 mod lustre_tests;
 
-use std::{collections::BTreeMap, fs::File, os::unix::ffi::OsStrExt, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    os::unix::ffi::OsStrExt,
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use lustre_api::{LuFid, LustreApi, migration::MigrationError, path::LiveLinks};
 use serde::{Deserialize, Serialize};
@@ -21,6 +28,7 @@ pub(super) struct ScopeDocument {
     root: String,
     #[serde(default)]
     excluded_subtrees: Vec<String>,
+    recursive: Option<bool>,
 }
 
 type Components = Vec<Vec<u8>>;
@@ -28,6 +36,7 @@ type Components = Vec<Vec<u8>>;
 pub(crate) struct DirectoryScope {
     root: Components,
     excluded_subtrees: Vec<Components>,
+    recursive: bool,
 }
 
 pub(crate) struct AdmittedLinks {
@@ -36,6 +45,27 @@ pub(crate) struct AdmittedLinks {
 }
 
 impl AdmittedLinks {
+    pub(crate) fn byte_paths(&self) -> BTreeSet<Vec<u8>> {
+        self.selected
+            .relative_paths()
+            .flatten()
+            .map(|path| {
+                let mut full = vec![b'/'];
+                full.extend_from_slice(path.as_os_str().as_bytes());
+                full
+            })
+            .collect()
+    }
+
+    pub(crate) fn observed_paths(&self) -> Vec<String> {
+        self.selected
+            .relative_paths()
+            .flatten()
+            .take(32)
+            .map(|path| format!("/{}", path.display()))
+            .collect()
+    }
+
     pub(crate) fn recheck(
         &self, mount: &Path, fid: &LuFid, source: &File, deadline: Instant,
     ) -> Result<(), MigrationError> {
@@ -69,20 +99,20 @@ pub(super) enum ScopeDecision {
     Deferred(DeferralReason),
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExclusionReason {
     LinkInExcludedSubtree,
     LinkOutsideScope,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeferralReason {
     IncompleteLinkEvidence,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScopeSummary {
     pub excluded_by_reason: BTreeMap<ExclusionReason, u64>,
@@ -106,6 +136,7 @@ impl TryFrom<ScopeDocument> for DirectoryScope {
         Ok(Self {
             root,
             excluded_subtrees,
+            recursive: document.recursive.unwrap_or(true),
         })
     }
 }
@@ -122,7 +153,7 @@ impl DirectoryScope {
     pub(super) fn locate_parent(&self, components: &[&[u8]]) -> LinkLocation {
         if self.excluded_subtrees.iter().any(|path| starts_with(components, path)) {
             LinkLocation::ExcludedSubtree
-        } else if starts_with(components, &self.root) {
+        } else if starts_with(components, &self.root) && (self.recursive || components.len() == self.root.len()) {
             LinkLocation::Allowed
         } else {
             LinkLocation::OutsideScope

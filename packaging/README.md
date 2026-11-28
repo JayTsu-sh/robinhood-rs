@@ -82,6 +82,23 @@ run `npx playwright install chromium` and `npm run test:e2e` in `web/`.
 For live-data acceptance, set `RBH_CONSOLE_REQUIRE_LIVE_DATA=1` and use a
 daemon with two eligible Lustre pools and a saved policy with an explicit pool pair.
 
+### Daemon-managed Lustre mounts
+
+The console can register existing Lustre mounts visible in the daemon's mount
+namespace. To let the daemon create, unmount, and restore its own mounts, set
+`RBH_LUSTRE_MANAGED_ROOT` to a canonical writable directory owned by the service
+user, and grant the service host Lustre mount privileges. On Linux this requires
+`CAP_SYS_ADMIN` in the mount namespace where the daemon runs. The packaged
+systemd unit also needs the managed directory in `ReadWritePaths`. The daemon
+runs the local Lustre client helpers and confines new mount paths to immediate
+children of that directory. Resource management writes require a configured
+writer token. Install the Lustre mount helpers and their shared libraries from
+the same client release.
+
+Removing a console registration keeps its catalog and run history. The daemon
+blocks removal while a strategy references it, and it blocks unmounting while a
+scan or operation is active or a referencing strategy is enabled.
+
 ## Enable pool migration under systemd
 
 Add a drop-in with `systemctl edit rbh-daemon.service` before enabling an
@@ -107,6 +124,12 @@ bypasses Linux read and directory-search permission checks. The daemon
 probes live lookup when enabling a scoped policy and reports missing
 access. Each migration checks the namespace again before exchanging
 layouts.
+
+For concurrent pool migration, set the policy's same-filesystem limit and bind
+an execution profile with sufficient global slots. Each FID has its own durable
+reservation and Lustre group lock. Concurrent copies share the policy's attempt,
+operation, data and time budgets. A configured bandwidth limit is divided among
+the permitted concurrent copies.
 
 ## Signals
 

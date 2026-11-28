@@ -37,10 +37,8 @@ impl LustreApi {
     /// names like `testfs-MDT0000` only work on the MDS host where the device
     /// actually exists.
     ///
-    /// When `device` is a mount point, the returned path is **absolute** (e.g.
-    /// `/lustre/foo/bar`). When `device` is a bare fsname, the returned path
-    /// is **relative** to the mount (e.g. `foo/bar`). Callers should pass the
-    /// form they want the result in.
+    /// The returned path is relative to the filesystem root. The root FID
+    /// itself resolves to `/`.
     ///
     /// Hardlinks: `llapi_fid2path` iterates all names via the `linkno` parameter
     /// when called repeatedly; this wrapper returns only the first link
@@ -48,6 +46,16 @@ impl LustreApi {
     /// hardlink set from changelog updates.
     #[tracing::instrument(name = "lustre.fid_to_path", skip(self), fields(fid = %fid))]
     pub fn fid_to_path(&self, device: &str, fid: &LuFid) -> Result<PathBuf> {
+        if Path::new(device).is_absolute() {
+            // Keep the mount pinned only for this lookup so it can be unmounted.
+            let directory = crate::mount::open_directory(Path::new(device))?;
+            let path = live_links::fid_link_path(&directory, fid, 0)?;
+            return Ok(if path.as_os_str().is_empty() {
+                PathBuf::from("/")
+            } else {
+                path
+            });
+        }
         let c_dev = CString::new(device)?;
         let fidstr = fid.to_string();
         let c_fid = CString::new(fidstr)?;

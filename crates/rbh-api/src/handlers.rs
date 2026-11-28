@@ -942,7 +942,7 @@ fn now_epoch() -> i64 {
 }
 
 #[tracing::instrument(skip(state, req))]
-async fn start_scan(
+pub(crate) async fn start_scan(
     State(state): State<AppState>, Json(req): Json<StartScanRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let config = state

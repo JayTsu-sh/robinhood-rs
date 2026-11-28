@@ -55,6 +55,64 @@ async fn insert_run(entries: &EntryStore, policy: u64, revision: u64, state: &st
 
 #[tokio::test]
 #[ignore = "requires isolated MariaDB"]
+async fn operator_controls_are_persisted_and_history_keeps_file_evidence() {
+    let (entries, server, policy, _) = history_fixture("controls").await;
+    sqlx::query("UPDATE policies SET enabled = TRUE WHERE id = ?")
+        .bind(policy)
+        .execute(entries.pool())
+        .await
+        .unwrap();
+    let run = insert_run(&entries, policy, 2, "queued", Some("requester")).await;
+    let control = format!("/api/runs/{run}/control");
+    for (action, expected) in [("pause", "paused"), ("resume", "queued"), ("cancel", "cancelled")] {
+        server
+            .post(&control)
+            .json(&json!({"action": action}))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let current = server.get(&format!("/api/runs/{run}")).await.json::<Value>();
+        assert_eq!(current["state"], expected);
+        assert_eq!(current["finishedAt"].is_string(), expected == "cancelled");
+    }
+    server
+        .post(&control)
+        .json(&json!({"action": "resume"}))
+        .await
+        .assert_status_bad_request();
+    let pending = insert_run(&entries, policy, 2, "awaiting_approval", Some("requester")).await;
+    server
+        .post(&format!("/api/runs/{pending}/control"))
+        .json(&json!({"action": "approve"}))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    let approved = server.get(&format!("/api/runs/{pending}")).await.json::<Value>();
+    assert_eq!(approved["state"], "running");
+    assert_eq!(approved["approvedBy"], "config-operator");
+
+    let fid = fid_codec::encode(&LuFid::new(0x200000401, 115, 0));
+    sqlx::query(
+        "INSERT INTO policy_operations (run_id, filesystem, fid, action, state, size, paths, attempt_count, finished_at)
+         VALUES (?, 'history-fixture', ?, 'lustre.pool_migrate', 'completed', 256, '[\"/team/report.bin\"]', 3, UTC_TIMESTAMP(6))",
+    ).bind(run).bind(&fid[..]).execute(entries.pool()).await.unwrap();
+
+    let operations = server.get(&format!("/api/runs/{run}/operations?path=report.bin")).await;
+    operations.assert_status_ok();
+    assert_eq!(operations.json::<Value>()["items"][0]["attemptCount"], 3);
+    let summary = server.get(&format!("/api/runs/summary?policyId={policy}")).await;
+    summary.assert_status_ok();
+    let summary = summary.json::<Value>();
+    assert_eq!(summary["total"], 2);
+    assert_eq!(summary["completedLogicalBytes"], "256");
+    let telemetry = server.get(&format!("/api/runs/{run}/telemetry")).await;
+    telemetry.assert_status_ok();
+    let telemetry = telemetry.json::<Value>();
+    assert_eq!(telemetry["controls"][0]["action"], "cancel");
+    assert_eq!(telemetry["controls"][0]["actor"], "config-operator");
+    assert_eq!(telemetry["completions"][0]["logicalBytes"], "256");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MariaDB"]
 async fn run_history_filters_before_paging_and_reads_pinned_revisions() {
     let (entries, server, policy, original_name) = history_fixture("runs").await;
     let old = insert_run(&entries, policy, 1, "finished", Some("operator")).await;

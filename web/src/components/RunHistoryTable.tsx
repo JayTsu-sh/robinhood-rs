@@ -3,7 +3,7 @@ import { Link, useSearchParams } from '@umijs/max';
 import { Button, Empty, Flex, Input, Select, Typography } from 'antd';
 import { useCallback, useMemo, useState } from 'react';
 import CursorResults from '@/components/CursorResults';
-import { ExecutionStatus, executionMode, executionTime, executionTrigger, logicalBytes, runStateOptions } from '@/components/ExecutionStatus';
+import { ExecutionStatus, executionElapsed, executionMode, executionTime, executionTrigger, logicalBytes, runStateOptions } from '@/components/ExecutionStatus';
 import { executionFilters, listRuns, runDetailsPath, type RunFilters, type RunHistory } from '@/services/executions';
 import { policyDetailsPath } from '@/services/policies';
 
@@ -21,12 +21,13 @@ const columns: ProColumns<RunHistory>[] = [
     </Flex>
   ) },
   { title: '调度状态', width: 150, render: (_, row) => <ExecutionStatus state={row.state} /> },
-  { title: '创建 / 开始时间', width: 200, render: (_, row) => (
+  { title: '开始 / 派发结束', width: 200, render: (_, row) => (
     <Flex vertical gap={4}>
-      <span>{executionTime(row.createdAt)}</span>
-      <Typography.Text type="secondary">{executionTime(row.startedAt)}</Typography.Text>
+      <span>{executionTime(row.startedAt)}</span>
+      <Typography.Text type="secondary">{executionTime(row.finishedAt)}</Typography.Text>
     </Flex>
   ) },
+  { title: '派发耗时', width: 110, render: (_, row) => executionElapsed(row.startedAt, row.finishedAt) },
   { title: '候选数 / 估算逻辑量', width: 215, render: (_, row) => (
     <Flex vertical gap={4}>
       <span>{row.candidateCount?.toLocaleString('zh-CN') ?? '—'}</span>
@@ -39,6 +40,7 @@ const columns: ProColumns<RunHistory>[] = [
     const counts = [byState.completed ?? 0, (byState.failed ?? 0) + (byState.deferred ?? 0) + (byState.unknown ?? 0), pendingCount];
     return counts.map((count) => count.toLocaleString('zh-CN')).join(' / ');
   } },
+  { title: '完成逻辑量', width: 170, render: (_, { operationResults }) => logicalBytes(operationResults?.completedLogicalBytes ?? null) },
 ];
 
 function RunFilterForm({
@@ -49,7 +51,7 @@ function RunFilterForm({
   apply: (filter: RunFilters) => void;
 }) {
   const [values, setValues] = useState(filter);
-  const hasFilter = (input: RunFilters) => Boolean(input.runId || input.state || input.policyName ||
+  const hasFilter = (input: RunFilters) => Boolean(input.runId || input.state || input.activationMode || input.policyName ||
     (policyId === undefined && input.policyId));
   return (
     <form className="console-controls" onSubmit={(event) => {
@@ -75,6 +77,12 @@ function RunFilterForm({
         <Select aria-label="调度状态" placeholder="全部调度状态" allowClear virtual={false}
           options={runStateOptions} value={values.state} onChange={(state) => setValues({ ...values, state })} />
       </Flex>
+      <Flex vertical gap={4} className="console-execution-filter">
+        <span>执行模式</span>
+        <Select aria-label="执行模式" placeholder="全部执行模式" allowClear virtual={false}
+          options={[{ value: 'preview', label: '仅评估' }, { value: 'enforced', label: '正式执行' }]}
+          value={values.activationMode} onChange={(activationMode) => setValues({ ...values, activationMode })} />
+      </Flex>
       <Flex gap={8} align="center" style={{ alignSelf: 'end' }}>
         <Button type="primary" htmlType="submit">查询</Button>
         <Button disabled={!hasFilter(filter) && !hasFilter(values)}
@@ -91,28 +99,29 @@ export default function RunHistoryTable({ policyId }: { policyId?: string }) {
   const policyName = policyId === undefined ? params.get('policyName') : null;
   const runId = params.get('runId');
   const state = params.get('runState');
+  const activationMode = params.get('activationMode');
   const filter = useMemo<RunFilters>(() => ({
     policyId: policy ?? undefined, policyName: policyName ?? undefined,
-    runId: runId ?? undefined, state: state ?? undefined,
-  }), [policy, policyName, runId, state]);
+    runId: runId ?? undefined, state: state ?? undefined, activationMode: activationMode ?? undefined,
+  }), [policy, policyName, runId, state, activationMode]);
   const load = useCallback((cursor: string | undefined, signal: AbortSignal) => listRuns(filter, cursor, signal), [filter]);
   const filterKey = JSON.stringify(filter);
 
   function apply(values: RunFilters) {
     setParams(executionFilters(params, {
       policyId: policyId === undefined ? values.policyId : undefined,
-      policyName: values.policyName, runId: values.runId, runState: values.state,
+      policyName: values.policyName, runId: values.runId, runState: values.state, activationMode: values.activationMode,
     }));
     setSequence((value) => value + 1);
   }
 
-  const activeFilter = filter.policyName || filter.runId || filter.state || (filter.policyId && !policyId);
+  const activeFilter = filter.policyName || filter.runId || filter.state || filter.activationMode || (filter.policyId && !policyId);
   return (
     <div className="console-table">
       <RunFilterForm key={filterKey} filter={filter} policyId={policyId} apply={apply} />
       <CursorResults key={`${filterKey}/${sequence}`} load={load} refreshable>
         {(rows) => <ProTable columns={columns} rowKey="idExact" dataSource={rows} search={false}
-          toolBarRender={false} pagination={false} scroll={{ x: 1225 }}
+          toolBarRender={false} pagination={false} scroll={{ x: 1490 }}
           locale={{ emptyText: <Empty className="console-empty" image={Empty.PRESENTED_IMAGE_SIMPLE}
             description={activeFilter ? '没有符合筛选条件的运行' : '暂无执行记录'} /> }} />}
       </CursorResults>

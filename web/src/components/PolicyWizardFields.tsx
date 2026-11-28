@@ -1,8 +1,9 @@
 import { DeleteOutlined } from '@ant-design/icons';
 import { Link } from '@umijs/max';
-import { Alert, Button, Card, Checkbox, Col, Descriptions, Flex, Form, Input, Row, Select, Typography } from 'antd';
+import { Alert, Button, Card, Checkbox, Col, Descriptions, Flex, Form, Input, Radio, Row, Select, Tag, Typography } from 'antd';
 import {
-  builtinPreview, comparisons, conditionFields, durationUnits, intervalUnits, newRule, sizeUnits,
+  ageComparisons, builtinPreview, candidateOrders, comparisons, conditionFields, durationUnits, intervalUnits, isIdentityField,
+  isNamespaceField, namespaceComparisons, newRule, sizeUnits,
   type Field, type FieldPath, type PolicySettings, type WizardStep,
 } from '@/domain/tieringPolicy';
 import type { WizardResources } from '@/services/policies';
@@ -48,6 +49,8 @@ function ConditionFields({ path, title, empty, parent = [] }: {
                   const clause = [...parent, ...path, 'clauses', name];
                   const field: Field = form.getFieldValue([...clause, 'field']);
                   const isSize = field === 'object.size';
+                  const identity = isIdentityField(field);
+                  const namespace = isNamespaceField(field);
                   return (
                     <Row gutter={[8, 0]} align="middle">
                       <Col xs={24} sm={8} md={7}>
@@ -55,18 +58,24 @@ function ConditionFields({ path, title, empty, parent = [] }: {
                           <Select options={options(conditionFields)} virtual={false}
                             onChange={(value: Field) => {
                               const size = value === 'object.size';
-                              form.setFieldValue([...clause, 'op'], size ? 'gte' : 'older_than');
-                              form.setFieldValue([...clause, 'unit'], size ? 'MiB' : 'd');
+                              const numeric = isIdentityField(value);
+                              const text = isNamespaceField(value);
+                              form.setFieldValue([...clause, 'op'], text ? 'glob' : numeric ? 'eq' : size ? 'gte' : 'older_than');
+                              form.setFieldValue([...clause, 'unit'], text || numeric ? '' : size ? 'MiB' : 'd');
+                              if (text) form.setFieldValue([...clause, 'amount'], '');
                             }} />
                         </Form.Item>
                       </Col>
                       <Col xs={12} sm={5} md={5}>
                         <Form.Item name={[name, 'op']} label="比较">
-                          <Select options={options(isSize ? comparisons : { older_than: '超过' })} virtual={false} />
+                          <Select options={options(namespace ? namespaceComparisons : isSize || identity ? comparisons : ageComparisons)} virtual={false} />
                         </Form.Item>
                       </Col>
                       <Col xs={12} sm={9} md={10}>
-                        <QuantityFields path={[name]} label="数值" units={isSize ? sizeUnits : durationUnits} />
+                        {namespace ? <Form.Item name={[name, 'amount']} label="路径或名称">
+                          <Input className="console-mono" placeholder={field === 'object.path' ? '/team/tmp/*' : '*.lock'} />
+                        </Form.Item> : identity ? <Form.Item name={[name, 'amount']} label="数值"><Input inputMode="numeric" /></Form.Item>
+                          : <QuantityFields path={[name]} label="数值" units={isSize ? sizeUnits : durationUnits} />}
                       </Col>
                       <Col xs={24} sm={2} md={2}>
                         <Button type="text" danger icon={<DeleteOutlined />} aria-label={`删除条件 ${name + 1}`}
@@ -108,9 +117,26 @@ function BasicFields({ resources }: { resources: WizardResources }) {
   );
   return (
     <>
-      <Typography.Paragraph type="secondary">集群内分层 · 在同一 Lustre 文件系统的两个 OST 池之间迁移。</Typography.Paragraph>
       <Form.Item name="name" label="策略名称" required><Input maxLength={253} /></Form.Item>
       <Form.Item name="description" label="描述"><Input.TextArea autoSize={{ minRows: 2, maxRows: 5 }} /></Form.Item>
+      <Form.Item label="策略模板">
+        <Radio.Group value="pool" aria-label="策略模板" style={{ width: '100%' }}>
+          <Row gutter={[12, 12]}>
+            <Col xs={24} sm={12}>
+              <Card size="small" style={{ height: '100%', borderColor: '#2563eb' }}>
+                <Radio value="pool">集群内分层</Radio>
+                <div><Typography.Text type="secondary">在同一 Lustre 文件系统的两个 OST 池之间迁移。</Typography.Text></div>
+              </Card>
+            </Col>
+            <Col xs={24} sm={12}>
+              <Card size="small" style={{ height: '100%' }}>
+                <Radio value="hsm" disabled>跨存储分层（HSM）<Tag style={{ marginInlineStart: 8 }}>暂未开放</Tag></Radio>
+                <div><Typography.Text type="secondary">将 Lustre 数据归档至已注册的外部存储。</Typography.Text></div>
+              </Card>
+            </Col>
+          </Row>
+        </Radio.Group>
+      </Form.Item>
       {(!eligible.length || (filesystemId && !filesystem?.tieringAvailable)) && (
         <Alert type="warning" showIcon message={eligible.length ? '当前选择的文件系统不可用' : '暂无可用于分层的文件系统'}
           description={<>{filesystem ? <Reason reason={filesystem.reason} /> :
@@ -151,8 +177,11 @@ function ScopeFields({ allowToggle }: { allowToggle: boolean }) {
       )}
       {scoped && (
         <Card size="small" title="目录范围">
-          <Typography.Paragraph type="secondary">只处理普通文件。目录包含递归子树，同一 FID 的所有硬链接都须满足范围。</Typography.Paragraph>
+          <Typography.Paragraph type="secondary">只处理普通文件，同一 FID 的所有硬链接都须满足范围。</Typography.Paragraph>
           <Form.Item name="root" label="起始目录" required><Input className="console-mono" placeholder="/team" /></Form.Item>
+          <Form.Item name="recursive" valuePropName="checked" getValueProps={(value) => ({ checked: value !== false })}>
+            <Checkbox>递归扫描子目录</Checkbox>
+          </Form.Item>
           <Form.List name="excludedSubtrees">
             {(fields, { add, remove }) => (
               <>
@@ -217,10 +246,36 @@ function RuleFields() {
 
 function TriggerFields() {
   const form = Form.useFormInstance();
+  const trigger = Form.useWatch('trigger', { form, preserve: true });
+  const firstTime = Form.useWatch('firstTime', { form, preserve: true });
   const windowEnabled = Form.useWatch('windowEnabled', { form, preserve: true });
   return (
     <>
-      <QuantityFields path={['interval']} label="周期" units={intervalUnits} />
+      <Form.Item name="trigger" label="启动方式">
+        <Select options={options({ periodic: '定期执行', pool_usage: '源 Pool 容量水位', manual: '仅手动触发' })} virtual={false} />
+      </Form.Item>
+      {trigger !== 'manual' && (
+        <>
+          <QuantityFields path={['interval']} label={trigger === 'pool_usage' ? '检测间隔' : '周期'} units={intervalUnits} />
+          {trigger === 'pool_usage' ? <Row gutter={16}>
+            <Col xs={24} sm={12}>
+              <Form.Item name="highWatermark" label="高水位（%）· 启动"><Input inputMode="numeric" /></Form.Item>
+            </Col>
+            <Col xs={24} sm={12}>
+              <Form.Item name="lowWatermark" label="低水位（%）· 停止"><Input inputMode="numeric" /></Form.Item>
+            </Col>
+          </Row> : <Row gutter={16}>
+            <Col xs={24} sm={12}>
+              <Form.Item name="firstTime" label="首次日内起点">
+                <Input type="time" />
+              </Form.Item>
+            </Col>
+            {firstTime && <Col xs={24} sm={12}>
+              <Form.Item name="firstTimezone" label="首次启动时区" required><Input /></Form.Item>
+            </Col>}
+          </Row>}
+        </>
+      )}
       <Form.Item name="windowEnabled" valuePropName="checked">
         <Checkbox>限制每日准入窗口</Checkbox>
       </Form.Item>
@@ -244,7 +299,9 @@ function TriggerFields() {
   );
 }
 
-function ExecutionFields({ resources, settings }: { resources: WizardResources; settings: PolicySettings }) {
+function ExecutionFields({ resources, settings, setMode }: {
+  resources: WizardResources; settings: PolicySettings; setMode: (mode: PolicySettings['mode']) => void;
+}) {
   const form = Form.useFormInstance();
   const selectedProfile = Form.useWatch('profile', { form, preserve: true });
   const selectedAuthorization = Form.useWatch('authorization', { form, preserve: true });
@@ -259,8 +316,24 @@ function ExecutionFields({ resources, settings }: { resources: WizardResources; 
         <Col xs={24} sm={12}><QuantityFields path={['maxLogicalBytes']} label="单轮最大逻辑数据量" units={sizeUnits} /></Col>
         <Col xs={24} sm={12}><QuantityFields path={['maxDuration']} label="单轮最大时长" units={durationUnits} /></Col>
         <Col xs={24} sm={12}><QuantityFields path={['maxFileBytes']} label="单文件逻辑大小上限" units={sizeUnits} /></Col>
+        <Col xs={24} sm={12}><Form.Item name="maxRate" label="带宽上限（MiB/s）"><Input inputMode="numeric" placeholder="不限" /></Form.Item></Col>
+        <Col xs={24} sm={12}><Form.Item name="maxConcurrency" label="同文件系统最大迁移并发"><Input inputMode="numeric" placeholder="1" /></Form.Item></Col>
+        <Col xs={24} sm={12}><Form.Item name="minTargetFree" label="目标 Pool 最低空闲比例（%）"><Input inputMode="numeric" placeholder="不限" /></Form.Item></Col>
+        <Col xs={24} sm={12}><Form.Item name="candidateOrder" label="候选排序">
+          <Select allowClear placeholder="按 FID" options={options(candidateOrders)} virtual={false} />
+        </Form.Item></Col>
+        <Col xs={24} sm={12}><Form.Item name="retries" label="单对象重试次数"><Input inputMode="numeric" placeholder="0" /></Form.Item></Col>
+        <Col xs={24} sm={12}><Form.Item name="pauseErrorRate" label="暂停错误率（%）"><Input inputMode="numeric" placeholder="留空时禁用" /></Form.Item></Col>
+        <Col xs={24} sm={12}><Form.Item name="pauseMinFailures" label="暂停所需最少失败数"><Input inputMode="numeric" /></Form.Item></Col>
       </Row>
       <Card size="small" title="执行与治理资源">
+        <Form.Item label="执行模式" htmlFor="execution-mode">
+          <Select id="execution-mode" value={settings.mode} onChange={setMode}
+            options={options({ preview: '仅评估（Dry-run）', enforced: '实际执行' })} virtual={false} />
+        </Form.Item>
+        {settings.mode === 'enforced' && <Form.Item name="requireOperatorApproval" valuePropName="checked">
+          <Checkbox>正式执行前需要操作员批准</Checkbox>
+        </Form.Item>}
         <Row gutter={16}>
           {([['profile', '执行配置'], ['authorization', '授权策略'], ['approval', '审批策略']] as const).map(([key, label]) => (
             <Col key={key} xs={24} lg={8}>
@@ -272,9 +345,10 @@ function ExecutionFields({ resources, settings }: { resources: WizardResources; 
           ))}
         </Row>
         <Descriptions column={1} size="small" items={[
-          { key: 'mode', label: '执行模式', children: settings.mode === 'enforced' ? '实际执行' : '仅预览' },
           { key: 'concurrency', label: '执行配置全局并发上限', children: slots ?? '—' },
+          { key: 'parallelism', label: '并发准入', children: '实际并发受执行配置、未完成操作和 daemon 可用数据库连接限制。' },
           { key: 'constraints', label: '服务端准入', children: '执行配置、系统安全策略、HSM 资格和实时复核共同约束。实际绑定见预览和已保存修订。' },
+          { key: 'files', label: '文件保护', children: '执行前复核文件标识、布局和状态。忙文件及证据不足的文件暂缓。' },
         ]} />
         {[selectedAuthorization, selectedApproval].includes(builtinPreview) && (
           <Alert type="info" showIcon message="builtin-preview 仅供预览。实际执行需绑定部署中允许池迁移的治理资源。" />
@@ -285,14 +359,15 @@ function ExecutionFields({ resources, settings }: { resources: WizardResources; 
 }
 
 export default function PolicyWizardFields({
-  step, resources, settings, allowScopeToggle,
-}: { step: WizardStep; resources: WizardResources; settings: PolicySettings; allowScopeToggle: boolean }) {
+  step, resources, settings, allowScopeToggle, setMode,
+}: { step: WizardStep; resources: WizardResources; settings: PolicySettings; allowScopeToggle: boolean;
+  setMode: (mode: PolicySettings['mode']) => void }) {
   switch (step) {
     case 'basics': return <BasicFields resources={resources} />;
     case 'filter': return <ScopeFields allowToggle={allowScopeToggle} />;
     case 'rules': return <RuleFields />;
     case 'trigger': return <TriggerFields />;
-    case 'execution': return <ExecutionFields resources={resources} settings={settings} />;
+    case 'execution': return <ExecutionFields resources={resources} settings={settings} setMode={setMode} />;
     default: return null;
   }
 }

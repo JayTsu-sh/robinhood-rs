@@ -9,28 +9,29 @@ use std::{
 
 use chrono::Utc;
 use lustre_api::{
-    LuFid, LustreApi, StripeInfo,
+    LuFid, LustreApi, LustreApiError, StripeInfo,
     migration::{
         FileAccessTime, FileVersion, MigrationError, MigrationLimits, MigrationOwnership, MigrationPlacement,
         MigrationPlan, VerifiedPlacement,
     },
 };
-use rbh_entry_store::{BackendKind, EntryKey, EntryStore, FileSystemId, ObjectId};
+use rbh_entry_store::{BackendKind, EntryKey, EntryStore, FileSystemConfig, FileSystemId, ObjectId};
 use serde_json::json;
 use sqlx::{MySql, QueryBuilder, Transaction, types::Json};
 
 use super::{
-    BATCH_SIZE, Candidate, Dispatch, Generation, Invocation, OPERATION_FIELDS, PolicyError, PolicyOperation,
-    PolicyStore, current_revision, decode_fid, elapsed_ms, exclude_recovery_ids, lock_permit,
+    BATCH_SIZE, Candidate, Dispatch, Generation, Invocation, MigrationReservation, OPERATION_FIELDS, PolicyError,
+    PolicyOperation, PolicyRun, PolicyStore, current_revision, decode_fid, elapsed_ms, exclude_recovery_ids,
+    lock_permit,
     preflight::{PreflightKey, PreflightRequest, PreflightResult, PreflightWait},
     short_reason, verify_worker_permit,
 };
 use crate::{
     PolicyTickTask,
     policy::{
-        ActionKind, AdmittedLinks, BudgetLimits, DirectoryScope,
-        execution::{Decision, FidObservation, NativeHsm, SubmissionDeferral, SubmissionGate, lustre_call},
-        heat, push_expression,
+        ActionKind, AdmittedLinks, BudgetLimits, CompiledPolicy, DirectoryScope,
+        execution::{Admission, Decision, FidObservation, NativeHsm, SubmissionDeferral, SubmissionGate, lustre_call},
+        heat, invalid, push_expression,
         resources::safety_matches,
     },
 };
@@ -54,9 +55,26 @@ pub(in crate::store) struct PoolRecovery {
     task: JoinHandle<(Result<MigrationPlacement, MigrationError>, MigrationOwnership)>,
 }
 
+struct PoolJob {
+    run: PolicyRun,
+    policy: Arc<CompiledPolicy>,
+    config: FileSystemConfig,
+    admission: Arc<Admission>,
+    candidate: Candidate,
+    operation: u64,
+    fid: LuFid,
+    plan: MigrationPlan,
+    generation: Generation,
+    links: Option<AdmittedLinks>,
+    expected_access: Option<FileAccessTime>,
+    deadline: Instant,
+    attempt_limit: u32,
+    ownership: MigrationOwnership,
+}
+
 impl PolicyStore {
     pub(super) async fn admit_pool_migration(
-        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: &Invocation,
+        &self, dispatch: &Dispatch<'_>, candidate: &Candidate, invocation: &Invocation, attempt_limit: u32,
         worker: &mut Transaction<'_, MySql>,
     ) -> Result<ControlFlow<&'static str>, PolicyError> {
         let options = invocation.migration.as_ref().expect("pool migration invocation");
@@ -158,6 +176,34 @@ impl PolicyStore {
                 .await
                 .map(ControlFlow::Continue);
         }
+        let concurrency = self.filesystem_migration_limit(dispatch);
+        if concurrency > 1
+            && let Some(percent) = options.min_target_free_percent.filter(|percent| *percent > 0)
+        {
+            let pending: String = sqlx::query_scalar(
+                "SELECT CAST(COALESCE(SUM(size), 0) AS CHAR) FROM policy_operations
+                 WHERE pending_migration_fs = ? AND BINARY JSON_VALUE(migration_plan, '$.targetPool') = BINARY ?",
+            )
+            .bind(filesystem.as_str())
+            .bind(options.target_pool.as_str())
+            .fetch_one(&self.pool)
+            .await?;
+            let pending = pending
+                .parse::<u128>()
+                .map_err(|error| PolicyError::Store(error.to_string()))?;
+            let sufficient = crate::policy::pool_capacity(&dispatch.config.mount_path, &options.target_pool)
+                .await
+                .and_then(|(total, _, available)| {
+                    available
+                        .checked_sub(pending + u128::from(candidate.size))
+                        .map(|remaining| remaining * 100 >= total * u128::from(percent))
+                });
+            if sufficient != Some(true) {
+                self.record_deferred(dispatch, candidate, invocation, "target_pool_free_space_below_minimum")
+                    .await?;
+                return Ok(ControlFlow::Continue(()));
+            }
+        }
         let plan = MigrationPlan {
             source_pool: options.source_pool.clone(),
             target_pool: options.target_pool.clone(),
@@ -169,6 +215,12 @@ impl PolicyStore {
                 .stripe_size
                 .or_else(|| u32::try_from(source.size).ok())
                 .ok_or_else(|| PolicyError::Store("unsupported source stripe size".into()))?,
+            max_bytes_per_second: options
+                .max_mib_per_second
+                .map(|mib| u64::from(mib) * 1024 * 1024 / u64::from(concurrency)),
+            min_target_free_percent: options.min_target_free_percent,
+            filesystem_concurrency: Some(concurrency),
+            expected_mount_source: self.console_mount_source(filesystem),
         };
         // A client can go offline after the periodic sampler last visited
         // this FID. Recheck before holding catalog or policy row locks.
@@ -180,7 +232,17 @@ impl PolicyStore {
                 .await
                 .map(ControlFlow::Continue);
         }
-        let ownership = match MigrationOwnership::acquire(&generation.filesystem_name) {
+        if !verify_worker_permit(worker).await? {
+            self.record_deferred(
+                dispatch,
+                candidate,
+                invocation,
+                "permit_store_requires_synchronous_commit",
+            )
+            .await?;
+            return Ok(ControlFlow::Continue(()));
+        }
+        let ownership = match MigrationOwnership::acquire(&generation.filesystem_name, fid) {
             Ok(ownership) => ownership,
             Err(error) => {
                 return self
@@ -189,20 +251,94 @@ impl PolicyStore {
                     .map(ControlFlow::Continue);
             }
         };
+        let paths = links.as_ref().map(AdmittedLinks::observed_paths).unwrap_or_default();
+        let lease = chrono::TimeDelta::from_std(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| PolicyError::Store(error.to_string()))?;
+        let lease_until = Utc::now()
+            .checked_add_signed(lease)
+            .filter(|date| chrono::Datelike::year(date) <= 9999)
+            .ok_or_else(|| invalid("migration deadline exceeds the database time range"))?;
         let operation = self
-            .reserve_operation(dispatch, candidate, invocation, &generation, Some(&plan), &self.pool)
+            .reserve_operation(
+                dispatch,
+                candidate,
+                invocation,
+                &generation,
+                Some(MigrationReservation {
+                    plan: &plan,
+                    paths: &paths,
+                    attempts: attempt_limit,
+                    lease_until,
+                }),
+                &self.pool,
+            )
             .await?;
+        let job = PoolJob {
+            run: dispatch.run.clone(),
+            policy: dispatch.policy.clone(),
+            config: dispatch.config.clone(),
+            admission: dispatch.admission.clone(),
+            candidate: candidate.clone(),
+            operation,
+            fid,
+            plan,
+            generation,
+            links,
+            expected_access,
+            deadline,
+            attempt_limit,
+            ownership,
+        };
+        if concurrency == 1 {
+            self.execute_pool_migration(job).await?;
+        } else {
+            let store = self.clone();
+            let job = tokio::spawn(async move { store.execute_pool_migration(job).await });
+            self.pool_jobs.lock().await.insert(operation, job);
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    async fn execute_pool_migration(&self, job: PoolJob) -> Result<(), PolicyError> {
+        let PoolJob {
+            run,
+            policy,
+            config,
+            admission,
+            candidate,
+            operation,
+            fid,
+            plan,
+            generation,
+            links,
+            expected_access,
+            deadline,
+            attempt_limit,
+            ownership,
+        } = job;
+        let dispatch = Dispatch {
+            run: &run,
+            policy: &policy,
+            config: &config,
+            admission,
+            heat: self.read_heat.get(&policy.filesystem),
+            preflight_until: Default::default(),
+        };
         let mut tx = self.pool.begin().await?;
         let active = current_revision(&mut tx, dispatch.run).await?;
         if !lock_permit(&mut tx, operation).await? {
-            return Ok(ControlFlow::Continue(()));
+            return Ok(());
         }
+        let mut attempt_count = Some(0);
         let mut late_result = None;
         let result = if !active {
             Some(Err(MigrationError::Deferred("policy_revision_inactive")))
-        } else if let Some(reason) = candidate_deferral(&mut tx, dispatch, candidate).await? {
+        } else if let Some(reason) = candidate_deferral(&mut tx, &dispatch, &candidate, links.as_ref()).await? {
             Some(Err(MigrationError::Deferred(reason)))
-        } else if !verify_worker_permit(worker).await? {
+        } else if !sqlx::query_scalar::<_, bool>("SELECT @@GLOBAL.innodb_flush_log_at_trx_commit = 1")
+            .fetch_one(&mut *tx)
+            .await?
+        {
             Some(Err(MigrationError::Deferred(
                 "permit_store_requires_synchronous_commit",
             )))
@@ -223,24 +359,44 @@ impl PolicyStore {
             // real blocking operation, even after the run budget expires.
             let scoped = links.is_some();
             let mut migration = Box::pin(lustre_call(move || {
-                let limits = MigrationLimits {
-                    deadline,
-                    expected_access,
-                    check_links: |source: &std::fs::File| match &links {
-                        Some(links) => links.recheck(&mount, &fid, source, deadline),
-                        None => Ok(()),
-                    },
-                    before_swap: || swap_gate.check().is_continue(),
+                let mut attempts = 0;
+                let result = loop {
+                    if attempts >= attempt_limit || Instant::now() >= deadline {
+                        break Err(MigrationError::Deferred("migration_deadline_elapsed"));
+                    }
+                    attempts += 1;
+                    let limits = MigrationLimits {
+                        deadline,
+                        expected_access,
+                        check_links: |source: &std::fs::File| match &links {
+                            Some(links) => links.recheck(&mount, &fid, source, deadline),
+                            None => Ok(()),
+                        },
+                        before_swap: || swap_gate.check().is_continue(),
+                    };
+                    let result = LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, &ownership);
+                    if attempts >= attempt_limit || !result.as_ref().is_err_and(retryable_before_swap) {
+                        break result;
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 };
-                let result = LustreApi.migrate_reserved_pool(&mount, &fid, &plan, expected, limits, &ownership);
                 // Recovery must wait until a possible late deferral has
                 // been journaled, including after the syscall returns.
-                (result, ownership)
+                (result, ownership, attempts)
             }));
             match tokio::time::timeout_at(deadline.into(), &mut migration).await {
-                Ok(Ok((result, _ownership))) => Some(result),
-                Ok(Err(error)) => Some(Err(MigrationError::Uncertain(error.to_string()))),
+                Ok(Ok((result, _ownership, attempts))) => {
+                    attempt_count = Some(attempts);
+                    Some(result)
+                }
+                Ok(Err(error)) => {
+                    attempt_count = None;
+                    Some(Err(MigrationError::Uncertain(error.to_string())))
+                }
                 Err(_) => {
+                    attempt_count = None;
                     if scoped {
                         late_result = Some(migration);
                     }
@@ -253,6 +409,13 @@ impl PolicyStore {
 
         // Release the policy, journal and catalog locks before updating the
         // catalog. The committed intent remains pending through this gap.
+        if let Some(count) = attempt_count {
+            sqlx::query("UPDATE policy_operations SET attempt_count = ? WHERE id = ?")
+                .bind(count)
+                .bind(operation)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         let (state, reason, evidence) = match result {
             Some(Ok(layout)) => {
@@ -275,21 +438,49 @@ impl PolicyStore {
         if let Some(pending) = late_result {
             let pool = self.pool.clone();
             tokio::spawn(async move {
-                if let Ok((Err(MigrationError::Deferred(reason)), _ownership)) = pending.await
-                    && let Err(error) = record_late_deferral(&pool, operation, reason).await
+                if let Ok((Err(MigrationError::Deferred(reason)), _ownership, attempts)) = pending.await
+                    && let Err(error) = record_late_deferral(&pool, operation, reason, attempts).await
                 {
                     tracing::warn!(operation, %error, reason, "could not record the late pool migration deferral");
                 }
             });
         }
-        Ok(ControlFlow::Continue(()))
+        Ok(())
+    }
+
+    pub(super) async fn reap_pool_jobs(&self) {
+        let finished = {
+            let mut jobs = self.pool_jobs.lock().await;
+            let ids: Vec<_> = jobs
+                .iter()
+                .filter(|(_, job)| job.is_finished())
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| jobs.remove(&id).map(|job| (id, job)))
+                .collect::<Vec<_>>()
+        };
+        for (operation, job) in finished {
+            match job.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(operation, %error, "pool migration job left a recoverable intent"),
+                Err(error) => tracing::warn!(operation, %error, "pool migration task failed"),
+            }
+        }
     }
 
     pub(super) async fn start_pending_pool_recoveries(&self, entries: &EntryStore) -> Result<(), PolicyError> {
         let mut query = QueryBuilder::new(format!(
             "SELECT {OPERATION_FIELDS} FROM policy_operations o JOIN policy_runs r ON r.id = o.run_id
-             WHERE o.pending_migration_fs IS NOT NULL"
+             WHERE o.pending_migration_fs IS NOT NULL
+               AND (o.migration_lease_until IS NULL OR o.migration_lease_until <= UTC_TIMESTAMP(6))"
         ));
+        {
+            let jobs = self.pool_jobs.lock().await;
+            if !jobs.is_empty() {
+                exclude_recovery_ids(&mut query, jobs.keys().copied());
+            }
+        }
         let mut slots = {
             let recoveries = self.pool_recoveries.lock().await;
             let slots = BATCH_SIZE.saturating_sub(recoveries.len());
@@ -351,12 +542,12 @@ impl PolicyStore {
             .await?;
             return Ok(false);
         };
-        let ownership = match MigrationOwnership::acquire(&generation.filesystem_name) {
+        let ownership = match MigrationOwnership::acquire(&generation.filesystem_name, fid) {
             Ok(ownership) => ownership,
             Err(error) => {
                 tracing::debug!(%filesystem, %fid, operation_id = operation.id, %error, "pool recovery waiting for migration ownership");
                 // Let later journal entries through while the previous worker
-                // still owns this Lustre filesystem.
+                // still owns this FID.
                 sqlx::query("UPDATE policy_operations SET checked_at = UTC_TIMESTAMP(6) WHERE id = ?")
                     .bind(operation.id)
                     .execute(&self.pool)
@@ -509,7 +700,7 @@ async fn observe_pool_source(
 }
 
 async fn candidate_deferral(
-    tx: &mut Transaction<'_, MySql>, dispatch: &Dispatch<'_>, candidate: &Candidate,
+    tx: &mut Transaction<'_, MySql>, dispatch: &Dispatch<'_>, candidate: &Candidate, links: Option<&AdmittedLinks>,
 ) -> Result<Option<&'static str>, PolicyError> {
     let policy = dispatch.policy;
     let entry = sqlx::query_scalar::<_, i64>(
@@ -527,7 +718,19 @@ async fn candidate_deferral(
     if entry.is_none() {
         return Ok(Some("catalog_candidate_changed"));
     }
-    let mut query = QueryBuilder::new("SELECT CAST(((");
+    if policy.uses_namespace_filters {
+        let mut query = QueryBuilder::new("");
+        policy.push_namespace_paths(&mut query, Some(&candidate.fid));
+        query.push("SELECT CAST(pathname AS BINARY) FROM policy_paths");
+        let indexed = query.build_query_scalar::<Vec<u8>>().fetch_all(&mut **tx).await?;
+        let indexed: std::collections::BTreeSet<_> = indexed.into_iter().collect();
+        if links.is_none_or(|links| links.byte_paths() != indexed) {
+            return Ok(Some("indexed_link_paths_changed"));
+        }
+    }
+    let mut query = QueryBuilder::new("");
+    policy.push_namespace_paths(&mut query, Some(&candidate.fid));
+    query.push("SELECT CAST(((");
     policy.push_scope(&mut query, None);
     query.push(") AND ((");
     push_expression(&mut query, &policy.decision, &policy.decision_params);
@@ -632,7 +835,7 @@ async fn finish_migration(
 ) -> Result<(), PolicyError> {
     sqlx::query(
         "UPDATE policy_operations SET state = ?, attempted = attempted OR ? <> 'deferred', reason = ?,
-         completion_evidence = ?, checked_at = UTC_TIMESTAMP(6),
+         completion_evidence = ?, checked_at = UTC_TIMESTAMP(6), migration_lease_until = NULL,
          finished_at = CASE WHEN ? IN ('completed','failed','deferred') THEN UTC_TIMESTAMP(6) ELSE NULL END
          WHERE id = ? AND state = ?",
     )
@@ -648,12 +851,23 @@ async fn finish_migration(
     Ok(())
 }
 
-async fn record_late_deferral(pool: &sqlx::MySqlPool, operation: u64, reason: &'static str) -> Result<(), sqlx::Error> {
+fn retryable_before_swap(error: &MigrationError) -> bool {
+    let errno = match error {
+        MigrationError::BeforeSwap(LustreApiError::Io(error)) => error.raw_os_error(),
+        MigrationError::BeforeSwap(LustreApiError::Ffi { errno, .. }) => Some(*errno),
+        _ => None,
+    };
+    matches!(errno, Some(libc::EINTR | libc::EAGAIN | libc::EIO | libc::ETIMEDOUT))
+}
+
+async fn record_late_deferral(
+    pool: &sqlx::MySqlPool, operation: u64, reason: &'static str, attempts: u32,
+) -> Result<(), sqlx::Error> {
     // A typed deferral from the original worker proves the swap was never
     // attempted. Preserve that reason even if layout recovery ran first.
     sqlx::query(
         "UPDATE policy_operations
-         SET state = 'deferred', attempted = FALSE, reason = ?, checked_at = UTC_TIMESTAMP(6),
+         SET state = 'deferred', attempted = FALSE, reason = ?, attempt_count = ?, checked_at = UTC_TIMESTAMP(6),
              finished_at = UTC_TIMESTAMP(6)
          WHERE id = ? AND (
             state = 'unknown'
@@ -661,6 +875,7 @@ async fn record_late_deferral(pool: &sqlx::MySqlPool, operation: u64, reason: &'
          )",
     )
     .bind(reason)
+    .bind(attempts)
     .bind(operation)
     .execute(pool)
     .await?;

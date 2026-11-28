@@ -1,4 +1,4 @@
-import { history, Link, useParams } from '@umijs/max';
+import { history, Link, useParams, useSearchParams } from '@umijs/max';
 import { Alert, Button, Card, Col, Flex, Form, Input, Modal, Row, Steps, Tag, Typography } from 'antd';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import InventoryPage from '@/components/InventoryPage';
@@ -20,18 +20,29 @@ import { requestError, useInventory } from '@/services/useInventory';
 type PreviewState = { loading: true } | { data: PolicyPreview } | { error: string };
 type SaveFailure = { message: string; conflict?: string };
 
-function Editor({ initial, settings: initialSettings, base: initialBase, resources, reload, currentRevision, exitRecovery }: {
+function draftConfirmed(draft: PolicyDraft, resources: WizardResources) {
+  const limit = Math.min(5, Math.max(0, draft.confirmed ?? 0));
+  for (let index = 0; index < limit; index += 1) {
+    if (validateStep(steps[index].id, draft.values, resources, draft.settings).length) return index;
+  }
+  return limit;
+}
+
+function Editor({ initial, settings: initialSettings, base: initialBase, resources, reload, currentRevision, exitRecovery, slot }: {
   initial: WizardValues; settings: PolicySettings; base?: SavedRevision; resources: WizardResources;
-  reload: (signal: AbortSignal) => Promise<void>; currentRevision?: string; exitRecovery?: () => void;
+  reload: (signal: AbortSignal) => Promise<void>; currentRevision?: string; exitRecovery?: () => void; slot?: string;
 }) {
   const [form] = Form.useForm();
-  const [values, setValues] = useState(initial);
-  const [base, setBase] = useState(initialBase);
-  const [settings, setSettings] = useState(initialSettings);
-  const [step, setStep] = useState(0);
-  const [confirmed, setConfirmed] = useState(0);
+  const [draft, setDraft] = useState(() => readPolicyDraft(initialBase?.id, slot));
+  const restored = slot ? draft : undefined;
+  const [initialValues] = useState(restored?.values ?? initial);
+  const [values, setValues] = useState(initialValues);
+  const [base, setBase] = useState(restored?.base ?? initialBase);
+  const [settings, setSettings] = useState(restored?.settings ?? initialSettings);
+  const [confirmed, setConfirmed] = useState(() => restored ? draftConfirmed(restored, resources) : 0);
+  const [step, setStep] = useState(confirmed);
   const [dirty, setDirty] = useState(!!exitRecovery);
-  const [draft, setDraft] = useState(() => readPolicyDraft(initialBase?.id));
+  const [editingDraft, setEditingDraft] = useState(!!restored || !!exitRecovery);
   const [draftNotice, setDraftNotice] = useState<{ type: 'success' | 'error'; text: string }>();
   const [invalid, setInvalid] = useState<FieldIssue[]>([]);
   const [preview, setPreview] = useState<PreviewState>();
@@ -118,10 +129,15 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
   }
 
   function storeDraft() {
-    const nextDraft: PolicyDraft = { version: 1, values: readValues(), base, settings };
+    const draftSlot = editingDraft && draft ? draft.slot :
+      Array.from(crypto.getRandomValues(new Uint8Array(12)), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    const nextDraft: PolicyDraft = {
+      version: 1, values: readValues(), base, settings, confirmed, slot: draftSlot, savedAt: Date.now(),
+    };
     try {
       savePolicyDraft(nextDraft);
       setDraft(nextDraft);
+      setEditingDraft(true);
       setDraftNotice({ type: 'success', text: '草稿已保存到当前浏览器' });
     } catch {
       setDraftNotice({ type: 'error', text: '浏览器无法保存草稿' });
@@ -146,17 +162,20 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
   function restoreDraft() {
     if (!draft || (dirty && !window.confirm('用浏览器中的草稿替换当前表单？'))) return;
     replace(draft.values, draft.settings, draft.base, true);
-    setDraftNotice({ type: 'success', text: '已恢复本地草稿，请重新确认各步骤' });
+    setConfirmed(draftConfirmed(draft, resources));
+    setEditingDraft(true);
+    setDraftNotice({ type: 'success', text: '已恢复本地草稿' });
   }
 
   function clearDraft() {
-    if (!draft) return;
+    if (!draft || !editingDraft) return;
     try {
       removePolicyDraft(draft);
     } catch {
       setDraftNotice({ type: 'error', text: '浏览器无法清除草稿' });
     }
     setDraft(null);
+    setEditingDraft(false);
   }
 
   function reset() {
@@ -273,9 +292,10 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
       <Row gutter={[16, 16]}>
         <Col xs={24} xl={step < 5 ? 16 : 24}>
           <Card title={<Typography.Title level={2} style={{ fontSize: 18, margin: 0 }}>{steps[step].title}</Typography.Title>}>
-            <Form form={form} name="tiering-policy-wizard" layout="vertical" initialValues={initial}
+            <Form form={form} name="tiering-policy-wizard" layout="vertical" initialValues={initialValues}
               onValuesChange={changed} disabled={busy}>
               <PolicyWizardFields step={steps[step].id} resources={resources} settings={settings}
+                setMode={(mode) => { setSettings({ ...settings, mode }); changed({}); }}
                 allowScopeToggle={!initial.scoped && !settings.enabled} />
             </Form>
             {validationMessage && <Alert type="error" showIcon message={validationMessage.message} />}
@@ -318,7 +338,7 @@ function Editor({ initial, settings: initialSettings, base: initialBase, resourc
   );
 }
 
-function PolicyWizardPage({ id }: { id?: string }) {
+function PolicyWizardPage({ id, slot }: { id?: string; slot?: string }) {
   const load = useCallback(async (signal: AbortSignal) => {
     const [resources, row] = await Promise.all([
       loadWizardResources(signal), id ? getPolicy(id, signal) : Promise.resolve(undefined),
@@ -338,8 +358,8 @@ function PolicyWizardPage({ id }: { id?: string }) {
   const data = reloaded ?? (state.status === 'ready' ? state.data : null);
   const row = data?.row;
   const editable = data?.editable;
-  const draft = row && !editable ? readPolicyDraft(row.idExact) : null;
-  const recovered = recover ? draft : null;
+  const draft = row && !editable ? readPolicyDraft(row.idExact, slot) : null;
+  const recovered = recover || slot ? draft : null;
   const title = id ? '编辑策略' : '新建策略';
   return (
     <InventoryPage title={title} status={state.status} error={state.status === 'error' ? state.message : undefined}
@@ -355,7 +375,8 @@ function PolicyWizardPage({ id }: { id?: string }) {
         ) : (
           <Editor key={row?.revisionExact ?? 'new'}
             initial={editable?.values ?? recovered?.values ?? newWizardValues()}
-            settings={editable?.settings ?? recovered?.settings ?? { enabled: false, mode: 'enforced' }}
+            settings={editable?.settings ?? recovered?.settings ?? { enabled: false, mode: 'preview' }}
+            slot={slot}
             base={recovered?.base ?? (row && { id: row.idExact, revision: row.revisionExact })}
             currentRevision={row?.revisionExact} exitRecovery={recovered ? () => setRecover(false) : undefined}
             resources={data.resources} reload={reload} />
@@ -367,5 +388,7 @@ function PolicyWizardPage({ id }: { id?: string }) {
 
 export default function PolicyWizard() {
   const { id } = useParams();
-  return <PolicyWizardPage key={id ?? 'new'} id={id} />;
+  const [params] = useSearchParams();
+  const slot = params.get('draft') ?? undefined;
+  return <PolicyWizardPage key={`${id ?? 'new'}/${slot ?? ''}`} id={id} slot={slot} />;
 }

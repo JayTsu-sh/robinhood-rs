@@ -1,0 +1,33 @@
+services:
+  rbh-daemon:
+    image: "${RBH_CONTAINER_IMAGE:-robinhood-rs:lustre}"
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: dev/compose/Dockerfile
+    network_mode: host
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - DAC_READ_SEARCH
+    devices:
+      - /dev/lnet:/dev/lnet
+    security_opt:
+      - "apparmor=${RBH_CONTAINER_APPARMOR_PROFILE:-unconfined}"
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      - "RBH_DATABASE_URL=${RBH_DATABASE_URL:?set the daemon MariaDB URL}"
+      - "RBH_LISTEN_ADDR=${RBH_LISTEN_ADDR:-127.0.0.1:8080}"
+      - "RBH_FILESYSTEMS_JSON=${RBH_FILESYSTEMS_JSON:-[]}"
+      - "RBH_CONSOLE_OBSERVER_ID=${RBH_CONSOLE_OBSERVER_ID:?set a stable unique ID for this daemon}"
+      - RBH_LUSTRE_MANAGED_ROOT=/mnt/rbh-lustre
+      - RBH_POLICY_WRITERS_FILE=/run/rbh-config/writers.json
+      - RBH_HSM_PRINCIPAL_FILE
+    volumes:
+      - type: bind
+        source: "${RBH_CONTAINER_CONFIG_DIR:?set the absolute path to the daemon configuration directory}"
+        target: /run/rbh-config
+        read_only: true
+        bind:
+          create_host_path: false

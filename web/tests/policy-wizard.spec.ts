@@ -23,6 +23,8 @@ test('a tiering draft can be resumed and revalidated after changing the filesyst
   await page.goto('/console/#/policies');
   await page.getByRole('link', { name: '新建策略' }).click();
   await expect(page.getByRole('heading', { name: '新建策略' })).toBeVisible();
+  await expect(page.getByRole('radio', { name: '集群内分层' })).toBeChecked();
+  await expect(page.getByRole('radio', { name: /跨存储分层.*暂未开放/ })).toBeDisabled();
   await page.getByRole('button', { name: '下一步' }).click();
   await expect(page.getByText('请输入策略名称')).toBeVisible();
   await page.getByLabel('策略名称').fill('daily-tiering');
@@ -58,7 +60,7 @@ test('a tiering draft can be resumed and revalidated after changing the filesyst
   await expect(page.getByRole('button', { name: '恢复草稿' })).toHaveCount(0);
 });
 
-test('the compiled wizard previews and saves a real disabled revision, with exact read-only export and edit conflicts', async ({ page, request, baseURL }) => {
+test('the compiled wizard previews and saves a real disabled revision, with exact read-only export and edit conflicts', { tag: '@daemon' }, async ({ page, request, baseURL }) => {
   const token = process.env.RBH_CONSOLE_WIZARD_TEST_TOKEN;
   const filesystem = process.env.RBH_CONSOLE_WIZARD_TEST_FS;
   test.skip(!token || !filesystem, 'requires the isolated writer, indexed fixture, and pools described in tests/README.md');

@@ -5,8 +5,11 @@ import { Button, Empty, Flex, Input, Select, Tag } from 'antd';
 import { useState } from 'react';
 import { LatestRunLink, runStateOptions } from '@/components/ExecutionStatus';
 import InventoryPage from '@/components/InventoryPage';
+import InventoryStatistics from '@/components/InventoryStatistics';
 import PolicyExecutionActions from '@/components/PolicyExecutionActions';
 import { policyDetailsPath, policyEditPath } from '@/services/policies';
+import { draftPath, listPolicyDrafts, type PolicyDraft } from '@/services/policyDrafts';
+import { getRunStatistics } from '@/services/executions';
 import { filesystemDetailsPath, listTieringPolicies, type TieringPolicy } from '@/services/tiering';
 import { useInventory } from '@/services/useInventory';
 
@@ -44,18 +47,29 @@ const columns: ProColumns<TieringPolicy>[] = [
 
 const loadPolicies = (signal: AbortSignal) => listTieringPolicies(signal, true);
 
+const draftColumns: ProColumns<PolicyDraft>[] = [
+  { title: '草稿名称', render: (_, draft) => <Link to={draftPath(draft)}>{draft.values.name || '未命名草稿'}</Link> },
+  { title: '文件系统', render: (_, { values }) => values.filesystem || '—' },
+  { title: '源池 → 目标池', render: (_, { values }) => `${values.sourcePool || '—'} → ${values.targetPool || '—'}` },
+  { title: '状态', render: () => <Tag color="gold">草稿</Tag> },
+  { title: '已确认配置', render: (_, { confirmed }) => `${confirmed ?? 0} / 5` },
+];
+
 export default function Policies() {
   const { state, refresh } = useInventory(loadPolicies);
+  const { state: statState, refresh: refreshStats } = useInventory(getRunStatistics);
+  const stats = statState.status === 'ready' ? statState.data : undefined;
   const actions: ProColumns<TieringPolicy> = {
     title: '操作',
     width: 175,
     render: (_, row) => <Flex gap={12} align="center" wrap>
       {row.editable && <Link to={policyEditPath(row.id)}>编辑</Link>}
-      <PolicyExecutionActions key={row.revision} {...row} onRefresh={refresh} />
+      <PolicyExecutionActions key={row.revision} {...row} onRefresh={() => { refresh(); refreshStats(); }} />
     </Flex>,
   };
   const [search, setSearch] = useState('');
   const [enabled, setEnabled] = useState('all');
+  const [drafts] = useState(listPolicyDrafts);
   const [runState, setRunState] = useState('all');
   const [params, setParams] = useSearchParams();
   const policyId = params.get('policy');
@@ -63,23 +77,32 @@ export default function Policies() {
   const query = search.trim().toLowerCase();
   const rows = allRows.filter((row) =>
     (!policyId || String(row.id) === policyId) &&
-    (enabled === 'all' || row.enabled === (enabled === 'enabled')) &&
+    (enabled !== 'draft' && (enabled === 'all' || row.enabled === (enabled === 'enabled'))) &&
     (runState === 'all' || (row.latestRun?.state ?? 'never') === runState) &&
     [row.name, String(row.id), row.filesystem, row.sourcePool, row.targetPool]
       .some((value) => value.toLowerCase().includes(query)),
   );
+  const visibleDrafts = !policyId && runState === 'all' && ['all', 'draft'].includes(enabled) ? drafts.filter(({ values }) =>
+    [values.name, values.filesystem, values.sourcePool, values.targetPool].some((value) => value.toLowerCase().includes(query))) : [];
 
   return (
     <InventoryPage
       title="分层策略"
       status={state.status}
       error={state.status === 'error' ? state.message : undefined}
-      refresh={refresh}
+      refresh={() => { refresh(); refreshStats(); }}
       action={<Flex gap={12} align="center">
         <Link to="/policies/preview">预览迁移</Link>
         <Link to="/policies/new" className="ant-btn ant-btn-primary">新建策略</Link>
       </Flex>}
     >
+      <InventoryStatistics items={[
+        ['已保存策略', allRows.length],
+        ['已启用策略', allRows.filter(({ enabled }) => enabled).length],
+        ['本地草稿', drafts.length],
+        ['全局活动执行', stats ? stats.queued + stats.running + stats.paused + stats.awaitingApproval : '—'],
+        ['近 24 小时全局完成对象', stats?.completedLastDay ?? '—'],
+      ]} />
       <div className="console-table">
         <div className="console-controls">
           <Input
@@ -99,6 +122,7 @@ export default function Policies() {
               { value: 'all', label: '全部状态' },
               { value: 'enabled', label: '已启用' },
               { value: 'disabled', label: '已停用' },
+              { value: 'draft', label: '草稿' },
             ]}
           />
           <Select aria-label="当前或最近运行状态" value={runState} onChange={setRunState} virtual={false} options={[
@@ -123,7 +147,7 @@ export default function Policies() {
           </Button>
           {policyId && <Tag>策略 ID {policyId}</Tag>}
         </div>
-        <ProTable
+        {(enabled !== 'draft' && (rows.length > 0 || !visibleDrafts.length)) && <ProTable
           columns={[...columns, actions]}
           dataSource={rows}
           rowKey="id"
@@ -136,7 +160,13 @@ export default function Policies() {
               allRows.length ? '没有符合筛选条件的策略' : '暂无分层策略'
             } />,
           }}
-        />
+        />}
+        {(visibleDrafts.length > 0 || enabled === 'draft') && <ProTable
+          columns={draftColumns} dataSource={visibleDrafts} rowKey={draftPath}
+          search={false} toolBarRender={false} pagination={visibleDrafts.length > 10 ? { defaultPageSize: 10 } : false}
+          scroll={{ x: 720 }}
+          locale={{ emptyText: <Empty className="console-empty" image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无符合条件的本地草稿" /> }}
+        />}
       </div>
     </InventoryPage>
   );
